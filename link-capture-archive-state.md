@@ -125,6 +125,12 @@ export async function linkProcessing(interval = 10) {
 }
 ```
 
+**浏览器重启时机说明**：
+- 30分钟轮换检查**只在批处理循环开头**执行（获取链接之前）
+- 不会主动中断正在处理的链接
+- 只有当前批次全部处理完成后，下一次循环开头才会检查是否需要重启
+- 只有浏览器意外断开时（`browser.isConnected()` 返回 false），才会在 catch 块中主动重启
+
 ### 2.2 公平调度算法
 
 **入口模块**：公平批次获取器（`apps/worker/lib/getLinkBatchFairly.ts`）
@@ -411,8 +417,9 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
   } catch (error: any) {
     console.error(`Error processing link ${link.url}:`, error);
     // ★ 注意：这里没有更新数据库！
-    // 但 archiveHandler 的 finally 已经执行过了
-    // lastPreserved 已经被设置为当前时间
+    // lastPreserved 是否被设置取决于异常发生的位置：
+    // - 如果异常在 archiveHandler 的 try 块之前：finally 未执行，lastPreserved 保持 null
+    // - 如果异常在 archiveHandler 的 try 块之后：finally 已执行，lastPreserved 已设置
 
     if (!browser.isConnected?.()) {
       await restartBrowser("browser disconnected");
@@ -421,7 +428,10 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
 };
 ```
 
-**关键理解**：Worker 的 catch 块只是记录日志和重启浏览器，**不会修改数据库状态**。但此时归档处理器的 finally 已经执行，`lastPreserved` 已经被设置。
+**关键理解**：
+- Worker 的 catch 块只是记录日志和检查浏览器状态，**不会主动修改数据库状态**
+- `lastPreserved` 的状态取决于异常在 `archiveHandler` 中发生的位置
+- 如果检测到浏览器断开连接，会立即重启浏览器，后续批次使用新浏览器实例
 
 ### 4.3 真实自动重试条件
 
@@ -433,11 +443,15 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
 | 页面创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
 | 文件夹创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
 | 进程被杀死（OOM、重启等） | ✅ 是 | finally 来不及执行 |
+| 浏览器意外断开连接 | ✅ 是 | 可能在任何位置中断，finally 可能未执行 |
 | 页面加载失败 | ❌ 否 | 进入 try 块后抛出，finally 执行 |
 | 浏览器超时 | ❌ 否 | 进入 try 块后抛出，finally 执行 |
 | 某个归档格式处理失败 | ❌ 否 | finally 执行 |
 
-**核心结论**：正常业务异常（页面无法访问、超时等）**不会自动重试**，只有基础设施层面的异常（浏览器/页面创建失败）才会自动重试。
+**核心结论**：
+- 正常业务异常（页面无法访问、超时等）**不会自动重试**
+- 只有基础设施层面的异常（浏览器/页面创建失败、进程崩溃、浏览器意外断开）才会自动重试
+- 30分钟浏览器轮换**不会导致**正在处理的链接失败，因为轮换只在批次之间进行
 
 ### 4.4 "unavailable" 终态详解
 
@@ -563,7 +577,7 @@ const count = await prisma.link.count({
 | 基于 `lastPreserved = null` 的隐式标记 | 简单可靠，无需额外状态字段 | 状态语义不明确，需要理解约定 |
 | `finally` 块强制收尾 | 确保处理过的链接有明确终态，避免无限等待 | 正常业务失败不会自动重试，用户体验可能不好 |
 | 按用户公平调度 | 防止大用户独占资源，保证多租户公平性 | 实现复杂，多轮数据库查询 |
-| 浏览器每30分钟重启 | 防止内存泄漏，稳定性好 | 重启时正在处理的链接会失败（但会被标记为 unavailable） |
+| 浏览器每30分钟轮换（仅批次间） | 防止内存泄漏，稳定性好；不会中断正在处理的链接 | 浏览器意外断开时，正在处理的链接可能失败（部分可能自动重试） |
 
 ## 七、潜在改进点
 
