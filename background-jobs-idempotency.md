@@ -70,7 +70,8 @@ archiveHandler(link, browser)
 ├─ 段 A：try 之前的初始化与短路分支（L29-L108）
 │    ├─ SSRF 安全检查 / 非 http(s) URL → 直接写 lastPreserved + 全 unavailable，return
 │    ├─ 创建 AbortController + timeoutPromise（5 分钟全局超时）
-│    ├─ browser.newContext / newPage
+│    ├─ browser.newContext → protectPageRequests → context.newPage
+│    ├─ createFolder × 2（archives/ 与 archives/preview/）
 │    └─ 解析 archivalSettings
 │
 ├─ 段 B：try 块（L109-L198）
@@ -202,7 +203,83 @@ const timeoutPromise = new Promise((_, reject) => {
 
 注意：`abortController.signal` 只传给了 `handleMonolith`，其他子流程（page.goto、截图、PDF、Readability）对超时不感知，它们可能在后台继续跑一会儿，但 `Promise.race` 已经让主流程结束并进入 finally。
 
-### 3.7 finally 内部如何写入状态
+### 3.7 Promise.race 并发收尾窗口：timeout 后 IIFE 仍在后台执行
+
+`Promise.race([主归档 IIFE, timeoutPromise])` 的一个重要特性是：**被"输掉"的 Promise 不会被取消**。当 timeoutPromise 先 reject 时，主归档 IIFE 仍然在后台继续执行，这会产生几类竞态风险：
+
+**风险 1：子处理器独立写 DB 与 finally 写 "unavailable" 的竞态**
+
+多个子处理器在执行过程中各自独立调用 `prisma.link.update` 写自己的字段：
+
+| 子处理器 | 独立写 DB 的位置 | 写入字段 |
+|---|---|---|
+| `determineLinkType` | `apps/worker/lib/archiveHandler.ts:L257-L262` | `type` |
+| 主流程 | `apps/worker/lib/archiveHandler.ts:L158-L164` | `metaDescription` |
+| `imageHandler` | `apps/worker/lib/preservationScheme/imageHandler.ts:L28-L33` | `image` |
+| `pdfHandler` | `apps/worker/lib/preservationScheme/pdfHandler.ts:L25-L30` | `pdf` |
+| `handleArchivePreview` | `apps/worker/lib/preservationScheme/handleArchivePreview.ts:L73-L78` | `preview` |
+| `handleReadability` | `apps/worker/lib/preservationScheme/handleReadability.ts:L98-L103` | `readable` |
+| `handleScreenshotAndPdf` | 内部 `page.screenshot().then(...)` / `page.pdf().then(...)` | `image` / `pdf` |
+| `handleMonolith` | `apps/worker/lib/preservationScheme/handleMonolith.ts:L57-L66` | `monolith` |
+
+假设以下时序：
+1. timeoutPromise reject → Promise.race 结束 → 进入 finally
+2. finally 在 L208 执行 `prisma.link.findUnique` 拿到 finalLink（此时 `image` 仍为 null）
+3. 后台 IIFE 中 `imageHandler` 执行完毕，独立写 DB：`image = "archives/1/2.jpeg"`
+4. finally 在 L213 执行 `prisma.link.update`，按条件 `!finalLink.image` → 把 `image` 覆盖写成 `"unavailable"`
+
+结果：文件实际已落盘（`archives/1/2.jpeg`），但 DB 里 `image` 是 `"unavailable"`，产生**孤儿文件 + 状态不一致**。
+
+反向时序（子处理器后写）的话，DB 里保留的是正确路径，反而没问题。
+
+**风险 2：后台 Playwright 操作被 context.close() 暴力中断**
+
+finally 中的 `context.close()`（`apps/worker/lib/archiveHandler.ts:L229`）会关闭整个浏览器上下文。如果此时后台 IIFE 正在执行 `page.screenshot()`、`page.pdf()`、`page.content()`、`page.evaluate()` 等操作，Playwright 会抛出类似"Target page, context or browser has been closed"的异常：
+- 子处理器自带 `.catch`（如 handleMonolith）→ 异常被吞
+- 子处理器没有 `.catch`（如 handleReadability、handleArchivePreview）→ 异常在已 resolve 的 Promise 链中变成 **unhandledRejection**，可能导致 Node.js 进程告警（取决于 `process.on("unhandledRejection")` 的处理）
+- `imageHandler` 和 `pdfHandler` 是直链下载，不依赖 Playwright context，不受 `context.close()` 影响
+
+**风险 3：sendToWayback 完全不受控**
+
+`apps/worker/lib/archiveHandler.ts:L119` 的 `sendToWayback(link.url)` 没有 await，是 fire-and-forget。timeout 抢占后它仍在后台发起对外 HTTP 请求，但不写 DB 也不写文件，影响有限。
+
+### 3.8 protectPageRequests 请求拦截对归档内容完整性的影响
+
+`apps/worker/lib/protectPageRequests.ts` 通过 Playwright 的 `context.route("**/*", ...)` 拦截**该上下文发起的所有网络请求**（包括主文档、子资源 CSS/JS/图片/font、XHR/Fetch、WebSocket 等）：
+
+```ts
+await context.route("**/*", async (route: Route) => {
+  const requestUrl = route.request().url();
+  if (isNonNetworkUrl(requestUrl)) {   // about:  blob:  data:
+    await route.continue();
+    return;
+  }
+  try {
+    await assertUrlIsSafeForServerSideFetch(requestUrl);  // SSRF 检查
+    await route.continue();
+  } catch (error) {
+    if (error instanceof UnsafeUrlError) {
+      await route.abort("blockedbyclient");   // ★ 被拦截的请求直接 abort
+      return;
+    }
+    throw error;   // 非 SSRF 异常在 route handler 中 throw
+  }
+});
+```
+
+对归档完整性的影响：
+
+| 场景 | 表现 | 后果 |
+|---|---|---|
+| 页面引用内网 IP 的 CSS/JS（如 `http://127.0.0.1/style.css`） | 请求被 `route.abort("blockedbyclient")` | 截图/PDF 样式错乱、交互脚本不执行 |
+| 页面引用内网域名的图片/font | 请求被 abort | 图片位置留白、字体回退到系统默认 |
+| SPA 通过 Fetch/XHR 请求内网 API 渲染动态内容 | 请求被 abort | 动态区域为空或显示加载错误 |
+| og:image 指向内网 | 主流程 SSRF 已先挡；即使过了，route 也会 abort | preview 退化到 fallback 用 `page.screenshot()` 截整页缩略图，内容可能不完整 |
+| `assertUrlIsSafeForServerSideFetch` 内部抛出**非** `UnsafeUrlError`（如 DNS 解析临时故障、依赖服务不可用） | 异常在 route handler 中 throw，Playwright 内部处理 | 该请求失败，页面渲染缺资源；**但不会冒泡到 archiveHandler 的外层 try**（因为 route callback 是 Playwright 内部调度的异步回调） |
+
+**关键点**：protectPageRequests 拦截的是浏览器上下文的**子资源请求**，主文档 `link.url` 的 SSRF 检查在段 A（`apps/worker/lib/archiveHandler.ts:L32-L42`）已经提前完成——两者是双层防护。子资源被 abort 不会让 `page.goto()` 抛异常（Playwright 不会因为子资源加载失败拒绝主文档导航），所以归档流程会继续执行，最终产出**视觉/内容不完整但状态标记为"成功"**的归档。
+
+### 3.9 finally 内部如何写入状态
 
 `apps/worker/lib/archiveHandler.ts:L208-L224`：
 
@@ -229,6 +306,7 @@ if (finalLink) {
 - **先重新查一次 DB**，不用内存里的旧 `link` 对象——因为子处理器（`imageHandler`、`handleReadability` 等）在执行过程中已经把自己的路径写进 DB 了，直接用内存值会覆盖掉已成功的字段
 - **只对 falsy 字段写 `"unavailable"`**，已是 archive 路径的字段传 `undefined`（Prisma 语义=不更新）
 - `indexVersion: null` 是有意为之：归档内容更新后需要重新全文索引
+- 但如 3.7 所述，`findUnique` 和后续 `update` 之间存在**读-改-写竞态窗口**，后台子处理器的并发写入可能被 finally 覆盖成 "unavailable"
 
 ---
 
@@ -251,19 +329,32 @@ if (finalLink) {
 | `"archives/.../xxx.jpeg"` | 成功落盘的路径 | ❌ 跳过（已存在且以 archive 开头） |
 | `"unavailable"` | 曾经尝试过但失败/放弃 | ❌ 跳过（`"unavailable"` 是 truthy 且不以 "archive" 开头） |
 
-### 4.2 自动重试的真正边界（只有 3 种情况）
+### 4.2 自动重试的真正边界：段 A 逐行拆解
 
-`getLinkBatchFairly` 只看 `lastPreserved == null`。所以只有当 `lastPreserved` 没被写成功时，下一轮轮询才会把这条链接再次捞起。结合 3.1 的控制流分析，仅有三种可能：
+`getLinkBatchFairly` 只看 `lastPreserved == null`。结合 3.1 的控制流，段 A（`apps/worker/lib/archiveHandler.ts:L29-L108`）的每一步都可能在进入 try 之前抛异常，从而让 `lastPreserved` 保持 null 并触发下一轮自动重试。逐行分析：
+
+| 段 A 代码行 | 操作 | 是否可能抛异常 | 抛异常时的后果 |
+|---|---|---|---|
+| L32-L42 | `assertUrlIsSafeForServerSideFetch(link.url)` | ✅ **可能**：如果抛出 `UnsafeUrlError` 之外的异常（例如 SSRF 检查依赖的 DNS 解析失败、底层网络错误），`else { throw error }` 分支会向外抛出 | 异常冒泡到 `archiveLink` catch；`lastPreserved` 未写 → **自动重试** |
+| L44-L61 | SSRF 命中 / 非 http(s) 直接写 DB + return | ❌ 不抛（写 DB 本身可能抛，但无 catch）；如果写 DB 抛异常则冒泡 | 如果 `prisma.link.update` 抛异常 → `lastPreserved` 未写 → **自动重试** |
+| L63-L75 | 创建 AbortController 与 timeoutPromise | ❌ 纯同步操作，不抛 | — |
+| L77-L78 | `browser.newContext(contextOptions)` | ✅ **可能**：Playwright 浏览器进程崩溃、资源不足、WS 连接断开 | 异常冒泡；`lastPreserved` 未写 → **自动重试**；⚠️ **context 可能已部分创建但未被关闭（无 finally），造成浏览器上下文泄漏** |
+| L79 | `protectPageRequests(context)` 注册路由 | ⚠️ 极低概率：如果 context 已关闭，`context.route()` 可能抛 | 异常冒泡；同上有 context 泄漏风险 |
+| L80 | `context.newPage()` | ✅ **可能**：Playwright 内部错误、上下文已失效 | 异常冒泡；**context 已创建但不会被关闭，造成泄漏**；`lastPreserved` 未写 → **自动重试** |
+| L82-L83 | `createFolder(...)` × 2（`packages/filesystem/createFolder.ts:L5-L18`） | ✅ **可能**：`fs.mkdirSync` 在磁盘权限不足、磁盘满、I/O 错误时同步抛出 | 异常冒泡；context 已创建但不关闭 → **自动重试 + context 泄漏** |
+| L85-L107 | 计算 archivalSettings（读 link.tags / 用户设置） | ❌ 纯内存操作，不抛 | — |
+
+**段 A 失败的共同副作用**：`browser.newContext()` 之后任何一步抛异常，因为还没进入 try，`finally` 里的 `context.close()` 不会执行，browser context 残留在 Chromium 进程中占用资源。worker 的浏览器 30 分钟整体重启（`apps/worker/worker.ts` 的 `BROWSER_MAX_AGE_MS` 机制）是兜底清理手段。
+
+综上，**真正会触发自动重试的只有 3 类场景**：
 
 | # | 场景 | 为什么 lastPreserved 没写 |
 |---|---|---|
-| 1 | **段 A 初始化抛异常**：如 `browser.newContext()`、`browser.newPage()` 失败（在进入 try 之前抛出，未触发 finally） | 没走到 finally；也没走到 SSRF 早期分支的 update |
-| 2 | **进程级崩溃**：OOM kill、SIGKILL、宿主机断电，导致 finally 虽在 JS 语义上应执行，但运行时已终止 | DB 写入未发生 |
-| 3 | **finally 内部的 prisma.update 自身失败**：DB 连接断开、事务冲突等，使 `lastPreserved` 字段没写成功 | finally 尝试执行但 DB 操作报错 |
+| 1 | **段 A 初始化抛异常**（上表列举的 assertUrl 非 SSRF 异常、newContext/newPage 失败、createFolder 失败、段 A 内 prisma.update 失败） | 没走到 finally；也没走到 SSRF 早期分支的 update |
+| 2 | **进程级崩溃**：OOM kill、SIGKILL、宿主机断电 | DB 写入未发生 |
+| 3 | **finally 内部的 prisma.update 自身失败**：DB 连接断开、事务冲突等 | finally 尝试执行但 DB 操作报错 |
 
 **所有其他情况——包括 HTTP 404/500、页面导航超时、5 分钟浏览器全局超时、DNS 失败、Readability 解析异常、imageHandler/pdfHandler 网络错误——都会进入 finally 并写入 `lastPreserved = now`，因此不会自动重试。**
-
-这是之前分析最容易出错的地方：即使异常冒泡到了 archiveHandler 的 catch，catch 里的 `throw err` 也不会阻止 finally 执行。
 
 ### 4.3 精确场景决策表
 
@@ -277,9 +368,10 @@ if (finalLink) {
 | handleReadability 解析抛异常 | ✅ | ✅ | ✅ 写入时间戳 | 之前完成的保留路径，`readable=null→"unavailable"` | ❌ 不重试 |
 | handleScreenshotAndPdf 内部截图失败 | ✅ | ✅ | ✅ 写入时间戳 | `image=null→"unavailable"`，其他按实际 | ❌ 不重试 |
 | handleMonolith 失败（被 .catch 吞） | ✅ | ✅ | ✅ 写入时间戳 | `monolith=null→"unavailable"`，其他按实际 | ❌ 不重试 |
-| 浏览器 5 分钟全局超时（timeoutPromise reject） | ✅ | ✅ | ✅ 写入时间戳 | 已完成的保留路径，未完成的写 `"unavailable"` | ❌ 不重试 |
+| 浏览器 5 分钟全局超时（timeoutPromise reject） | ✅ | ✅ | ✅ 写入时间戳 | 已完成的保留路径，未完成的写 `"unavailable"`；可能存在 3.7 的竞态覆盖 | ❌ 不重试 |
 | SSRF / 非 http(s)（早期 return 分支） | ❌（在 try 之前 return） | ❌ | ✅ 在段 A 直接写入 | 全部写 `"unavailable"` | ❌ 不重试 |
 | browser.newContext() 失败（段 A 抛错） | ❌（还没进入 try） | ❌ | ❌ 未写入 | 保持原样（全 null） | ✅ **会重试** |
+| createFolder 磁盘权限不足（段 A 抛错） | ❌（还没进入 try） | ❌ | ❌ 未写入 | 保持原样（全 null） | ✅ **会重试** |
 | 进程 OOM / SIGKILL，死在 try 执行过程中 | ✅（已进入 try） | ❌（进程终止） | ❌ 未写入 | 部分格式可能已写路径，其余 null | ✅ **会重试**（但已写路径的格式下次会被跳过） |
 | finally 的 prisma.update 自身报错 | ✅ | ✅（尝试执行） | ❌ 写入失败 | 保持 try 期间各子处理器已写入的状态 | ✅ **会重试** |
 
@@ -300,9 +392,71 @@ if (finalLink) {
 1. **Playwright 浏览器资源昂贵**：反复重试失败链接会长时间占用 browser context
 2. **失败原因多为不可自动恢复**：目标站点 404、被墙、内容类型异常、SSRf 拦截——这些靠重试几乎不会成功
 3. **4xx/5xx 不视为失败**：系统把 404 页面当有效内容归档，不给用户留"空白"
-4. **提供了人工重试入口**：`/api/v1/worker/preservation` DELETE 接口可以把已归档链接的格式字段清空，让它们重新进入待处理队列（见 `packages/router/worker.tsx` 中的 `useDeletePreservations`）
+4. **提供了人工重试入口**：`/api/v1/worker/preservation` DELETE 接口可以把已归档链接的格式字段清空，让它们重新进入待处理队列
 
 代价是：暂时性网络抖动导致的真正失败（如 page.goto 的 DNS 解析失败、safeFetch 的连接超时）也被永久标记为 unavailable，需要人工触发重跑。
+
+### 4.6 人工重跑入口详解
+
+人工重跑通过 `DELETE /api/v1/worker/preservation` 接口（`apps/web/pages/api/v1/worker/preservation.tsx`）调用，前端入口在 `apps/web/pages/admin/background-jobs.tsx`，仅限服务器管理员（`user.id === NEXT_PUBLIC_ADMIN`）使用。Schema 定义 `packages/lib/schemaValidation.ts:L304-L306` 支持两种 action：
+
+#### action = "allAndRePreserve"：全量重跑
+
+```ts
+// apps/web/pages/api/v1/worker/preservation.tsx:L36-L66
+for (const link of allLinks) {
+  await removeFiles(link.id, link.collectionId);   // 删除磁盘上所有归档文件
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      image: null, pdf: null, readable: null, monolith: null, preview: null,
+      lastPreserved: null,    // 重新进入待处理队列
+      indexVersion: null,     // 重新索引
+    },
+  });
+}
+```
+
+- 作用范围：管理员自己拥有的全部 `type = "url"` 链接
+- 行为：**先删文件，再把所有格式字段 + lastPreserved + indexVersion 全部置 null**
+- 效果：下一轮 worker 轮询时这些链接就像从未归档过一样，全部格式从头生成
+
+#### action = "allBroken"：仅重跑失败项
+
+```ts
+// apps/web/pages/api/v1/worker/preservation.tsx:L67-L164
+// 第一步：筛选有任一格式等于 "unavailable" 的链接
+OR: [{ image: "unavailable" }, { pdf: "unavailable" }, ...]
+
+// 第二步：结合用户设置判断是否真的需要该格式
+needsReprocessing =
+  (link.image === "unavailable" && shouldArchive.archiveAsScreenshot) ||
+  (link.pdf   === "unavailable" && shouldArchive.archiveAsPDF)        || ...
+
+// 第三步：只把需要且失败的格式字段置 null
+if (needsReprocessing) {
+  await prisma.link.update({
+    data: {
+      image:    shouldArchive.archiveAsScreenshot && link.image    === "unavailable" ? null : link.image,
+      pdf:      shouldArchive.archiveAsPDF        && link.pdf      === "unavailable" ? null : link.pdf,
+      readable: shouldArchive.archiveAsReadable   && link.readable === "unavailable" ? null : link.readable,
+      monolith: shouldArchive.archiveAsMonolith   && link.monolith === "unavailable" ? null : link.monolith,
+      lastPreserved: null,   // ★ 只要 needsReprocessing，就整体重置
+      indexVersion: null,
+    },
+  });
+}
+```
+
+- 作用范围：仅筛选 5 个格式字段中**至少有一个值为 `"unavailable"`** 的链接
+- 行为：
+  - **不删文件**：已是 archive 路径的字段（部分成功的产物）保留不动，对应磁盘文件也保留
+  - **精确重置**：只把「用户设置启用了该格式 **且** 当前值为 `"unavailable"`」的字段置 null
+  - **整体重入队列**：`lastPreserved` 一律置 null，让链接重新进入待处理
+  - **选择性跳过重跑**：如果 `needsReprocessing` 为 false（例如用户当前已禁用截图，但历史上截图失败被标 unavailable），则完全不动
+- 效果：下一轮 worker 轮询时，未失败的格式会因为字段仍是 `archives/...` 路径被跳过（断点续传），失败的格式重新尝试生成
+
+**两种 action 的共同特点**：都只重置 DB 字段，不向 worker 发通知——worker 在下一次 60 秒轮询（`apps/worker/workers/linkProcessing.ts:L88` 的 `delay`）时自然会把 `lastPreserved = null` 的链接重新捞起。
 
 ---
 
@@ -398,8 +552,11 @@ await prisma.link.update({ where: { id: link.id }, data: { monolith: `archives/.
 | 任务领取无行级锁 | 多 worker 实例下重复归档 | 改用 `SELECT ... FOR UPDATE SKIP LOCKED` 或引入 Redis 分布式锁 |
 | HTTP 4xx/5xx 被当作正常内容归档 | 用户保存的是 404 页面而非目标内容 | 在 `page.goto` 后检查 `response.status()`，对 4xx/5xx 单独标记并考虑允许重试 |
 | 绝大多数业务失败不自动重试 | 暂时性网络抖动也被永久标 unavailable | 增加 `retryCount` / `nextRetryAt`，仅对网络层错误和 5xx 重试，对 4xx 直接标 unavailable |
+| Promise.race 后子处理器并发写 DB | finally 的 "unavailable" 可能覆盖子处理器刚写入的真实路径，产生孤儿文件 | 用事务 + `SELECT ... FOR UPDATE` 锁定行；或把各格式写入全部推迟到 finally 统一执行 |
+| 段 A 失败无 context.close() | browser.newContext/newPage/createFolder 抛异常时 context 泄漏 | 把 context 创建也包进 try，或在段 A 内单独加 try/finally 关 context |
+| protectPageRequests 导致子资源被 abort | 截图/PDF 样式缺失、图片空白、动态内容不完整，UI 显示"成功"但内容不可用 | 对主资源（首屏图片/字体）考虑放宽 SSRF 或使用代理；在 finally 中统计被 abort 的子资源数量，超过阈值标警告 |
 | AI 标签失败也标记 `aiTagged=true` | AI API 抖动导致的失败无法自动重试 | 区分成功/失败标记，或增加重试次数字段 |
 | RSS 新建 link 与更新 `lastBuildDate` 非事务 | 崩溃可能漏更时间戳，下次重复创建 link | 包事务；或对 link 加 (url, collectionId) 唯一约束 |
 | 无指数退避 + 最大重试次数 | 若未来启用重试，持续失败的链接每轮都占浏览器资源 | 重试间隔指数增长，超过阈值写 `"unavailable"` |
-| 孤儿文件（DB 回滚但文件已写入） | 占用磁盘 | 定期扫描 `archives/` 目录与 DB 交叉校验 |
+| 孤儿文件（DB 回滚但文件已写入；或 Promise.race 竞态 finally 覆盖） | 占用磁盘 | 定期扫描 `archives/` 目录与 DB 交叉校验 |
 | 同批次内重复 ID 靠内存 Set 去重 | 多实例间不生效 | 数据库层加唯一约束或利用事务 |
