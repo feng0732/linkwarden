@@ -60,20 +60,20 @@ await prisma.link.update({
 
 **入口文件**：[archives/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/web/pages/api/v1/archives/index.ts)
 
-用户上传文件时，系统使用了一个巧妙的"临时锁定"机制：
+用户上传文件时，系统使用了一个"临时锁定"机制防止与 worker 竞争：
 
 ```typescript
-// 创建时临时锁定，防止 archiveHandler 竞争
+// 创建时临时锁定，设置 lastPreserved = 1970-01-01，防止 archiveHandler 选中
 const link = await prisma.link.create({
   data: {
     // ...
-    lastPreserved: new Date(0).toISOString(), // 临时标记为已处理（1970年）
+    lastPreserved: new Date(0).toISOString(), // 临时标记为"已处理"
     aiTagged: true,
     indexVersion: 1,
   },
 });
 
-// 上传完成后解锁，允许后续补充处理
+// 上传完成后解锁，设置 lastPreserved = null，允许 worker 处理
 await prisma.link.update({
   where: { id: link.id },
   data: {
@@ -235,7 +235,7 @@ Link 模型中与归档相关的字段：
 
 ```prisma
 model Link {
-  // 归档内容路径
+  // 归档内容路径字段
   preview         String?   // 缩略图路径
   image           String?   // 截图路径
   pdf             String?   // PDF路径
@@ -243,11 +243,10 @@ model Link {
   monolith        String?   // 单文件HTML路径
 
   // 状态控制字段
-  lastPreserved   DateTime? // 最后处理时间，null=待处理
   type            String    // 链接类型：url/pdf/image
   indexVersion    Int?      // 索引版本（用于搜索）
   clientSide      Boolean   // 是否为客户端上传
-  lastPreserved   DateTime? // 核心状态标记
+  lastPreserved   DateTime? // 核心状态标记：null=待处理，有值=已处理
 }
 ```
 
@@ -258,60 +257,85 @@ model Link {
 | 字段值 | 含义 |
 |--------|------|
 | `null` | 待处理 / 需要重新处理 |
-| `"unavailable"` | 处理失败 / 无法归档 |
+| `"unavailable"` | 已尝试处理但失败 / 无法归档 |
 | 字符串路径（如 `"archives/123/456.pdf"`） | 处理成功，值为文件存储路径 |
 
-### 3.3 状态流转过程
+### 3.3 状态流转核心逻辑
+
+状态流转的关键在于 `archiveHandler` 中的 `try-catch-finally` 结构：
 
 ```
-创建链接
-    ↓
-lastPreserved = null
-所有归档字段 = null
-    ↓
-Worker 选中处理
-    ↓
-逐个处理各归档格式
-  ├─ 成功 → 字段 = 文件路径
-  └─ 失败 → 字段保持 null 或后续标记为 "unavailable"
-    ↓
-finally 块统一收尾
-    ↓
-lastPreserved = 当前时间
-对于仍为 null 的字段 → 标记为 "unavailable"
+函数入口
+    │
+    ├─ 安全检查失败或URL不安全 → 直接设置 lastPreserved + unavailable → 返回
+    │
+    ├─ 浏览器上下文/页面创建失败 → 抛出异常 → 函数终止 → lastPreserved 保持 null
+    │
+    └─ 进入 try 块
+         │
+         ├─ 成功 → 各归档格式字段被设置为文件路径
+         │
+         ├─ 失败 → catch 捕获并重新抛出异常
+         │
+         └─ finally 块（★ 无论成功失败，只要进入 try 就一定会执行 ★）
+              │
+              ├─ 查询 link 是否还存在
+              │
+              ├─ 存在 → 设置 lastPreserved = 当前时间
+              │         仍为 null 的字段 → 标记为 "unavailable"
+              │
+              └─ 不存在 → 删除已生成的文件
 ```
 
-**finally 块的统一处理逻辑**（[archiveHandler.ts#L208-L224](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L224)）：
+### 3.4 finally 块的关键作用
+
+**代码位置**：[archiveHandler.ts#L203-L230](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/archiveHandler.ts#L203-L230)
 
 ```typescript
-const finalLink = await prisma.link.findUnique({
-  where: { id: link.id },
-});
+finally {
+  if (timeoutId !== undefined) {
+    clearTimeout(timeoutId);
+  }
 
-if (finalLink) {
-  await prisma.link.update({
+  const finalLink = await prisma.link.findUnique({
     where: { id: link.id },
-    data: {
-      lastPreserved: new Date().toISOString(),
-      readable: !finalLink.readable ? "unavailable" : undefined,
-      image: !finalLink.image ? "unavailable" : undefined,
-      monolith: !finalLink.monolith ? "unavailable" : undefined,
-      pdf: !finalLink.pdf ? "unavailable" : undefined,
-      preview: !finalLink.preview ? "unavailable" : undefined,
-      indexVersion: null,
-    },
   });
+
+  if (finalLink) {
+    await prisma.link.update({
+      where: { id: link.id },
+      data: {
+        lastPreserved: new Date().toISOString(), // ★ 总是设置
+        readable: !finalLink.readable ? "unavailable" : undefined,
+        image: !finalLink.image ? "unavailable" : undefined,
+        monolith: !finalLink.monolith ? "unavailable" : undefined,
+        pdf: !finalLink.pdf ? "unavailable" : undefined,
+        preview: !finalLink.preview ? "unavailable" : undefined,
+        indexVersion: null,
+      },
+    });
+  } else {
+    await removeFiles(link.id, link.collectionId);
+  }
+
+  await context?.close().catch(() => {});
 }
 ```
 
-### 3.4 各归档格式的独立处理
+**重要结论**：只要进入了 `try` 块（第109行），无论处理成功还是失败，`finally` 块一定会执行，`lastPreserved` 一定会被设置为当前时间。
+
+### 3.5 各归档格式的独立处理
 
 每个归档格式都有独立的处理文件，成功后立即更新数据库：
 
-- **预览图**：[handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)
-- **截图/PDF**：[handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts)
-- **可读性**：[handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts)
-- **单文件HTML**：[handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts)
+| 归档格式 | 处理文件 | 错误处理方式 | 是否向外抛出 |
+|---------|---------|-------------|------------|
+| 预览图 | [handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts) | 内部 catch 但非 UnsafeUrlError 会重抛 | 可能抛出 |
+| 截图/PDF | [handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts) | `Promise.allSettled` 捕获 | 不抛出 |
+| 可读性 | [handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts) | 大小超限 return，无其他 catch | 可能抛出 |
+| 单文件HTML | [handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts) | 调用时 `.catch()` 捕获 | 不抛出 |
+| 图片处理 | [imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts) | 大小超限 return，无其他 catch | 可能抛出 |
+| PDF处理 | [pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts) | 大小超限 return，无其他 catch | 可能抛出 |
 
 以截图处理为例：
 
@@ -335,57 +359,119 @@ page.screenshot({ fullPage: true, type: "jpeg" })
 
 ## 四、失败补偿机制
 
-### 4.1 隐式重试：基于 `lastPreserved = null`
+### 4.1 异常抛出路径完整分析
 
-系统**没有显式的重试队列或重试次数字段**，重试机制完全依赖 `lastPreserved` 字段：
+让我们从 `archiveHandler` 入口开始，逐条分析可能的异常路径：
 
-- 成功处理 → `lastPreserved` 设置为当前时间 → 不会再被选中
-- 处理失败（抛出异常）→ `finally` 块可能没执行到 → `lastPreserved` 仍为 `null` → 下次轮询会再次选中
+**路径1：进入 try 块之前（第25-108行）**
 
-**Worker 中的异常捕获**（[linkProcessing.ts#L58-L68](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/workers/linkProcessing.ts#L58-L68)）：
+```
+第32-42行: assertUrlIsSafeForServerFetch
+  ├─ 抛出 UnsafeUrlError → skipPreservation = true，不向外抛出
+  └─ 抛出其他异常 → 向外抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+
+第44-61行: skipPreservation 或 URL 非 http/https
+  └─ 更新 DB: lastPreserved = 现在，所有字段 = "unavailable" → return → 正常结束
+
+第77-80行: 创建浏览器上下文和页面
+  ├─ browser.newContext() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+  ├─ protectPageRequests() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+  └─ browser.newPage() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+
+第82-107行: 创建文件夹、获取归档设置
+  └─ createFolder() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+```
+
+**路径2：进入 try 块之后（第109-230行）**
+
+```
+try {
+  // 任何业务逻辑抛出异常
+} catch (err) {
+  console.log("Failed Link:", link.url);
+  console.log("Reason:", err);
+  throw err;  // 重新抛出异常
+} finally {
+  // ★ 无论是否有异常，这里一定会执行！★
+  // 设置 lastPreserved = 当前时间
+  // 未成功字段标记为 "unavailable"
+}
+```
+
+### 4.2 Worker 层的异常捕获
+
+**代码位置**：[linkProcessing.ts#L45-L69](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/workers/linkProcessing.ts#L45-L69)
 
 ```typescript
-const archiveLink = async (link) => {
+const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
   try {
+    console.log(`- Link ${link.url} for user ${link.collection.ownerId}`);
     await archiveHandler(link, browser);
-    // 成功
+    console.log(`Succeeded processing link ${link.url}...`);
   } catch (error: any) {
     console.error(`Error processing link ${link.url}:`, error);
-    // 注意：这里没有更新数据库！
-    // lastPreserved 仍为 null，下次会重试
+    // ★ 注意：这里没有更新数据库！
+    // 但 archiveHandler 的 finally 已经执行过了
+    // lastPreserved 已经被设置为当前时间
+
+    if (!browser.isConnected?.()) {
+      await restartBrowser("browser disconnected");
+    }
   }
 };
 ```
 
-### 4.2 部分成功的问题
+**关键理解**：Worker 的 catch 块只是记录日志和重启浏览器，**不会修改数据库状态**。但此时 `archiveHandler` 的 finally 已经执行，`lastPreserved` 已经被设置。
 
-这个设计存在一个**重要缺陷**：如果处理过程中部分归档格式成功了，但后续步骤抛出异常，会导致：
+### 4.3 真实自动重试条件
 
-1. 已成功的字段已写入文件路径（如 `image = "archives/123/456.jpeg"`）
-2. `lastPreserved` 仍为 `null`
-3. 下次重试时，这些已成功的格式会被跳过（因为有 `!link.image` 检查）
-4. 只有未成功的格式会被重试
+**自动重试只会发生在以下极端情况**：
 
-**跳过已处理字段的逻辑**（[archiveHandler.ts#L169-L194](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/archiveHandler.ts#L169-L194)）：
+| 场景 | 是否重试 | 原因 |
+|-----|---------|------|
+| 浏览器创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
+| 页面创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
+| 文件夹创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
+| 进程被杀死（OOM、重启等） | ✅ 是 | finally 来不及执行 |
+| 页面加载失败 | ❌ 否 | 进入 try 块后抛出，finally 执行 |
+| 浏览器超时 | ❌ 否 | 进入 try 块后抛出，finally 执行 |
+| 某个归档格式处理失败 | ❌ 否 | finally 执行 |
 
-```typescript
-if (!link.preview) await handleArchivePreview(link, page);
-if (archivalSettings.archiveAsReadable && !link.readable)
-  await handleReadability(content, link);
-if ((archivalSettings.archiveAsScreenshot && !link.image) ||
-    (archivalSettings.archiveAsPDF && !link.pdf))
-  await handleScreenshotAndPdf(link, page, archivalSettings);
+**核心结论**：正常业务异常（页面无法访问、超时等）**不会自动重试**，只有基础设施层面的异常（浏览器/页面创建失败）才会自动重试。
+
+### 4.4 "unavailable" 终态详解
+
+当一个归档格式字段被标记为 `"unavailable"` 时，表示：
+
+1. **系统已经尝试过处理**：`lastPreserved` 已设置为处理时间
+2. **该格式本次处理失败**：可能是网络问题、页面结构问题、大小超限等
+3. **不会自动重试**：因为 `lastPreserved` 已设置，worker 不会再选中
+4. **需要手动触发**：用户必须调用重新归档 API，将 `lastPreserved` 重置为 `null`
+
+### 4.5 部分成功的场景
+
+如果处理过程中部分归档格式成功，但后续步骤抛出异常：
+
+```
+1. handleArchivePreview 成功 → preview = "archives/..."
+2. handleReadability 成功 → readable = "archives/..."
+3. page.goto 失败（网络中断）→ 抛出异常
+4. catch 捕获并重新抛出
+5. finally 执行：
+   - lastPreserved = 当前时间
+   - image = "unavailable"（因为还是 null）
+   - pdf = "unavailable"
+   - monolith = "unavailable"
+   - preview 和 readable 保持已成功的路径
 ```
 
-### 4.3 最终失败标记
+结果：
+- 已成功的格式保留文件路径
+- 未成功的格式标记为 `"unavailable"`
+- `lastPreserved` 已设置，**不会自动重试**
+- 下次手动重新归档时，已成功的格式会被跳过（因为有 `!link.preview` 检查）
 
-如果异常被 `archiveHandler` 内部捕获并走到了 `finally` 块，那么未成功的字段会被标记为 `"unavailable"`，此时：
-
-- `lastPreserved` 被设置为当前时间
-- 字段值为 `"unavailable"`
-- **不会自动重试**，需要用户手动触发重新归档
-
-### 4.4 待处理数量统计
+### 4.6 待处理数量统计
 
 **入口文件**：[countUnprocessedBillableLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/countUnprocessedBillableLinks.ts)
 
@@ -419,40 +505,52 @@ const count = await prisma.link.count({
                         ▼
                 archiveHandler 处理
                         │
-             ┌──────────┴──────────┐
-             │                     │
-             ▼                     ▼
-      浏览器访问页面         确定链接类型
-             │                     │
-             ├─────────────────────┼─────────────────────┐
-             ▼                     ▼                     ▼
-      生成预览图            提取可读文本            截图 + PDF
-             │                     │                     │
-             ├─────────────────────┴─────────────────────┘
-             │
-             ▼
-      处理 Monolith（单文件HTML）
-             │
-             ├─ 全部成功 → 所有字段 = 文件路径
-             │
-             ├─ 部分成功 → 部分字段 = 路径，部分 = null
-             │
-             └─ 全部失败 → 所有字段 = null
-                        │
-                        ▼
-                finally 块执行
-                        │
-             ┌──────────┴──────────┐
-             │                     │
-             ▼                     ▼
-      链接还存在吗？         链接已被删除 → 删除文件
-             │
-             ▼
-      lastPreserved = 现在
-      仍为 null 的字段 → "unavailable"
-                        │
-                        ▼
-                  归档结束
+         ┌──────────────┴──────────────┐
+         │                             │
+         ▼                             ▼
+  浏览器上下文创建失败         浏览器上下文创建成功
+         │                             │
+  抛出异常，函数终止              进入 try 块
+  lastPreserved 保持 null              │
+  下次自动重试                        │
+                                       ▼
+                              确定链接类型
+                                       │
+                              浏览器访问页面
+                                       │
+         ┌─────────────────────────────┼─────────────────────────────┐
+         ▼                             ▼                             ▼
+  生成预览图                    提取可读文本                    截图 + PDF
+         │                             │                             │
+         ├─────────────────────────────┴─────────────────────────────┘
+         │
+         ▼
+  处理 Monolith（单文件HTML）
+         │
+         ├─ 全部成功 → 所有字段 = 文件路径
+         │
+         ├─ 部分成功 → 部分字段 = 路径，部分 = null
+         │
+         └─ 全部失败 → 所有字段 = null（但过程中可能有部分已写入）
+                       │
+                       ▼
+               catch 捕获异常，重新抛出
+                       │
+                       ▼
+               ★ finally 块执行 ★
+                       │
+              ┌────────┴────────┐
+              │                 │
+              ▼                 ▼
+        链接还存在吗？     链接已被删除 → 删除文件
+              │
+              ▼
+        lastPreserved = 现在
+        仍为 null 的字段 → "unavailable"
+                       │
+                       ▼
+                 归档结束
+   （不会自动重试，需手动重置 lastPreserved）
 ```
 
 ---
@@ -461,15 +559,16 @@ const count = await prisma.link.count({
 
 | 设计决策 | 优点 | 缺点 |
 |---------|------|------|
-| 无统一状态字段，多字段独立 | 各格式可独立重试，部分成功不影响整体 | 状态理解困难，没有整体进度指示 |
-| 基于 `lastPreserved = null` 的隐式重试 | 简单可靠，无需额外重试队列 | 无法控制重试次数，可能无限重试 |
-| finally 块统一标记 `"unavailable"` | 确保处理过的链接有明确终态 | 标记为 unavailable 后不会自动重试 |
-| 按用户公平调度 | 防止大用户独占资源 | 实现复杂，多轮数据库查询 |
-| 浏览器每30分钟重启 | 防止内存泄漏 | 处理中的链接会失败（但会重试） |
+| 无统一状态字段，多字段独立 | 各格式可独立处理，部分成功不影响整体可用性 | 状态理解困难，没有整体进度指示 |
+| 基于 `lastPreserved = null` 的隐式标记 | 简单可靠，无需额外状态字段 | 状态语义不明确，需要理解约定 |
+| `finally` 块强制收尾 | 确保处理过的链接有明确终态，避免无限等待 | 正常业务失败不会自动重试，用户体验可能不好 |
+| 按用户公平调度 | 防止大用户独占资源，保证多租户公平性 | 实现复杂，多轮数据库查询 |
+| 浏览器每30分钟重启 | 防止内存泄漏，稳定性好 | 重启时正在处理的链接会失败（但会被标记为 unavailable） |
 
 ## 七、潜在改进点
 
-1. **增加统一状态字段**：添加 `archiveStatus` 枚举（`PENDING`/`PROCESSING`/`COMPLETED`/`FAILED`），便于理解和查询
-2. **增加重试次数限制**：添加 `retryCount` 字段，防止无限重试
-3. **部分失败回滚**：如果整体处理失败，考虑回滚已写入的文件和字段
-4. **状态流转日志**：记录每次处理的开始/结束时间、错误信息，便于排查
+1. **增加统一状态字段**：添加 `archiveStatus` 枚举（`PENDING`/`PROCESSING`/`COMPLETED`/`PARTIAL_FAILED`/`FAILED`），便于理解和查询
+2. **增加重试次数字段**：添加 `retryCount` 字段，对可重试的失败进行有限次自动重试
+3. **区分失败类型**：将失败区分为"临时性失败"（网络超时）和"永久性失败"（无效URL），分别处理
+4. **部分失败回滚选项**：提供配置项，允许在整体失败时回滚已成功的归档文件
+5. **状态流转日志**：记录每次处理的开始/结束时间、错误信息、成功的格式，便于排查
