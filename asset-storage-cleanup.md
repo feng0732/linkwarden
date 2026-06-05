@@ -4,218 +4,236 @@
 
 ### 1.1 存储后端抽象
 
-所有文件操作通过 `@linkwarden/filesystem` 包统一封装，支持两种存储后端：
+所有文件操作通过 `@linkwarden/filesystem` 包统一封装，支持两种存储后端，**运行时通过 `s3Client` 是否存在自动切换**：
 
-| 存储方式 | 触发条件 | 根路径配置 |
+| 存储方式 | 触发条件 | 实际落点 |
 |---|---|---|
-| 本地文件系统 | 未配置完整 S3 环境变量 | `STORAGE_FOLDER`（默认 `data`），实际路径 = `<project_root>/../../<STORAGE_FOLDER>/` |
-| S3 兼容对象存储 | 同时配置 `SPACES_ENDPOINT` / `SPACES_REGION` / `SPACES_KEY` / `SPACES_SECRET` | `SPACES_BUCKET_NAME` 指定的 bucket |
+| 本地文件系统 | `SPACES_ENDPOINT` / `SPACES_REGION` / `SPACES_KEY` / `SPACES_SECRET` 任意一个未配置 | 根目录由 `STORAGE_FOLDER`（默认 `data`）决定，最终绝对路径 = `path.join(process.cwd(), "../..", STORAGE_FOLDER, filePath)` |
+| S3 兼容对象存储 | 上述四个变量全部配置 | Bucket = `SPACES_BUCKET_NAME`，对象 Key = 传入的 `filePath` |
 
-> 实现见：[s3Client.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/s3Client.ts)、[createFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFile.ts)、[readFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/readFile.ts)
+> S3 客户端初始化见：[s3Client.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/s3Client.ts)
+> 本地模式路径拼接在每个文件系统函数内部都重复了一遍 `path.join(process.cwd(), "../..", storagePath, filePath)`，未抽取成常量。
 
-### 1.2 目录结构与文件类型
-
-所有归档文件按 `collectionId` 分目录存储，按 `linkId + 后缀` 命名：
+### 1.2 目录结构与文件命名（全部为无前置斜杠的相对路径 Key）
 
 ```
-archives/
-├── <collectionId>/
-│   ├── <linkId>.pdf                # PDF 归档
-│   ├── <linkId>.png                # 截图 (PNG)
-│   ├── <linkId>.jpeg / .jpg        # 截图 (JPEG)
-│   ├── <linkId>.html               # Monolith 单文件网页归档
-│   └── <linkId>_readability.json   # Readability 正文提取结果
-└── preview/
-    └── <collectionId>/
-        └── <linkId>.jpeg           # 预览缩略图
-
-uploads/
-└── avatar/
-    └── <userId>.jpg                # 用户头像
+archives/<collectionId>/<linkId>.pdf                  # PDF 归档
+archives/<collectionId>/<linkId>.png                  # 截图 PNG
+archives/<collectionId>/<linkId>.jpeg                 # 截图 JPEG
+archives/<collectionId>/<linkId>.jpg                  # 截图 JPG（仅 removeFiles 兼容删除）
+archives/<collectionId>/<linkId>.html                 # Monolith 单文件网页
+archives/<collectionId>/<linkId>_readability.json     # Readability 正文 JSON
+archives/preview/<collectionId>/<linkId>.jpeg         # 预览缩略图（固定 JPEG）
+uploads/avatar/<userId>.jpg                            # 用户头像（固定 JPG）
 ```
 
-> 文件后缀与格式枚举映射见：[getSuffixFromFormat.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/shared/getSuffixFromFormat.ts)、[global.ts#L160-L166](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/types/global.ts#L160-L166)
+> 枚举与后缀的映射见：[getSuffixFromFormat.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/shared/getSuffixFromFormat.ts)、[global.ts#L160-L166](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/types/global.ts#L160-L166)
+> 所有 Worker 归档 Handler 在写文件时都用模板字面量拼路径：[handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts)、[handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts)、[handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts)、[handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)、[imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts)、[pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts)、[generatePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/lib/generatePreview.ts)
 
-### 1.3 文件系统核心 API
+### 1.3 文件系统核心 API 行为核准
 
-| 函数 | 文件 | 作用 |
+| 函数 | 文件 | 关键行为 / 注意点 |
 |---|---|---|
-| `createFile` | [createFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFile.ts) | 写入文件（支持 base64 或 Buffer） |
-| `readFile` | [readFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/readFile.ts) | 读取文件，返回 `{ file, contentType, status }` |
-| `fileExists` | [fileExists.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/fileExists.ts) | 判断文件是否存在 |
-| `removeFile` | [removeFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/removeFile.ts) | 删除单个文件 |
-| `removeFolder` | [removeFolder.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/removeFolder.ts) | 递归删除目录（S3 下分页列举后批量删除） |
-| `moveFile` | [moveFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/moveFile.ts) | 移动文件（S3 下 = copy + delete） |
-| `createFolder` | [createFolder.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFolder.ts) | 创建目录（S3 下 no-op） |
-| `removeFiles` | [manageFiles.ts#L4-L31](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/manageFiles.ts#L4-L31) | 删除一个 link 的所有归档变体 |
-| `moveFiles` | [manageFiles.ts#L33-L68](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/manageFiles.ts#L33-L68) | 将一个 link 的所有归档变体从一个 collection 移到另一个 |
+| `createFile` | [createFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFile.ts) | 返回 `boolean` 表示成功/失败；本地会 `fs.mkdir(recursive)` 自动建目录；S3 异常仅 console.error |
+| `readFile` | [readFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/readFile.ts) | 本地/S3 返回结构不一致（见 §二）；文件末尾有一段 `fileNotFoundTemplate` HTML **从未被 return 使用** |
+| `fileExists` | [fileExists.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/fileExists.ts) | S3 用 `HeadObject`；本地用 `fs.existsSync`；任何异常都当"不存在"返回 false |
+| `removeFile` | [removeFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/removeFile.ts) | **本地模式 fs.unlink 是异步回调、不 await**，调用方返回时删除可能还没完成；S3 用 await 但失败只 console.log |
+| `removeFolder` | [removeFolder.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/removeFolder.ts) | S3 用 `ListObjects` + `DeleteObjects` 分页循环，`IsTruncated` 时递归；本地用 `fs.rmdirSync(recursive:true)`；目录不存在时仅打日志 |
+| `moveFile` | [moveFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/moveFile.ts) | **S3 模式使用回调风格 `s3Client.copyObject(...)`，未 await/Promisify**，调用返回时 copy+delete 尚未执行；本地先 `fs.existsSync` 再 rename，不存在直接跳过 |
+| `createFolder` | [createFolder.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFolder.ts) | S3 no-op；本地 `fs.mkdirSync(recursive:true)` |
+| `removeFiles` | [manageFiles.ts#L4-L31](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/manageFiles.ts#L4-L31) | 对一个 link 并发 await 7 次 `removeFile`（pdf/png/jpeg/jpg/html/preview/readability），每个独立 try/catch |
+| `moveFiles` | [manageFiles.ts#L33-L68](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/manageFiles.ts#L33-L68) | 对 7 个文件调用 `moveFile`，在 S3 模式下全部"发射后不管" |
 
 ---
 
-## 二、引用关系
+## 二、引用关系 & 读取降级（本地 vs S3 精确对比）
 
-### 2.1 数据库存储的文件路径
+### 2.1 数据库字段与文件路径的对应
 
-在 Prisma schema 中，`Link` 模型的以下字段存储文件相对路径（或特殊字符串 `"unavailable"`）：
+`Link` 模型相关字段类型是 `String?`（可空），实际取值有三种语义：
 
-| 字段 | 对应文件 | 说明 |
+| 取值 | 含义 | Worker 是否会再处理 |
 |---|---|---|
-| `Link.image` | `archives/<collectionId>/<linkId>.(png\|jpeg\|jpg)` | 截图 |
-| `Link.pdf` | `archives/<collectionId>/<linkId>.pdf` | PDF |
-| `Link.readable` | `archives/<collectionId>/<linkId>_readability.json` | Readability 正文 |
-| `Link.monolith` | `archives/<collectionId>/<linkId>.html` | Monolith 网页 |
-| `Link.preview` | `archives/preview/<collectionId>/<linkId>.jpeg` | 预览缩略图 |
-| `User.image` | `uploads/avatar/<userId>.jpg` | 用户头像 |
+| `null` | 从未归档 / 已被重置等待重新归档 | **是**（`lastPreserved: null` 才会被 `getLinkBatchFairly` 选中） |
+| `"unavailable"` | 已尝试归档但失败 / 被用户配置禁用 | **否**（字符串是 truthy，`!link.image === false`） |
+| 形如 `archives/<collectionId>/<linkId>.<suffix>` 的字符串 | 归档成功，值即为文件系统/ S3 Key | **否**（见各 handler 的 `startsWith("archive")` 判断） |
 
-> Schema 定义见：[schema.prisma#L166-L198](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/prisma/schema.prisma#L166-L198)
+> Worker 批量取待处理 Link 的条件：[getLinkBatchFairly.ts#L36-L38](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/getLinkBatchFairly.ts#L36-L38)（`url != null AND lastPreserved IS NULL`）
 
-**字段值约定：**
-- `null`：尚未生成，worker 将在后续轮询中处理
-- `"unavailable"`：已尝试归档但失败（或用户配置禁用），不再重试（除非手动触发重新归档）
-- 文件路径字符串：归档成功，可通过 API 读取
+### 2.2 读取文件路径的来源：**DB 字段 vs 实时拼接（不统一！）**
 
-### 2.2 读取文件的入口
+这是一个关键细节：读取文件有**两条路径**，使用的 filePath 来源并不相同：
 
-#### 2.2.1 归档文件读取（archives API）
+#### 路径 A — archives API（`GET /api/v1/archives/[linkId]`）
+在 [resolveAccessibleArchive.ts#L70-L72](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts#L70-L72) 中：
+```ts
+filePath = isPreview
+  ? `archives/preview/${collection.id}/${linkId}.jpeg`
+  : `archives/${collection.id}/${linkId + suffix}`;
+```
+**它不读 DB 里存的 `Link.image/pdf/...` 字段，而是根据当前 `collection.id` + `linkId` + `format` 实时拼出来。**
 
-`GET /api/v1/archives/[linkId]?format=<ArchivedFormat>&preview=<0|1>`
+#### 路径 B — Worker 内部读已有 Monolith
+在 [archiveHandler.ts#L132-L148](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L132-L148) 中：
+```ts
+if (link.monolith?.endsWith(".html")) {
+  const file = await readFile(link.monolith); // 直接用 DB 里存的路径
+}
+```
 
-流程：
-1. 通过 `resolveAccessibleArchive` 校验用户对 link 所在 collection 的权限（owner / member / 公开集合）
-2. 拼装文件路径：
-   - `preview=1` → `archives/preview/<collectionId>/<linkId>.jpeg`
-   - 其他 → `archives/<collectionId>/<linkId + suffix>`
-3. 调用 `readFile` 读文件并返回
+#### 路径 C — 前端显示判断（getFormatBasedOnPreference）
+在 [getFormatBasedOnPreference.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/lib/getFormatBasedOnPreference.ts) 中同时检查 falsy **和** `"unavailable"`：
+```ts
+if (!link.pdf || link.pdf === "unavailable") return null;
+```
+再用 `link.image?.endsWith("png")` 判断返回 PNG 还是 JPEG 枚举。
 
-> 实现见：[\[linkId\].ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/archives/[linkId].ts)、[resolveAccessibleArchive.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts)
+**影响：** 如果 Link 从 collection A 移到 collection B，但 `moveFiles` 执行失败/未完成，那么 DB 字段里存的还是 `archives/A/123.jpeg`，archives API 按实时拼接会去读 `archives/B/123.jpeg`（404），而 Worker 内部若复用 monolith 则会读 DB 里存的旧路径（可能还存在也可能已被删）。
 
-#### 2.2.2 Monolith 安全读取（preserved API，用户内容域名隔离）
+### 2.3 readFile 返回值的本地/S3 差异（核准！）
 
-当配置 `NEXT_PUBLIC_USER_CONTENT_DOMAIN` 时，Monolith HTML 必须走独立域名以防止 XSS：
+[readFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/readFile.ts) 是读取降级的核心，三种情况返回值不同：
 
-1. `GET /api/v1/preserved/token?linkId=&format=`：服务端签发 JWT token（有效期 300s），包含 `filePath`、`linkId`、`format`
-2. 前端用 token 访问 `NEXT_PUBLIC_USER_CONTENT_DOMAIN/api/v1/preserved/view?token=`
-3. 服务端校验 Host 头、token 有效性，然后读取文件返回
+| 情景 | 本地文件系统 | S3 对象存储 |
+|---|---|---|
+| 文件存在 | `{ file: Buffer, contentType: 按后缀推断, status: 200 }` | `{ file: Buffer, contentType: 按后缀推断, status: 200 }` |
+| 文件不存在 | `{ file: "File not found.", contentType: "text/plain", status: 404 }` | `headObject` 抛错 → `{ file: "File not found.", contentType: "text/plain", status: 400 }` **（注意是 400 不是 404）** |
+| 内部异常（S3 连不上/权限错等） | N/A（本地异常会直接 throw 到最外层？不，本地没 try/catch，fs.existsSync 和 readFileSync 报错会上抛） | 最外层 catch → `{ file: "An internal occurred, please contact the support team.", contentType: "text/plain" }` **（注意没有 status 字段！）** |
 
-> 实现见：[createPreservedFormatUrl.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/preserved/createPreservedFormatUrl.ts)、[view.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/preserved/view.ts)
+> S3 模式下先 `headObject` 判断存在性，不存在直接 return 400，不会再发 `GetObject`。
+> 文件末尾定义的 `fileNotFoundTemplate`（一段 HTML 说明）定义了但从未 return，实际上线不会输出这段 HTML。
 
-#### 2.2.3 头像读取
+#### 上层调用方如何用 status
 
-`GET /api/v1/avatar/[id]`：直接读取 `uploads/avatar/<id>.jpg`，无需鉴权（头像视为公开）。
+- **archives API**：[linkId].ts#L122-L127
+  ```ts
+  const { file, contentType, status } = await readFile(filePath);
+  res.setHeader("Content-Type", contentType)
+     .status(status as number)       // S3 内部异常时 status=undefined → Number(undefined)=NaN → Express 默认 200
+     .send(file);
+  ```
+- **preserved/view API**：[view.ts#L131-L134](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/preserved/view.ts#L131-L134)
+  ```ts
+  if (status !== 200) {
+    return res.status(status as number).send(file);  // status 为 undefined/NaN 时同上
+  }
+  ```
+- **avatar API**：[id].ts#L32-L39
+  ```ts
+  res.setHeader("Content-Type", contentType)
+     .status(status as number)
+     .send(file);
+  ```
 
-> 实现见：[\[id\].ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/avatar/[id].ts)
-
-#### 2.2.4 上传归档文件
-
-`POST /api/v1/archives/[linkId]?format=&preview=`：允许用户手动上传 PDF / 图片 / HTML 作为归档，流程：
-1. 鉴权 + 检查 collection 权限（`canCreate`）
-2. 校验文件大小（默认 10MB）和 MIME 类型
-3. 若是图片，额外生成 preview
-4. 调用 `createFile` 落盘，并更新 `Link.image / pdf / monolith` 字段
-
-> 实现见：[\[linkId\].ts#L130-L290](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/archives/[linkId].ts#L130-L290)
+**结论：** 当 S3 内部异常时 `status` 字段缺失，Express/Nest 会按 200 返回但 body 是错误文本，前端按成功解析但拿到的是纯文本，可能导致图片/PDF 解析失败。
 
 ---
 
-## 三、清理触发点
+## 三、清理触发点（按调用链核准）
 
-### 3.1 触发场景总览
+### 3.1 触发场景总览（带精确调用点）
 
-| 场景 | 触发方式 | 清理内容 | 关键实现 |
+| 场景 | 触发方式 | 清理动作 | 关键代码 |
 |---|---|---|---|
-| 删除单个 Link | `DELETE /api/v1/links/[id]` | 该 link 所有归档文件 + MeiliSearch 索引 | [deleteLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/deleteLinkById.ts) |
-| 批量删除 Links | `DELETE /api/v1/links` body `{ids:[]}` | 循环调用 removeFiles | [deleteLinksById.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/bulk/deleteLinksById.ts) |
-| 删除 Collection（Owner） | `DELETE /api/v1/collections/[id]` | 递归删子集合、对应 archives 目录 + preview 目录 + MeiliSearch | [deleteCollectionById.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts) |
-| 成员离开 Collection | 同上（member 视角） | 仅解除 UsersAndCollections 关系，**不删文件** | 同上 |
-| 删除 User | `DELETE /api/v1/users/[id]` | 其所有 collection 的 archives 目录 + 头像 + Stripe 订阅 | [deleteUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts) |
-| 修改 Link 的 URL | `PUT /api/v1/links/[id]`（URL 变化） | 删除旧 URL 对应的归档文件，DB 字段置 null | [updateLinkById.ts#L133-L144](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L133-L144) |
-| Link 跨 Collection 移动 | `PUT /api/v1/links/[id]`（collectionId 变化） | 调用 `moveFiles` 在目录间移动文件，**不删文件** | [updateLinkById.ts#L195-L197](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L195-L197) |
-| 清空单条 Link 归档 | `PUT /api/v1/links/[id]/archive` | 删除归档文件并将 DB 字段置 null，等待 worker 重新生成 | [index.ts (links/\[id\]/archive)](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/links/[id]/archive/index.ts) |
-| 批量清空 Links 归档 | `DELETE /api/v1/links/archive` | 对指定 linkIds 执行 removeFiles + 字段置 null | [index.ts (links/archive)](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/links/archive/index.ts) |
-| 管理员批量重置 | `DELETE /api/v1/worker/preservation` action=`allAndRePreserve` / `allBroken` | 删所有归档 或 仅重置标记为 "unavailable" 的条目 | [preservation.tsx](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx) |
-| Worker 归档过程中 Link 被删 | archiveHandler finally 块 | 检测 finalLink 为 null 时立即 removeFiles | [archiveHandler.ts#L208-L227](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L227) |
-| 用户移除头像 | `PUT /api/v1/users/[id]` 传 `image=""` | 删除 `uploads/avatar/<userId>.jpg` | [updateUserById.ts#L94-L96](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts#L94-L96) |
+| 删除单 Link | `DELETE /api/v1/links/[id]` | `prisma.link.delete` → `removeFiles(linkId, collectionId)` → MeiliSearch 删文档 | [deleteLinkById.ts#L22-L31](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/deleteLinkById.ts#L22-L31) |
+| 批量删 Link | `DELETE /api/v1/links` body `{ids:[]}` | `prisma.link.deleteMany` → 循环 `removeFiles` → MeiliSearch | [deleteLinksById.ts#L35-L51](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/bulk/deleteLinksById.ts#L35-L51) |
+| 删除 Collection（Owner） | `DELETE /api/v1/collections/[id]` | 递归删子集合 DB 数据 → `removeFolder("archives/{id}")` + `"archives/preview/{id}"` → MeiliSearch → 删自身记录 | [deleteCollectionById.ts#L54-L101](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L54-L101)、[#L106-L150](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L106-L150) |
+| 成员离开 Collection | 同上（member 调） | 仅解除 `UsersAndCollections` 关系，文件不动 | [deleteCollectionById.ts#L23-L49](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L23-L49) |
+| 删除 User | `DELETE /api/v1/users/[id]` | 在 `$transaction` 内：MeiliSearch → 所有 collection `removeFolder` → `removeFile("uploads/avatar/{id}.jpg")` → Stripe → `prisma.user.delete`（级联删 DB） | [deleteUserById.ts#L108-L205](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L108-L205) |
+| 修改 Link URL | `PUT /api/v1/links/[id]` URL 变化 | `removeFiles(oldLink.id, oldLink.collectionId)`，DB 中 image/pdf/readable/monolith/preview/lastPreserved 全部置 `null` | [updateLinkById.ts#L133-L163](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L133-L163) |
+| Link 跨 Collection 移动 | `PUT` 时 collectionId 变化 | `moveFiles(linkId, oldCollectionId, newCollectionId)` | [updateLinkById.ts#L195-L197](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L195-L197) |
+| 清空单条归档并重做 | `PUT /api/v1/links/[id]/archive` | 字段置 `null` + `removeFiles` | [links/[id]/archive/index.ts#L51-L68](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/links/[id]/archive/index.ts#L51-L68) |
+| 批量清空归档 | `DELETE /api/v1/links/archive` body `{linkIds:[]}` | 每条授权 link → `removeFiles` + 字段置 `null` | [links/archive/index.ts#L62-L87](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/links/archive/index.ts#L62-L87) |
+| 管理员批量重置 | `DELETE /api/v1/worker/preservation` action=`allAndRePreserve` \| `allBroken` | 全部删/仅重置 `"unavailable"` → 字段置 `null` | [preservation.tsx#L36-L165](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L36-L165) |
+| Worker 归档过程中 Link 被删 | archiveHandler `finally` 块 | `finalLink == null` → `removeFiles` | [archiveHandler.ts#L208-L227](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L227) |
+| 用户清除头像 | `PUT /api/v1/users/[id]` body `image=""` | `removeFile("uploads/avatar/{userId}.jpg")` | [updateUserById.ts#L94-L96](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts#L94-L96) |
 
-### 3.2 Worker 归档流程中的清理协作
+### 3.2 Worker 内 "已归档" 判断的两套不统一逻辑
 
-Worker 入口：[worker.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/worker.ts) → [linkProcessing.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/workers/linkProcessing.ts) 每 N 秒轮询未归档的 link。
+判断"某个格式是否已归档"散落在三处且条件不一致：
 
-关键协作点在 [archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts)：
+| 位置 | 判断条件 | `"unavailable"` 会被视为"已归档"吗？ |
+|---|---|---|
+| [archiveHandler.ts#L122](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L122) 等外层入口 | `!link.image`（falsy 判断） | **是**（字符串为 truthy，跳过整个分支，不会再尝试） |
+| [handleScreenshotAndPdf.ts#L23](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L23) / [#L58](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L58) | `!link.image?.startsWith("archive")` | **否**（`"unavailable"` 不以 "archive" 开头，会继续尝试重新生成——但外层已经跳过了这个 handler，实际上到不了这里） |
+| [handleArchivePreview.ts#L42](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts#L42) / [#L59](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts#L59) | `!link.preview?.startsWith("archive")` | 同上 |
 
-1. **归档前创建目录**：`createFolder({ filePath: "archives/preview/{collectionId}" })` 和 `archives/{collectionId}`。
-2. **若归档过程中 link 已被删除**：`finally` 块中 `prisma.link.findUnique` 返回 null → 调用 `removeFiles(link.id, link.collectionId)` 清理半成品。
-3. **归档失败标记**：对未生成的格式，将对应字段写入 `"unavailable"`（而不是保留 null），避免 worker 无限重试。需要再次归档时，前端应调用 `PUT /links/[id]/archive` 将字段重置为 null。
+**但因为外层用 falsy 先把门，`"unavailable"` 的 Link 永远不会进入具体 handler，所以不会被重新处理——必须手动走"清空归档并重做" API 把字段重置成 `null`。**
 
-### 3.3 删除 Collection 的递归逻辑
+### 3.3 archiveHandler finally 块的残留处理（核准！）
 
-[deleteCollectionById.ts#L106-L150](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L106-L150) 中 `deleteSubCollections` 递归处理：
+[archiveHandler.ts#L203-L229](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L203-L229) 的逻辑：
 
 ```
-对每个子集合 subCollection:
-  ├── 递归 deleteSubCollections(subCollection.id)
-  ├── 删除 UsersAndCollections 关联
-  ├── 查询所有 links 的 id → 删除 MeiliSearch 文档
-  ├── prisma.link.deleteMany (级联删 Highlight 等)
-  ├── prisma.collection.delete
-  └── removeFolder("archives/{subCollection.id}")
-      removeFolder("archives/preview/{subCollection.id}")
+finally {
+  finalLink = prisma.link.findUnique({ id: link.id })
+  if (finalLink) {
+    // 对每个字段：若 DB 里该字段仍为 falsy（null/空串），写 "unavailable"
+    // 但不会去删已经写入的半成品文件！
+    prisma.link.update({
+      readable: !finalLink.readable ? "unavailable" : undefined,
+      image:    !finalLink.image    ? "unavailable" : undefined,
+      ...
+    })
+  } else {
+    // Link 已被删 → 清理所有可能已写入的文件
+    removeFiles(link.id, link.collectionId)
+  }
+}
 ```
 
-注意：文件删除发生在 DB 记录删除之后（先删子集合关联数据，再删目录），且不在 Prisma `$transaction` 内与 DB 操作一起原子化。
-
-### 3.4 删除 User 的清理逻辑
-
-[deleteUserById.ts#L108-L205](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L108-L205) 在一个 prisma `$transaction(timeout=20s)` 内：
-
-1. 查询 ownerId = 该用户的所有 link → 删除 MeiliSearch 文档
-2. 查询其所有 collection → `Promise.all` 删除每个 collection 的 `archives/{id}` 和 `archives/preview/{id}` 目录
-3. 删除头像 `uploads/avatar/{userId}.jpg`
-4. 处理 Stripe 订阅取消 / seat 扣减
-5. 最终 `prisma.user.delete`（通过 `onDelete: Cascade` 级联清理 Collection / Link / Tag / Highlight 等表）
+**关键核准点：** 如果 createFile 成功但 prisma.update 失败（网络抖动），则出现"文件存在但 DB 字段仍是 null"的孤儿；finally 块会把字段打成 `"unavailable"`，**不会删那个孤儿文件**。下次该 Link 也不会再被 Worker 选中（因为 `lastPreserved` 已设置，见 getLinkBatchFairly 的 `lastPreserved: null` 条件）。
 
 ---
 
-## 四、残留处理与容错
+## 四、残留处理 & 容错（逐场景核准）
 
-### 4.1 可能产生残留文件的场景
+### 4.1 残留产生的精确场景
 
-| 场景 | 原因 | 是否有自动清理 |
-|---|---|---|
-| 事务 / API 中断 | 删除 collection 时 DB 回滚但 `removeFolder` 已执行；或反之 DB 已删但 API 在 removeFolder 前崩溃 | **无**，需人工干预 |
-| S3 删除静默失败 | `removeFile` / `removeFolder` 中 S3 异常仅 `console.log`，未抛出 | **无** |
-| 本地 fs.unlink 回调失败 | `removeFile` 的 fs.unlink 为异步，出错仅日志 | **无** |
-| link 跨 collection 移动中异常 | `moveFile` 在 S3 上先 copy 再 delete，若 copy 完 delete 前崩溃，源文件残留 | **无** |
-| 临时上传文件未清理 | `formidable` 产生的临时文件，仅在上传成功时 `fs.unlinkSync` | 若上传失败回调中抛错，可能残留 formidable 临时目录文件（由操作系统 / tmpwatch 处理） |
-| 归档中途 Worker 进程被杀 | archiveHandler 正在写多个格式时崩溃，半成品文件无 DB 引用 | **无**，且 DB 字段保持 null 会让后续 worker 再次覆盖式写入 |
-| DB 字段与实际文件不一致 | 文件在存储端被人为删除，但 DB 仍保留路径 | 读取时 `readFile` 返回 404，前端展示 "File not found" 模板 |
+| # | 场景 | 代码路径 | 残留内容 | 有无自动清理 |
+|---|---|---|---|---|
+| 1 | `createFile` 成功 + `prisma.link.update` 失败 | 所有归档 handler（handleScreenshotAndPdf 等） | 存储端存在文件，DB 字段为 null / undefined → 随后 finally 打成 `"unavailable"` | 无，需手动触发"重新归档"或手工删 |
+| 2 | 删除 Collection 时 `removeFolder` 之前进程崩溃 | deleteCollectionById.ts | DB 记录已删（或未删，视崩溃点），文件完整保留 | 无；若 DB 已删则文件永久无主 |
+| 3 | S3 `removeFile` / `removeFolder` 网络异常 | removeFile.ts / removeFolder.ts try/catch console.log | DB 已删，S3 对象仍在 | 无 |
+| 4 | 本地 `removeFile` fs.unlink 回调失败（文件被锁/权限） | removeFile.ts#L27-L29 | DB 已删，磁盘文件仍在 | 无 |
+| 5 | `moveFile` S3 copyObject 成功但 removeFile 前崩溃（注意：moveFile 根本不 await） | moveFile.ts#L17-L23 | 目标路径和源路径都有同一文件副本（双倍占用） | 无；源路径在删老 collection 时可能被 `removeFolder` 清走 |
+| 6 | `moveFile` 本地 fs.rename 中途崩溃（极罕见） | moveFile.ts#L33-L37 | 取决于 OS atomicity，通常要么都成功要么都失败 | 无 |
+| 7 | Worker 处理到一半被 SIGKILL（例如部署重启） | archiveHandler 中间任意位置 | 已写入的文件孤儿；DB 字段仍是 null；`lastPreserved` 仍是 null → **下次会被重新选中并覆盖写入** | 部分"自愈"（覆盖写），但旧版本字节不会被释放 |
+| 8 | 人工在存储端删除文件但保留 DB 路径 | 运维操作 | readFile 返回 400/404/无 status，前端显示 "File not found" | 无自愈机制，需要 DB 侧手动重置字段或重新归档 |
+| 9 | formidable 上传文件失败时未进入 catch 分支 | archives/[linkId].ts#L199-L289 | OS 临时目录残留 form 文件 | 依赖系统 tmpwatch / 重启清理 |
+| 10 | `removeFolder` S3 分页列举时新写入了对象 | removeFolder.ts#L22-L36 IsTruncated 递归 | 后写入的对象可能漏删 | 无 |
 
-### 4.2 现存容错措施
+### 4.2 现存容错措施（核准）
 
-1. **文件操作静默失败**：所有 `removeFile` / `removeFolder` / `moveFile` 在本地和 S3 模式下都用 `try/catch` + `console.log`，保证上层业务（如删除 Link / Collection）即使文件删不掉也能继续完成 DB 层删除，避免"删不掉文件导致记录无法删除"。
+1. **文件操作静默失败**：`removeFile` / `removeFolder` / `moveFile` 的所有存储异常都被 try/catch 吞掉并仅 console.log，保证 DB 层删除不被阻塞。**代价是残留无感知。**
+2. **读取端降级**：文件不存在时返回纯文本错误 + 非 2xx status（本地 404、S3 400、S3 内部异常无 status）。`fileNotFoundTemplate` HTML 声明了但未被实际使用。
+3. **重复写入幂等**：
+   - archiveHandler 外层：`!link.image` 等 falsy 判断跳过已归档格式；
+   - handleScreenshotAndPdf 内层：`!link.image?.startsWith("archive")` 进一步保护；
+   - 手动上传 API：`link.image.endsWith("jpeg") && format===png` 这种 PNG/JPEG 互斥检查。
+4. **`"unavailable"` 熔断**：防止 Worker 对注定失败的 URL 反复尝试。
+5. **`lastPreserved` 时间戳**：作为 Worker 取任务的"水位线"，避免重复选中已经处理过的 Link。
 
-2. **读取端优雅降级**：`readFile` 在文件不存在时返回 `{ file: "File not found.", contentType: "text/plain", status: 404 }`，并附带 HTML 模板说明，不会 500。
+### 4.3 核准后补充的缺失能力
 
-3. **重复写入幂等**：归档流程对已存在的格式（例如 `link.image` 非空时跳过截图），避免重复写。手动上传时若 PNG/JPEG 互斥也会先检查。
+除已记录的孤儿扫描/回收站/事务一致性/操作审计外，根据本次代码核查再补充：
 
-4. **"unavailable" 标记熔断**：归档失败的格式会被标记为 `"unavailable"`，worker 不会重复尝试，防止无限浪费资源。
+- **`readFile` 返回结构不统一**：S3 内部异常无 `status` 字段，调用方 `status as number` 变成 NaN，可能被 Express 当作 200 返回；建议固定返回结构。
+- **`moveFile` S3 未 promisify**：回调风格导致 `moveFiles` 实际是"fire-and-forget"，Link 跨集合移动后 DB 字段还是旧路径，archives API 按新 collectionId 拼路径会 404，直到 moveFile 的异步回调真的跑完（甚至 copyObject 回调报错根本不会跑）。
+- **`removeFile` 本地异步未 await**：`fs.unlink(callback)` 没包装成 Promise，`removeFiles` 并发 7 次删除返回时，文件可能还没真正释放磁盘空间。
+- **`fileNotFoundTemplate` 死代码**：readFile.ts 末尾 HTML 模板从未被 return，可以清理或在 archives API 上使用以优化 UX。
+- **归档处理中断后 DB 与存储端不一致无对账**：createFile 成功但 prisma.update 失败时，文件孤儿且 `"unavailable"` 字段阻断后续重试，只能手工干预。
 
-### 4.3 缺失能力（当前代码未实现）
-
-- **孤儿文件扫描**：没有定时任务扫描 `archives/**` / `uploads/**`，比对 DB 中存在的 `collectionId` / `linkId` / `userId`，删除无主文件。
-- **回收站 / Soft Delete**：所有删除均为硬删除，DB 和文件均无回退可能。
-- **事务一致性**：文件系统操作未参与 DB 事务，无法回滚。
-- **操作审计**：删除文件无日志记录（仅 `console.log`）。
-
-### 4.4 关键环境变量
+### 4.4 关键环境变量（核准）
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `STORAGE_FOLDER` | `data` | 本地存储根目录名 |
-| `SPACES_ENDPOINT` / `SPACES_REGION` / `SPACES_KEY` / `SPACES_SECRET` / `SPACES_BUCKET_NAME` | - | S3/DO Spaces 配置，同时存在时启用 S3 模式 |
-| `SPACES_FORCE_PATH_STYLE` | - | S3 path-style 访问开关 |
-| `NEXT_PUBLIC_USER_CONTENT_DOMAIN` | - | 配置后强制 Monolith 通过独立域名 + JWT token 访问，防御 XSS |
-| `NEXT_PUBLIC_MAX_FILE_BUFFER` | `10` | 手动上传文件大小限制（MB） |
-| `DISABLE_PRESERVATION` | - | 设为 `true` 时所有归档全部标记为 unavailable，不生成文件 |
+| `SPACES_ENDPOINT` / `SPACES_REGION` / `SPACES_KEY` / `SPACES_SECRET` / `SPACES_BUCKET_NAME` / `SPACES_FORCE_PATH_STYLE` | - | 全部存在则启用 S3 模式 |
+| `NEXT_PUBLIC_USER_CONTENT_DOMAIN` | - | 配置后 Monolith 必须走独立域名 + JWT token |
+| `NEXT_PUBLIC_MAX_FILE_BUFFER` | `10` | 手动上传文件大小 MB 限制 |
+| `DISABLE_PRESERVATION` | - | `"true"` 时所有归档标记为 unavailable |
+| `SCREENSHOT_MAX_BUFFER` / `PDF_MAX_BUFFER` / `READABILITY_MAX_BUFFER` / `PREVIEW_MAX_BUFFER` / `MONOLITH_MAX_BUFFER` | 均 `100`（preview 为 `10`） | Worker 归档时 Buffer 上限（MB），超限直接 console 并跳过不写 DB |
 
 ---
 
@@ -223,31 +241,33 @@ Worker 入口：[worker.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarde
 
 ```
 用户上传 / Worker 归档
-        │
-        ▼
-  createFile / createFolder  ─────────┐
-        │                             │
-        ▼                             │
-  DB 写入 Link.image/pdf/...          │
-        │                             │
-        ▼                             │
-  前端访问 ──► archives API           │
-        │     resolveAccessibleArchive│
-        │     readFile                │
-        ▼                             │
-  文件返回 ◄───────────────────────────┘
+  │
+  ├─ 权限校验 ──► prisma 查询 collection/member
+  │
+  ├─ createFile(filePath=`archives/<collectionId>/<linkId>.<suffix>`)
+  │    ├─ 本地: path.join(process.cwd(), "../..", STORAGE_FOLDER, filePath)
+  │    └─ S3:   PutObject(Bucket=SPACES_BUCKET_NAME, Key=filePath)
+  │
+  ├─ prisma.link.update({ image/pdf/monolith/readable/preview: filePath })
+  │    └─ 此处失败会产生孤儿文件（finally 仅把 null 置 unavailable，不删文件）
+  │
+  ▼
+前端访问（两条路径不一致！）
+  ├─ archives API: resolveAccessibleArchive 实时拼路径
+  │     `archives/${collection.id}/${linkId+suffix}`  ──► readFile
+  │
+  └─ Worker 内部: readFile(link.monolith)  ◄── 直接使用 DB 存储的路径
 
-用户删除 Link / Collection / User / 重新归档
-        │
-        ▼
-  prisma.link/collection/user.delete(...)
-        │
-        ▼
-  removeFiles(linkId, collectionId)  ◄── 删除所有格式文件
-  或 removeFolder("archives/{id}")   ◄── 删整个 collection 目录
-  或 removeFolder("archives/preview/{id}")
-  或 removeFile("uploads/avatar/{id}.jpg")
-        │
-        ▼
-  meiliClient.deleteDocument(s)      ◄── 同步清理搜索索引
+
+用户删除 / 重做归档
+  │
+  ├─ prisma.link/collection/user.delete(...)   (DB 级联 onDelete: Cascade)
+  │
+  ├─ removeFiles(linkId, collectionId)         ◄── 7 种文件并发删（本地异步不 await）
+  │   或 removeFolder("archives/<collectionId>")
+  │   或 removeFolder("archives/preview/<collectionId>")
+  │   或 removeFile("uploads/avatar/<userId>.jpg")
+  │   或 moveFiles(linkId, fromId, toId)        ◄── S3 回调不 await，fire-and-forget
+  │
+  └─ meiliClient.deleteDocument(s)  ◄── 清理搜索索引
 ```
