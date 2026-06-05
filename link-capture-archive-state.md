@@ -4,7 +4,7 @@
 
 ### 1.1 创建链接自动触发
 
-**入口文件**：[postLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/web/lib/api/controllers/links/postLink.ts)
+**入口模块**：创建链接控制器（`apps/web/lib/api/controllers/links/postLink.ts`）
 
 当用户通过 API 创建新链接时，系统会自动初始化归档状态：
 
@@ -35,7 +35,7 @@ const newLink = await prisma.link.create({
 
 ### 1.2 手动重新归档
 
-**入口文件**：[links/[id]/archive/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/web/pages/api/v1/links/%5Bid%5D/archive/index.ts)
+**入口模块**：单链接归档 API（`apps/web/pages/api/v1/links/[id]/archive/index.ts`）
 
 用户可以通过 PUT 请求触发单个链接的重新归档：
 
@@ -58,12 +58,12 @@ await prisma.link.update({
 
 ### 1.3 文件上传归档
 
-**入口文件**：[archives/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/web/pages/api/v1/archives/index.ts)
+**入口模块**：归档上传 API（`apps/web/pages/api/v1/archives/index.ts`）
 
 用户上传文件时，系统使用了一个"临时锁定"机制防止与 worker 竞争：
 
 ```typescript
-// 创建时临时锁定，设置 lastPreserved = 1970-01-01，防止 archiveHandler 选中
+// 创建时临时锁定，设置 lastPreserved = 1970-01-01，防止归档处理器选中
 const link = await prisma.link.create({
   data: {
     // ...
@@ -91,7 +91,7 @@ await prisma.link.update({
 
 ### 2.1 Worker 主循环
 
-**入口文件**：[linkProcessing.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/workers/linkProcessing.ts)
+**入口模块**：链接处理 Worker（`apps/worker/workers/linkProcessing.ts`）
 
 Worker 采用无限循环 + 公平调度的方式处理链接：
 
@@ -127,7 +127,7 @@ export async function linkProcessing(interval = 10) {
 
 ### 2.2 公平调度算法
 
-**入口文件**：[getLinkBatchFairly.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/getLinkBatchFairly.ts)
+**入口模块**：公平批次获取器（`apps/worker/lib/getLinkBatchFairly.ts`）
 
 为了防止单个用户占用全部处理资源，系统采用多用户轮询调度：
 
@@ -169,7 +169,7 @@ await prisma.user.updateMany({
 
 ### 2.3 归档处理核心
 
-**入口文件**：[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/archiveHandler.ts)
+**入口模块**：归档处理器（`apps/worker/lib/archiveHandler.ts`）
 
 核心处理流程：
 
@@ -229,7 +229,7 @@ export default async function archiveHandler(
 
 ### 3.1 数据模型
 
-**入口文件**：[schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/packages/prisma/schema.prisma#L166-L198)
+**定义位置**：Link 数据模型（`packages/prisma/schema.prisma#L166-L198`）
 
 Link 模型中与归档相关的字段：
 
@@ -262,7 +262,7 @@ model Link {
 
 ### 3.3 状态流转核心逻辑
 
-状态流转的关键在于 `archiveHandler` 中的 `try-catch-finally` 结构：
+状态流转的关键在于归档处理器中的 `try-catch-finally` 结构：
 
 ```
 函数入口
@@ -289,7 +289,7 @@ model Link {
 
 ### 3.4 finally 块的关键作用
 
-**代码位置**：[archiveHandler.ts#L203-L230](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/archiveHandler.ts#L203-L230)
+**代码位置**：归档处理器 finally 块（`apps/worker/lib/archiveHandler.ts#L203-L230`）
 
 ```typescript
 finally {
@@ -322,20 +322,20 @@ finally {
 }
 ```
 
-**重要结论**：只要进入了 `try` 块（第109行），无论处理成功还是失败，`finally` 块一定会执行，`lastPreserved` 一定会被设置为当前时间。
+**重要结论**：只要进入了 `try` 块，无论处理成功还是失败，`finally` 块一定会执行，`lastPreserved` 一定会被设置为当前时间。
 
 ### 3.5 各归档格式的独立处理
 
 每个归档格式都有独立的处理文件，成功后立即更新数据库：
 
-| 归档格式 | 处理文件 | 错误处理方式 | 是否向外抛出 |
+| 归档格式 | 处理模块 | 错误处理方式 | 是否向外抛出 |
 |---------|---------|-------------|------------|
-| 预览图 | [handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts) | 内部 catch 但非 UnsafeUrlError 会重抛 | 可能抛出 |
-| 截图/PDF | [handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts) | `Promise.allSettled` 捕获 | 不抛出 |
-| 可读性 | [handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts) | 大小超限 return，无其他 catch | 可能抛出 |
-| 单文件HTML | [handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts) | 调用时 `.catch()` 捕获 | 不抛出 |
-| 图片处理 | [imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts) | 大小超限 return，无其他 catch | 可能抛出 |
-| PDF处理 | [pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts) | 大小超限 return，无其他 catch | 可能抛出 |
+| 预览图 | 预览图处理器（`apps/worker/lib/preservationScheme/handleArchivePreview.ts`） | 内部 catch 但非 UnsafeUrlError 会重抛 | 可能抛出 |
+| 截图/PDF | 截图PDF处理器（`apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts`） | `Promise.allSettled` 捕获 | 不抛出 |
+| 可读性 | 可读性处理器（`apps/worker/lib/preservationScheme/handleReadability.ts`） | 大小超限 return，无其他 catch | 可能抛出 |
+| 单文件HTML | Monolith处理器（`apps/worker/lib/preservationScheme/handleMonolith.ts`） | 调用时 `.catch()` 捕获 | 不抛出 |
+| 图片处理 | 图片处理器（`apps/worker/lib/preservationScheme/imageHandler.ts`） | 大小超限 return，无其他 catch | 可能抛出 |
+| PDF处理 | PDF处理器（`apps/worker/lib/preservationScheme/pdfHandler.ts`） | 大小超限 return，无其他 catch | 可能抛出 |
 
 以截图处理为例：
 
@@ -361,28 +361,28 @@ page.screenshot({ fullPage: true, type: "jpeg" })
 
 ### 4.1 异常抛出路径完整分析
 
-让我们从 `archiveHandler` 入口开始，逐条分析可能的异常路径：
+让我们从归档处理器入口开始，逐条分析可能的异常路径：
 
-**路径1：进入 try 块之前（第25-108行）**
+**路径1：进入 try 块之前（函数开头至 try 之前）**
 
 ```
-第32-42行: assertUrlIsSafeForServerFetch
+安全检查阶段: assertUrlIsSafeForServerFetch
   ├─ 抛出 UnsafeUrlError → skipPreservation = true，不向外抛出
   └─ 抛出其他异常 → 向外抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
 
-第44-61行: skipPreservation 或 URL 非 http/https
+跳过处理阶段: skipPreservation 或 URL 非 http/https
   └─ 更新 DB: lastPreserved = 现在，所有字段 = "unavailable" → return → 正常结束
 
-第77-80行: 创建浏览器上下文和页面
+浏览器创建阶段: 创建浏览器上下文和页面
   ├─ browser.newContext() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
   ├─ protectPageRequests() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
   └─ browser.newPage() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
 
-第82-107行: 创建文件夹、获取归档设置
+初始化阶段: 创建文件夹、获取归档设置
   └─ createFolder() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
 ```
 
-**路径2：进入 try 块之后（第109-230行）**
+**路径2：进入 try 块之后**
 
 ```
 try {
@@ -400,7 +400,7 @@ try {
 
 ### 4.2 Worker 层的异常捕获
 
-**代码位置**：[linkProcessing.ts#L45-L69](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/workers/linkProcessing.ts#L45-L69)
+**代码位置**：Worker 异常捕获（`apps/worker/workers/linkProcessing.ts#L45-L69`）
 
 ```typescript
 const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
@@ -421,7 +421,7 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
 };
 ```
 
-**关键理解**：Worker 的 catch 块只是记录日志和重启浏览器，**不会修改数据库状态**。但此时 `archiveHandler` 的 finally 已经执行，`lastPreserved` 已经被设置。
+**关键理解**：Worker 的 catch 块只是记录日志和重启浏览器，**不会修改数据库状态**。但此时归档处理器的 finally 已经执行，`lastPreserved` 已经被设置。
 
 ### 4.3 真实自动重试条件
 
@@ -429,7 +429,7 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
 
 | 场景 | 是否重试 | 原因 |
 |-----|---------|------|
-| 浏览器创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
+| 浏览器上下文创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
 | 页面创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
 | 文件夹创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
 | 进程被杀死（OOM、重启等） | ✅ 是 | finally 来不及执行 |
@@ -473,7 +473,7 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
 
 ### 4.6 待处理数量统计
 
-**入口文件**：[countUnprocessedBillableLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/36-linkwarden/apps/worker/lib/countUnprocessedBillableLinks.ts)
+**入口模块**：未处理链接计数器（`apps/worker/lib/countUnprocessedBillableLinks.ts`）
 
 ```typescript
 const count = await prisma.link.count({
