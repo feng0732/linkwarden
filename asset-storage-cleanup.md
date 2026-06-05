@@ -11,7 +11,7 @@
 | 本地文件系统 | `SPACES_ENDPOINT` / `SPACES_REGION` / `SPACES_KEY` / `SPACES_SECRET` 任意一个未配置 | 根目录由 `STORAGE_FOLDER`（默认 `data`）决定，最终绝对路径 = `path.join(process.cwd(), "../..", STORAGE_FOLDER, filePath)` |
 | S3 兼容对象存储 | 上述四个变量全部配置 | Bucket = `SPACES_BUCKET_NAME`，对象 Key = 传入的 `filePath` |
 
-> S3 客户端初始化见：[s3Client.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/s3Client.ts)
+> S3 客户端初始化见：[s3Client.ts](packages/filesystem/s3Client.ts)
 > 本地模式路径拼接在每个文件系统函数内部都重复了一遍 `path.join(process.cwd(), "../..", storagePath, filePath)`，未抽取成常量。
 
 ### 1.2 目录结构与文件命名（全部为无前置斜杠的相对路径 Key）
@@ -27,22 +27,22 @@ archives/preview/<collectionId>/<linkId>.jpeg         # 预览缩略图（固定
 uploads/avatar/<userId>.jpg                            # 用户头像（固定 JPG）
 ```
 
-> 枚举与后缀的映射见：[getSuffixFromFormat.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/shared/getSuffixFromFormat.ts)、[global.ts#L160-L166](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/types/global.ts#L160-L166)
-> 所有 Worker 归档 Handler 在写文件时都用模板字面量拼路径：[handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts)、[handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts)、[handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts)、[handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)、[imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts)、[pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts)、[generatePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/lib/generatePreview.ts)
+> 枚举与后缀的映射见：[getSuffixFromFormat.ts](apps/web/lib/shared/getSuffixFromFormat.ts)、[global.ts#L160-L166](packages/types/global.ts#L160-L166)
+> 所有 Worker 归档 Handler 在写文件时都用模板字面量拼路径：[handleScreenshotAndPdf.ts](apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts)、[handleReadability.ts](apps/worker/lib/preservationScheme/handleReadability.ts)、[handleMonolith.ts](apps/worker/lib/preservationScheme/handleMonolith.ts)、[handleArchivePreview.ts](apps/worker/lib/preservationScheme/handleArchivePreview.ts)、[imageHandler.ts](apps/worker/lib/preservationScheme/imageHandler.ts)、[pdfHandler.ts](apps/worker/lib/preservationScheme/pdfHandler.ts)、[generatePreview.ts](packages/lib/generatePreview.ts)
 
 ### 1.3 文件系统核心 API 行为核准
 
 | 函数 | 文件 | 关键行为 / 注意点 |
 |---|---|---|
-| `createFile` | [createFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFile.ts) | 返回 `boolean` 表示成功/失败；本地会 `fs.mkdir(recursive)` 自动建目录；S3 异常仅 console.error |
-| `readFile` | [readFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/readFile.ts) | 本地/S3 返回结构不一致（见 §二）；文件末尾有一段 `fileNotFoundTemplate` HTML **从未被 return 使用** |
-| `fileExists` | [fileExists.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/fileExists.ts) | S3 用 `HeadObject`；本地用 `fs.existsSync`；任何异常都当"不存在"返回 false |
-| `removeFile` | [removeFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/removeFile.ts) | **本地模式 fs.unlink 是异步回调、不 await**，调用方返回时删除可能还没完成；S3 用 await 但失败只 console.log |
-| `removeFolder` | [removeFolder.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/removeFolder.ts) | S3 用 `ListObjects` + `DeleteObjects` 分页循环，`IsTruncated` 时递归；本地用 `fs.rmdirSync(recursive:true)`；目录不存在时仅打日志 |
-| `moveFile` | [moveFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/moveFile.ts) | **S3 模式使用回调风格 `s3Client.copyObject(...)`，未 await/Promisify**，调用返回时 copy+delete 尚未执行；本地先 `fs.existsSync` 再 rename，不存在直接跳过 |
-| `createFolder` | [createFolder.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/createFolder.ts) | S3 no-op；本地 `fs.mkdirSync(recursive:true)` |
-| `removeFiles` | [manageFiles.ts#L4-L31](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/manageFiles.ts#L4-L31) | 对一个 link 并发 await 7 次 `removeFile`（pdf/png/jpeg/jpg/html/preview/readability），每个独立 try/catch |
-| `moveFiles` | [manageFiles.ts#L33-L68](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/manageFiles.ts#L33-L68) | 对 7 个文件调用 `moveFile`，在 S3 模式下全部"发射后不管" |
+| `createFile` | [createFile.ts](packages/filesystem/createFile.ts) | 返回 `boolean` 表示成功/失败；本地会 `fs.mkdir(recursive)` 自动建目录；S3 异常仅 console.error |
+| `readFile` | [readFile.ts](packages/filesystem/readFile.ts) | 本地/S3 返回结构不一致（见 §二）；文件末尾有一段 `fileNotFoundTemplate` HTML **从未被 return 使用** |
+| `fileExists` | [fileExists.ts](packages/filesystem/fileExists.ts) | S3 用 `HeadObject`；本地用 `fs.existsSync`；任何异常都当"不存在"返回 false |
+| `removeFile` | [removeFile.ts](packages/filesystem/removeFile.ts) | **本地模式 fs.unlink 是异步回调、不 await**，调用方返回时删除可能还没完成；S3 用 await 但失败只 console.log |
+| `removeFolder` | [removeFolder.ts](packages/filesystem/removeFolder.ts) | S3 用 `ListObjects` + `DeleteObjects` 分页循环，`IsTruncated` 时递归；本地用 `fs.rmdirSync(recursive:true)`；目录不存在时仅打日志 |
+| `moveFile` | [moveFile.ts](packages/filesystem/moveFile.ts) | **S3 模式使用回调风格 `s3Client.copyObject(...)`，未 await/Promisify**，调用返回时 copy+delete 尚未执行；本地先 `fs.existsSync` 再 rename，不存在直接跳过 |
+| `createFolder` | [createFolder.ts](packages/filesystem/createFolder.ts) | S3 no-op；本地 `fs.mkdirSync(recursive:true)` |
+| `removeFiles` | [manageFiles.ts#L4-L31](packages/filesystem/manageFiles.ts#L4-L31) | 对一个 link 并发 await 7 次 `removeFile`（pdf/png/jpeg/jpg/html/preview/readability），每个独立 try/catch |
+| `moveFiles` | [manageFiles.ts#L33-L68](packages/filesystem/manageFiles.ts#L33-L68) | 对 7 个文件调用 `moveFile`，在 S3 模式下全部"发射后不管" |
 
 ---
 
@@ -58,14 +58,14 @@ uploads/avatar/<userId>.jpg                            # 用户头像（固定 J
 | `"unavailable"` | 已尝试归档但失败 / 被用户配置禁用 | **否**（字符串是 truthy，`!link.image === false`） |
 | 形如 `archives/<collectionId>/<linkId>.<suffix>` 的字符串 | 归档成功，值即为文件系统/ S3 Key | **否**（见各 handler 的 `startsWith("archive")` 判断） |
 
-> Worker 批量取待处理 Link 的条件：[getLinkBatchFairly.ts#L36-L38](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/getLinkBatchFairly.ts#L36-L38)（`url != null AND lastPreserved IS NULL`）
+> Worker 批量取待处理 Link 的条件：[getLinkBatchFairly.ts#L36-L38](apps/worker/lib/getLinkBatchFairly.ts#L36-L38)（`url != null AND lastPreserved IS NULL`）
 
 ### 2.2 读取文件路径的来源：**DB 字段 vs 实时拼接（不统一！）**
 
 这是一个关键细节：读取文件有**两条路径**，使用的 filePath 来源并不相同：
 
 #### 路径 A — archives API（`GET /api/v1/archives/[linkId]`）
-在 [resolveAccessibleArchive.ts#L70-L72](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts#L70-L72) 中：
+在 [resolveAccessibleArchive.ts#L70-L72](apps/web/lib/api/archives/resolveAccessibleArchive.ts#L70-L72) 中：
 ```ts
 filePath = isPreview
   ? `archives/preview/${collection.id}/${linkId}.jpeg`
@@ -74,7 +74,7 @@ filePath = isPreview
 **它不读 DB 里存的 `Link.image/pdf/...` 字段，而是根据当前 `collection.id` + `linkId` + `format` 实时拼出来。**
 
 #### 路径 B — Worker 内部读已有 Monolith
-在 [archiveHandler.ts#L132-L148](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L132-L148) 中：
+在 [archiveHandler.ts#L132-L148](apps/worker/lib/archiveHandler.ts#L132-L148) 中：
 ```ts
 if (link.monolith?.endsWith(".html")) {
   const file = await readFile(link.monolith); // 直接用 DB 里存的路径
@@ -82,7 +82,7 @@ if (link.monolith?.endsWith(".html")) {
 ```
 
 #### 路径 C — 前端显示判断（getFormatBasedOnPreference）
-在 [getFormatBasedOnPreference.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/lib/getFormatBasedOnPreference.ts) 中同时检查 falsy **和** `"unavailable"`：
+在 [getFormatBasedOnPreference.ts](packages/lib/getFormatBasedOnPreference.ts) 中同时检查 falsy **和** `"unavailable"`：
 ```ts
 if (!link.pdf || link.pdf === "unavailable") return null;
 ```
@@ -92,7 +92,7 @@ if (!link.pdf || link.pdf === "unavailable") return null;
 
 ### 2.3 readFile 返回值的本地/S3 差异（核准！）
 
-[readFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/packages/filesystem/readFile.ts) 是读取降级的核心，三种情况返回值不同：
+[readFile.ts](packages/filesystem/readFile.ts) 是读取降级的核心，三种情况返回值不同：
 
 | 情景 | 本地文件系统 | S3 对象存储 |
 |---|---|---|
@@ -112,7 +112,7 @@ if (!link.pdf || link.pdf === "unavailable") return null;
      .status(status as number)       // S3 内部异常时 status=undefined → Number(undefined)=NaN → Express 默认 200
      .send(file);
   ```
-- **preserved/view API**：[view.ts#L131-L134](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/preserved/view.ts#L131-L134)
+- **preserved/view API**：[view.ts#L131-L134](apps/web/pages/api/v1/preserved/view.ts#L131-L134)
   ```ts
   if (status !== 200) {
     return res.status(status as number).send(file);  // status 为 undefined/NaN 时同上
@@ -135,18 +135,18 @@ if (!link.pdf || link.pdf === "unavailable") return null;
 
 | 场景 | 触发方式 | 清理动作 | 关键代码 |
 |---|---|---|---|
-| 删除单 Link | `DELETE /api/v1/links/[id]` | `prisma.link.delete` → `removeFiles(linkId, collectionId)` → MeiliSearch 删文档 | [deleteLinkById.ts#L22-L31](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/deleteLinkById.ts#L22-L31) |
-| 批量删 Link | `DELETE /api/v1/links` body `{ids:[]}` | `prisma.link.deleteMany` → 循环 `removeFiles` → MeiliSearch | [deleteLinksById.ts#L35-L51](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/bulk/deleteLinksById.ts#L35-L51) |
-| 删除 Collection（Owner） | `DELETE /api/v1/collections/[id]` | 递归删子集合 DB 数据 → `removeFolder("archives/{id}")` + `"archives/preview/{id}"` → MeiliSearch → 删自身记录 | [deleteCollectionById.ts#L54-L101](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L54-L101)、[#L106-L150](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L106-L150) |
-| 成员离开 Collection | 同上（member 调） | 仅解除 `UsersAndCollections` 关系，文件不动 | [deleteCollectionById.ts#L23-L49](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L23-L49) |
-| 删除 User | `DELETE /api/v1/users/[id]` | 在 `$transaction` 内：MeiliSearch → 所有 collection `removeFolder` → `removeFile("uploads/avatar/{id}.jpg")` → Stripe → `prisma.user.delete`（级联删 DB） | [deleteUserById.ts#L108-L205](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L108-L205) |
-| 修改 Link URL | `PUT /api/v1/links/[id]` URL 变化 | `removeFiles(oldLink.id, oldLink.collectionId)`，DB 中 image/pdf/readable/monolith/preview/lastPreserved 全部置 `null` | [updateLinkById.ts#L133-L163](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L133-L163) |
-| Link 跨 Collection 移动 | `PUT` 时 collectionId 变化 | `moveFiles(linkId, oldCollectionId, newCollectionId)` | [updateLinkById.ts#L195-L197](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L195-L197) |
-| 清空单条归档并重做 | `PUT /api/v1/links/[id]/archive` | 字段置 `null` + `removeFiles` | [links/[id]/archive/index.ts#L51-L68](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/links/[id]/archive/index.ts#L51-L68) |
-| 批量清空归档 | `DELETE /api/v1/links/archive` body `{linkIds:[]}` | 每条授权 link → `removeFiles` + 字段置 `null` | [links/archive/index.ts#L62-L87](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/links/archive/index.ts#L62-L87) |
-| 管理员批量重置 | `DELETE /api/v1/worker/preservation` action=`allAndRePreserve` \| `allBroken` | 全部删/仅重置 `"unavailable"` → 字段置 `null` | [preservation.tsx#L36-L165](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L36-L165) |
-| Worker 归档过程中 Link 被删 | archiveHandler `finally` 块 | `finalLink == null` → `removeFiles` | [archiveHandler.ts#L208-L227](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L227) |
-| 用户清除头像 | `PUT /api/v1/users/[id]` body `image=""` | `removeFile("uploads/avatar/{userId}.jpg")` | [updateUserById.ts#L94-L96](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts#L94-L96) |
+| 删除单 Link | `DELETE /api/v1/links/[id]` | `prisma.link.delete` → `removeFiles(linkId, collectionId)` → MeiliSearch 删文档 | [deleteLinkById.ts#L22-L31](apps/web/lib/api/controllers/links/linkId/deleteLinkById.ts#L22-L31) |
+| 批量删 Link | `DELETE /api/v1/links` body `{ids:[]}` | `prisma.link.deleteMany` → 循环 `removeFiles` → MeiliSearch | [deleteLinksById.ts#L35-L51](apps/web/lib/api/controllers/links/bulk/deleteLinksById.ts#L35-L51) |
+| 删除 Collection（Owner） | `DELETE /api/v1/collections/[id]` | 递归删子集合 DB 数据 → `removeFolder("archives/{id}")` + `"archives/preview/{id}"` → MeiliSearch → 删自身记录 | [deleteCollectionById.ts#L54-L101](apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L54-L101)、[#L106-L150](apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L106-L150) |
+| 成员离开 Collection | 同上（member 调） | 仅解除 `UsersAndCollections` 关系，文件不动 | [deleteCollectionById.ts#L23-L49](apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts#L23-L49) |
+| 删除 User | `DELETE /api/v1/users/[id]` | 在 `$transaction` 内：MeiliSearch → 所有 collection `removeFolder` → `removeFile("uploads/avatar/{id}.jpg")` → Stripe → `prisma.user.delete`（级联删 DB） | [deleteUserById.ts#L108-L205](apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L108-L205) |
+| 修改 Link URL | `PUT /api/v1/links/[id]` URL 变化 | `removeFiles(oldLink.id, oldLink.collectionId)`，DB 中 image/pdf/readable/monolith/preview/lastPreserved 全部置 `null` | [updateLinkById.ts#L133-L163](apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L133-L163) |
+| Link 跨 Collection 移动 | `PUT` 时 collectionId 变化 | `moveFiles(linkId, oldCollectionId, newCollectionId)` | [updateLinkById.ts#L195-L197](apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L195-L197) |
+| 清空单条归档并重做 | `PUT /api/v1/links/[id]/archive` | 字段置 `null` + `removeFiles` | [links/[id]/archive/index.ts#L51-L68](apps/web/pages/api/v1/links/[id]/archive/index.ts#L51-L68) |
+| 批量清空归档 | `DELETE /api/v1/links/archive` body `{linkIds:[]}` | 每条授权 link → `removeFiles` + 字段置 `null` | [links/archive/index.ts#L62-L87](apps/web/pages/api/v1/links/archive/index.ts#L62-L87) |
+| 管理员批量重置 | `DELETE /api/v1/worker/preservation` action=`allAndRePreserve` \| `allBroken` | 全部删/仅重置 `"unavailable"` → 字段置 `null` | [preservation.tsx#L36-L165](apps/web/pages/api/v1/worker/preservation.tsx#L36-L165) |
+| Worker 归档过程中 Link 被删 | archiveHandler `finally` 块 | `finalLink == null` → `removeFiles` | [archiveHandler.ts#L208-L227](apps/worker/lib/archiveHandler.ts#L208-L227) |
+| 用户清除头像 | `PUT /api/v1/users/[id]` body `image=""` | `removeFile("uploads/avatar/{userId}.jpg")` | [updateUserById.ts#L94-L96](apps/web/lib/api/controllers/users/userId/updateUserById.ts#L94-L96) |
 
 ### 3.2 Worker 内 "已归档" 判断的两套不统一逻辑
 
@@ -154,15 +154,15 @@ if (!link.pdf || link.pdf === "unavailable") return null;
 
 | 位置 | 判断条件 | `"unavailable"` 会被视为"已归档"吗？ |
 |---|---|---|
-| [archiveHandler.ts#L122](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L122) 等外层入口 | `!link.image`（falsy 判断） | **是**（字符串为 truthy，跳过整个分支，不会再尝试） |
-| [handleScreenshotAndPdf.ts#L23](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L23) / [#L58](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L58) | `!link.image?.startsWith("archive")` | **否**（`"unavailable"` 不以 "archive" 开头，会继续尝试重新生成——但外层已经跳过了这个 handler，实际上到不了这里） |
-| [handleArchivePreview.ts#L42](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts#L42) / [#L59](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts#L59) | `!link.preview?.startsWith("archive")` | 同上 |
+| [archiveHandler.ts#L122](apps/worker/lib/archiveHandler.ts#L122) 等外层入口 | `!link.image`（falsy 判断） | **是**（字符串为 truthy，跳过整个分支，不会再尝试） |
+| [handleScreenshotAndPdf.ts#L23](apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L23) / [#L58](apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L58) | `!link.image?.startsWith("archive")` | **否**（`"unavailable"` 不以 "archive" 开头，会继续尝试重新生成——但外层已经跳过了这个 handler，实际上到不了这里） |
+| [handleArchivePreview.ts#L42](apps/worker/lib/preservationScheme/handleArchivePreview.ts#L42) / [#L59](apps/worker/lib/preservationScheme/handleArchivePreview.ts#L59) | `!link.preview?.startsWith("archive")` | 同上 |
 
 **但因为外层用 falsy 先把门，`"unavailable"` 的 Link 永远不会进入具体 handler，所以不会被重新处理——必须手动走"清空归档并重做" API 把字段重置成 `null`。**
 
 ### 3.3 archiveHandler finally 块的残留处理（核准！）
 
-[archiveHandler.ts#L203-L229](file:///d:/fz/0601/solo-dogfeeding/code/40-linkwarden/apps/worker/lib/archiveHandler.ts#L203-L229) 的逻辑：
+[archiveHandler.ts#L203-L229](apps/worker/lib/archiveHandler.ts#L203-L229) 的逻辑：
 
 ```
 finally {
