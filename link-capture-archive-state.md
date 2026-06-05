@@ -271,17 +271,20 @@ model Link {
 状态流转的关键在于归档处理器中的 `try-catch-finally` 结构：
 
 ```
-函数入口
+函数入口（第25行）
     │
     ├─ 安全检查失败或URL不安全 → 直接设置 lastPreserved + unavailable → 返回
     │
-    ├─ 浏览器上下文/页面创建失败 → 抛出异常 → 函数终止 → lastPreserved 保持 null
+    ├─ 浏览器上下文/页面创建失败（try块前，第78/80行）
+    │    ├─ 原因：浏览器已断开连接
+    │    └─ 结果：抛出异常 → 函数终止 → lastPreserved 保持 null → 自动重试
     │
-    └─ 进入 try 块
+    └─ 进入 try 块（第109行）
          │
          ├─ 成功 → 各归档格式字段被设置为文件路径
          │
-         ├─ 失败 → catch 捕获并重新抛出异常
+         ├─ 失败（包括浏览器断开）→ catch 捕获并重新抛出异常
+         │    └─ 注意：try 块内的浏览器断开（page.goto()等）→ finally 仍会执行
          │
          └─ finally 块（★ 无论成功失败，只要进入 try 就一定会执行 ★）
               │
@@ -289,9 +292,12 @@ model Link {
               │
               ├─ 存在 → 设置 lastPreserved = 当前时间
               │         仍为 null 的字段 → 标记为 "unavailable"
+              │         （包括 try 块内浏览器断开导致未完成的格式）
               │
               └─ 不存在 → 删除已生成的文件
 ```
+
+**关键边界**：第109行 `try {` 是分界点。只有发生在该行之前的浏览器断开才会自动重试。
 
 ### 3.4 finally 块的关键作用
 
@@ -369,40 +375,45 @@ page.screenshot({ fullPage: true, type: "jpeg" })
 
 让我们从归档处理器入口开始，逐条分析可能的异常路径：
 
-**路径1：进入 try 块之前（函数开头至 try 之前）**
+**路径1：进入 try 块之前（第25-108行）**
 
 ```
-安全检查阶段: assertUrlIsSafeForServerFetch
+安全检查阶段: assertUrlIsSafeForServerFetch（第32-42行）
   ├─ 抛出 UnsafeUrlError → skipPreservation = true，不向外抛出
   └─ 抛出其他异常 → 向外抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
 
-跳过处理阶段: skipPreservation 或 URL 非 http/https
+跳过处理阶段: skipPreservation 或 URL 非 http/https（第44-61行）
   └─ 更新 DB: lastPreserved = 现在，所有字段 = "unavailable" → return → 正常结束
 
-浏览器创建阶段: 创建浏览器上下文和页面
-  ├─ browser.newContext() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
-  ├─ protectPageRequests() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
-  └─ browser.newPage() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+浏览器创建阶段: 创建浏览器上下文和页面（第77-80行）
+  ├─ browser.newContext() 抛出（可能因浏览器断开）→ 函数终止 → finally 不执行 → lastPreserved 保持 null → 自动重试
+  ├─ protectPageRequests() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null → 自动重试
+  └─ context.newPage() 抛出（可能因浏览器断开）→ 函数终止 → finally 不执行 → lastPreserved 保持 null → 自动重试
 
-初始化阶段: 创建文件夹、获取归档设置
-  └─ createFolder() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null
+初始化阶段: 创建文件夹、获取归档设置（第82-107行）
+  └─ createFolder() 抛出 → 函数终止 → finally 不执行 → lastPreserved 保持 null → 自动重试
 ```
 
-**路径2：进入 try 块之后**
+**路径2：进入 try 块之后（第109-198行）**
 
 ```
 try {
   // 任何业务逻辑抛出异常
+  // 包括：page.goto()、page.screenshot() 等因浏览器断开抛出
 } catch (err) {
   console.log("Failed Link:", link.url);
   console.log("Reason:", err);
   throw err;  // 重新抛出异常
 } finally {
-  // ★ 无论是否有异常，这里一定会执行！★
+  // ★ 无论是否有异常，无论是否浏览器断开，这里一定会执行！★
   // 设置 lastPreserved = 当前时间
   // 未成功字段标记为 "unavailable"
 }
 ```
+
+**浏览器断开关键结论**：
+- try 块前断开（第78/80行）→ 自动重试
+- try 块内断开（page 操作）→ 标记 unavailable，不重试
 
 ### 4.2 Worker 层的异常捕获
 
@@ -437,20 +448,26 @@ const archiveLink = async (link: LinkWithCollectionOwnerAndTags) => {
 
 **自动重试只会发生在以下极端情况**：
 
-| 场景 | 是否重试 | 原因 |
-|-----|---------|------|
-| 浏览器上下文创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
-| 页面创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
-| 文件夹创建失败 | ✅ 是 | 进入 try 块前抛出，finally 不执行 |
-| 进程被杀死（OOM、重启等） | ✅ 是 | finally 来不及执行 |
-| 浏览器意外断开连接 | ✅ 是 | 可能在任何位置中断，finally 可能未执行 |
-| 页面加载失败 | ❌ 否 | 进入 try 块后抛出，finally 执行 |
-| 浏览器超时 | ❌ 否 | 进入 try 块后抛出，finally 执行 |
-| 某个归档格式处理失败 | ❌ 否 | finally 执行 |
+| 场景 | 是否重试 | lastPreserved | 原因 |
+|-----|---------|---------------|------|
+| 浏览器上下文创建失败 | ✅ 是 | 保持 null | try 块前（第78行）`browser.newContext()` 抛出，finally 不执行 |
+| 页面创建失败 | ✅ 是 | 保持 null | try 块前（第80行）`context.newPage()` 抛出，finally 不执行 |
+| 文件夹创建失败 | ✅ 是 | 保持 null | try 块前抛出，finally 不执行 |
+| 浏览器断开在 try 块之前 | ✅ 是 | 保持 null | 第78/80行调用失败，finally 不执行 |
+| 浏览器断开在 try 块之内 | ❌ 否 | 被设置 | `page.goto()`/`page.screenshot()` 等抛出 → catch → finally 执行 |
+| 进程被杀死（OOM、重启等） | ✅ 是 | 保持 null | 无论位置，finally 来不及执行 |
+| 页面加载失败 | ❌ 否 | 被设置 | try 块内抛出，finally 执行 |
+| 浏览器超时 | ❌ 否 | 被设置 | try 块内抛出，finally 执行 |
+| 某个归档格式处理失败 | ❌ 否 | 被设置 | finally 执行 |
+
+**浏览器断开场景细分**：
+- **try 块前断开**（第25-108行）：`browser.newContext()` 或 `context.newPage()` 调用失败 → 函数终止 → finally 不执行 → 自动重试
+- **try 块内断开**（第109-198行）：`page.goto()`、`page.screenshot()` 等调用失败 → catch 捕获重抛 → finally 一定会执行 → 标记 unavailable，不重试
+- **注意**：`determineLinkType`、`imageHandler`、`pdfHandler`、`handleReadability`、`handleMonolith` 不直接使用 browser 对象，浏览器断开不会影响这些函数
 
 **核心结论**：
 - 正常业务异常（页面无法访问、超时等）**不会自动重试**
-- 只有基础设施层面的异常（浏览器/页面创建失败、进程崩溃、浏览器意外断开）才会自动重试
+- 浏览器断开不都会重试，只有发生在 try 块之前的断开才会重试
 - 30分钟浏览器轮换**不会导致**正在处理的链接失败，因为轮换只在批次之间进行
 
 ### 4.4 "unavailable" 终态详解
@@ -519,24 +536,25 @@ const count = await prisma.link.count({
                         ▼
                 archiveHandler 处理
                         │
-         ┌──────────────┴──────────────┐
-         │                             │
-         ▼                             ▼
-  浏览器上下文创建失败         浏览器上下文创建成功
-         │                             │
-  抛出异常，函数终止              进入 try 块
-  lastPreserved 保持 null              │
-  下次自动重试                        │
-                                       ▼
-                              确定链接类型
-                                       │
-                              浏览器访问页面
-                                       │
-         ┌─────────────────────────────┼─────────────────────────────┐
-         ▼                             ▼                             ▼
-  生成预览图                    提取可读文本                    截图 + PDF
-         │                             │                             │
-         ├─────────────────────────────┴─────────────────────────────┘
+         ┌──────────────┴──────────────────────────────────┐
+         │                                               │
+         ▼                                               ▼
+  try 块前浏览器断开（第78/80行）                 浏览器上下文创建成功
+         │                                               │
+  browser.newContext()/newPage() 失败               进入 try 块（第109行）
+  抛出异常，函数终止                                      │
+  lastPreserved 保持 null                                  │
+  下次自动重试                                            │
+                                                         ▼
+                                                  确定链接类型
+                                                         │
+                                                  浏览器访问页面
+                                                         │
+         ┌───────────────────────────────────────────────┼───────────────────────────────────────┐
+         ▼                                               ▼                                               ▼
+  生成预览图                                        提取可读文本                                    截图 + PDF
+         │                                               │                                               │
+         ├───────────────────────────────────────────────┴───────────────────────────────────────┘
          │
          ▼
   处理 Monolith（单文件HTML）
@@ -545,13 +563,15 @@ const count = await prisma.link.count({
          │
          ├─ 部分成功 → 部分字段 = 路径，部分 = null
          │
-         └─ 全部失败 → 所有字段 = null（但过程中可能有部分已写入）
+         ├─ 全部失败 → 所有字段 = null（但过程中可能有部分已写入）
+         │
+         └─ try 块内浏览器断开 → page.goto()/screenshot() 等抛出
                        │
                        ▼
                catch 捕获异常，重新抛出
                        │
                        ▼
-               ★ finally 块执行 ★
+               ★ finally 块执行 ★（一定会执行！）
                        │
               ┌────────┴────────┐
               │                 │
@@ -561,11 +581,16 @@ const count = await prisma.link.count({
               ▼
         lastPreserved = 现在
         仍为 null 的字段 → "unavailable"
+        （包括 try 块内浏览器断开导致未完成的格式）
                        │
                        ▼
                  归档结束
    （不会自动重试，需手动重置 lastPreserved）
 ```
+
+**关键分界点**：第109行 `try {`
+- 该行之前浏览器断开 → 自动重试
+- 该行之后浏览器断开 → 标记 unavailable，不重试
 
 ---
 
@@ -577,7 +602,7 @@ const count = await prisma.link.count({
 | 基于 `lastPreserved = null` 的隐式标记 | 简单可靠，无需额外状态字段 | 状态语义不明确，需要理解约定 |
 | `finally` 块强制收尾 | 确保处理过的链接有明确终态，避免无限等待 | 正常业务失败不会自动重试，用户体验可能不好 |
 | 按用户公平调度 | 防止大用户独占资源，保证多租户公平性 | 实现复杂，多轮数据库查询 |
-| 浏览器每30分钟轮换（仅批次间） | 防止内存泄漏，稳定性好；不会中断正在处理的链接 | 浏览器意外断开时，正在处理的链接可能失败（部分可能自动重试） |
+| 浏览器每30分钟轮换（仅批次间） | 防止内存泄漏，稳定性好；不会中断正在处理的链接 | 浏览器意外断开时，try 块内断开的链接会标记 unavailable，仅 try 块前断开会自动重试 |
 
 ## 七、潜在改进点
 
