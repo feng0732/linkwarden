@@ -344,7 +344,7 @@ if (finalLink) {
 | L82-L83 | `createFolder(...)` × 2（`packages/filesystem/createFolder.ts:L5-L18`） | ✅ **可能**：`fs.mkdirSync` 在磁盘权限不足、磁盘满、I/O 错误时同步抛出 | 异常冒泡；context 已创建但不关闭 → **自动重试 + context 泄漏** |
 | L85-L107 | 计算 archivalSettings（读 link.tags / 用户设置） | ❌ 纯内存操作，不抛 | — |
 
-**段 A 失败的共同副作用**：`browser.newContext()` 之后任何一步抛异常，因为还没进入 try，`finally` 里的 `context.close()` 不会执行，browser context 残留在 Chromium 进程中占用资源。worker 的浏览器 30 分钟整体重启（`apps/worker/worker.ts` 的 `BROWSER_MAX_AGE_MS` 机制）是兜底清理手段。
+**段 A 失败的共同副作用**：`browser.newContext()` 之后任何一步抛异常，因为还没进入 try，`finally` 里的 `context.close()` 不会执行，browser context 残留在 Chromium 进程中占用资源。worker 的浏览器 30 分钟整体重启（`apps/worker/workers/linkProcessing.ts:L9,L18-L33` 的 `BROWSER_MAX_AGE_MS` 常量 + `restartBrowser` 函数）是兜底清理手段。
 
 综上，**真正会触发自动重试的只有 3 类场景**：
 
@@ -456,7 +456,126 @@ if (needsReprocessing) {
   - **选择性跳过重跑**：如果 `needsReprocessing` 为 false（例如用户当前已禁用截图，但历史上截图失败被标 unavailable），则完全不动
 - 效果：下一轮 worker 轮询时，未失败的格式会因为字段仍是 `archives/...` 路径被跳过（断点续传），失败的格式重新尝试生成
 
-**两种 action 的共同特点**：都只重置 DB 字段，不向 worker 发通知——worker 在下一次 60 秒轮询（`apps/worker/workers/linkProcessing.ts:L88` 的 `delay`）时自然会把 `lastPreserved = null` 的链接重新捞起。
+**两种 action 的共同特点**：都只重置 DB 字段，不向 worker 发通知——worker 在下一次轮询（默认 **10 秒**，`apps/worker/worker.ts:L8-L9` 的 `workerIntervalInSeconds = Number(process.env.ARCHIVE_SCRIPT_INTERVAL) || 10`，通过 `apps/worker/workers/linkProcessing.ts:L41,L83` 的 `delay(interval)` 实现）时自然会把 `lastPreserved = null` 的链接重新捞起。
+
+### 4.7 普通用户的归档重置路径
+
+管理员接口（4.6）是全局批量重置，普通用户在日常使用中有三条独立路径可以触发自己链接的归档重置：
+
+#### 路径 1：单链接重新归档（PUT /api/v1/links/[id]/archive）
+
+这是最常见的用户操作，前端有两个入口：
+- `apps/web/components/LinkViews/LinkComponents/LinkActions.tsx:L59-L76` 链接卡片三个点菜单 → "Refresh preserved formats"
+- `apps/web/components/ModalContent/LinkModal.tsx:L123-L139` 链接详情 Drawer 右上角三个点 → "Refresh preserved formats"（仅在 `link.type === "url"` 时显示）
+
+后端实现：`apps/web/pages/api/v1/links/[id]/archive/index.ts:L39-L72`
+
+```ts
+await prisma.link.update({
+  where: { id: link.id },
+  data: {
+    image: null, pdf: null, readable: null, monolith: null, preview: null,
+    lastPreserved: null, indexVersion: null,
+    clientSide: false,   // 额外重置客户端归档标记
+  },
+});
+await removeFiles(link.id, link.collection.id);
+```
+
+| 维度 | 行为 |
+|---|---|
+| 权限 | collection.ownerId 或 member.canUpdate（`apps/web/pages/api/v1/links/[id]/archive/index.ts:L30-L37`） |
+| 前置检查 | `link.url` 存在且 `isValidUrl(link.url)`，否则直接返回成功但不做任何事 |
+| 删文件 | ✅ 调 `removeFiles` 全删 |
+| 重置范围 | 5 个格式字段 + `lastPreserved` + `indexVersion` + `clientSide` **全部置 null** |
+| 行为等价于 | 管理员 `allAndRePreserve` 但只针对单条链接 |
+
+#### 路径 2：批量重新归档（DELETE /api/v1/links/archive）
+
+前端入口：`apps/web/components/LinkListOptions.tsx:L93-L115,L176-L191`，在列表页编辑模式（铅笔图标激活）下的刷新按钮（`bi-arrow-clockwise`），先通过多选框勾选链接再点按钮触发。Schema 定义 `packages/lib/schemaValidation.ts:L296-L302` 的 `LinkArchiveActionSchema` 接受 `linkIds: number[]`。
+
+后端实现：`apps/web/pages/api/v1/links/archive/index.ts:L11-L90`
+
+```ts
+// 先做权限过滤
+const authorizedLinks = await prisma.link.findMany({
+  where: {
+    id: { in: linkIds },
+    url: { not: null },
+    OR: [
+      { collection: { ownerId: user.id } },
+      { collection: { members: { some: { userId: user.id, canDelete: true } } } },
+    ],
+  },
+  select: { id: true, collectionId: true },
+});
+
+// 先返回 HTTP 200，再在后台循环处理（不阻塞响应）
+res.status(200).json({ response: "Success." });
+for (const link of authorizedLinks) {
+  await removeFiles(link.id, collectionId);
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      image: null, pdf: null, readable: null, monolith: null, preview: null,
+      lastPreserved: null, indexVersion: null,
+    },
+  });
+}
+```
+
+| 维度 | 行为 |
+|---|---|
+| 权限 | 每条链接单独检查 collection.ownerId 或 member.canDelete；无权限的链接静默过滤掉，不返回错误 |
+| 前置检查 | `url != null`（无 URL 的链接不会被处理） |
+| 响应时序 | **先返回 200 再做 DB 操作**（fire-and-forget 模式）。如果循环中途 DB 抛异常，已处理的链接已重置，未处理的保持原样 |
+| 删文件 | ✅ 每条都调 `removeFiles` |
+| 重置范围 | 同单链接：5 个格式 + `lastPreserved` + `indexVersion` 全置 null；注意**不重置 `clientSide`**（与单链接 PUT 的细微差异） |
+| 行为等价于 | 对一组授权链接逐个执行 `allAndRePreserve` |
+
+#### 路径 3：URL 变更触发重置（updateLinkById）
+
+当用户在编辑链接时修改了 URL，系统会自动触发全量重置。核心逻辑在 `apps/web/lib/api/controllers/links/linkId/updateLinkById.ts:L133-L163`：
+
+```ts
+// 条件判断：新 URL 存在、与旧 URL 不同、且合法
+if (data.url && oldLink && oldLink?.url !== data.url && isValidUrl(data.url)) {
+  await removeFiles(oldLink.id, oldLink.collectionId);   // 删旧文件
+} else if (oldLink?.url !== data.url)
+  return { response: "Invalid URL.", status: 401 };       // URL 变了但不合法，直接拒绝
+
+// prisma.link.update 中对每个字段做三元判断
+data: {
+  image:    oldLink?.url !== data.url ? null : undefined,
+  pdf:      oldLink?.url !== data.url ? null : undefined,
+  readable: oldLink?.url !== data.url ? null : undefined,
+  monolith: oldLink?.url !== data.url ? null : undefined,
+  preview:  oldLink?.url !== data.url ? null : undefined,
+  lastPreserved: oldLink?.url !== data.url ? null : undefined,
+  indexVersion: null,   // ★ 无条件置 null，不管 URL 变没变
+}
+```
+
+| 维度 | 行为 |
+|---|---|
+| 触发条件 | `data.url` 与 `oldLink.url` **字符串精确不等**且 `isValidUrl(newUrl)` |
+| 非法 URL 处理 | URL 变了但 `isValidUrl` 不通过 → 返回 401，**不更新任何字段**（包括 URL 本身也不会写入） |
+| 删文件 | ✅ 用旧 `linkId` + 旧 `collectionId` 删旧文件。注意：URL 变更如果伴随 collectionId 变更（移动到另一个集合），文件会先按旧路径删掉，然后 `L195-L197` 再把新集合下的文件移动过去——但因为已经删了，移动其实是 no-op |
+| 重置范围 | 除 `indexVersion` 外，全部以 `oldLink?.url !== data.url` 为条件——URL 变了就置 null，没变就传 `undefined`（不更新） |
+| `indexVersion` 特殊处理 | **无条件置 null**。意味着即使只改了 name/description/tags（URL 没变），也会触发 Meilisearch 重新索引（符合预期，因为搜索索引需要最新的元数据） |
+| collection 移动 | 如果 collectionId 也变了，`L195-L197` 会调 `moveFiles` 尝试跨集合搬运归档文件。但 URL 变更场景下前面已经 `removeFiles` 了，所以实际不会有文件可搬 |
+
+**批量编辑不触发 URL 重置**：`apps/web/lib/api/controllers/links/bulk/updateLinks.ts:L10-L13` 定义批量编辑只接受 `tags` 和 `collectionId` 两个字段，不允许改 URL，因此批量编辑不会触发归档重置。
+
+### 4.8 所有重置路径的对比总表
+
+| 路径 | 触发者 | 范围 | 删文件 | URL 必须变？ | lastPreserved 重置 | indexVersion 重置 | 其他重置 |
+|---|---|---|---|---|---|---|---|
+| 管理员 `allAndRePreserve` | 服务器管理员（单用户） | 全部 type="url" 链接 | ✅ | ❌ | ✅ 全量 | ✅ | — |
+| 管理员 `allBroken` | 服务器管理员（单用户） | 仅含 unavailable 字段的链接 | ❌ | ❌ | ✅ 只重入队列 | ✅ | 只把「需要且 unavailable」的格式置 null |
+| 单链接 PUT /api/v1/links/[id]/archive | 链接所有者 / 有 canUpdate 的成员 | 单条 | ✅ | ❌ | ✅ | ✅ | `clientSide: false` |
+| 批量 DELETE /api/v1/links/archive | 链接所有者 / 有 canDelete 的成员 | 勾选的一组（权限过滤后） | ✅ | ❌ | ✅ | ✅ | — |
+| URL 变更 updateLinkById | 链接所有者 / 有 canUpdate 的成员 | 单条 | ✅ | ✅（URL 字符串精确不等） | ✅（仅 URL 变时） | ✅（无条件） | — |
 
 ---
 
