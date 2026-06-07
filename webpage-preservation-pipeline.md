@@ -108,7 +108,8 @@ archiveHandler(link, browser)
     │
     └─ finally
         ├─ 清理 timeout
-        ├─ 读回 finalLink，把 null 的字段标记为 "unavailable"
+        ├─ 读回 finalLink: 仍为 null 的字段 → "unavailable" (终止态)
+        ├─ lastPreserved = now (链接不再被 Worker 自动拾取)
         ├─ context.close()
         └─ 若 link 已被删除 → removeFiles() 清理已落盘文件
 ```
@@ -139,12 +140,18 @@ content (Playwright 渲染后的完整 HTML)
     ├─ JSDOM(cleanedUpContent, { url })      // 构造 DOM
     ├─ new Readability(dom.document).parse() // Mozilla Readability 提取
     │
-    ├─ article.textContent 后处理
+    ├─ article?.textContent 存在且非空?
+    │   ├─ 否 → 静默 return，不写 DB 不抛错
+    │   │       → 字段保持 null → finally 标记 "unavailable"
+    │   └─ 是 → 继续
+    │
+    ├─ textContent 后处理
     │   ├─ 去重空格: replace(/ +(?= )/g, "")
     │   ├─ 去换行:   replace(/(\r\n|\n|\r)/gm, " ")
     │   └─ 长度截断: slice(0, TEXT_CONTENT_LIMIT)
     │
     ├─ Buffer 大小检查: < READABILITY_MAX_BUFFER (默认 100MB)
+    │   └─ 超限 → console.error + return (静默失败)
     │
     ├─ createFile(
     │    data: JSON.stringify(article),
@@ -161,6 +168,7 @@ content (Playwright 渲染后的完整 HTML)
 - **输入来源**：使用 Playwright 渲染后的 HTML（而非原始 HTTP 响应），对 SPA/动态渲染页面友好
 - **双重净化**：先 DOMPurify 再 Readability，避免提取出的 HTML 中包含恶意脚本
 - **双字段存储**：完整文章对象存 JSON 文件，纯文本摘要存 `Link.textContent` 字段供 MeiliSearch 建索引
+- **静默失败**：Readability 无法提取有效文章（返回 null 或文本为空）、Buffer 超限均为静默 return，不抛错。字段保持 `null`，由 finally 块兜底标记为 `"unavailable"`（终止态）
 - **可选 keepContent**：参数 `keepContent=true` 时把完整净化后 HTML 塞进 `article.content`（未被默认路径调用）
 
 ---
@@ -223,9 +231,9 @@ Monolith 是独立的子进程，其资源下载行为完全独立于 Playwright
 - **输出大小超限** → `> MONOLITH_MAX_BUFFER`（默认 100MB）时 reject
 - **软失败隔离**：在 [archiveHandler.ts:189-193](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L189-L193) 中用 `.catch(err => console.error(err))` 吞掉异常，Monolith 失败不会中断其他格式产出。
 
-### 4.5 Monolith 的 DB 更新时机
+### 4.5 失败后的状态标记与成功时的 DB 更新时机
 
-**成功时在 handleMonolith 内部立即写库**，不等 finally：
+**成功路径**：成功时在 handleMonolith 内部立即写库，不等 finally：
 
 [handleMonolith.ts:57-66](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts#L57-L66)：
 ```typescript
@@ -237,7 +245,13 @@ await prisma.link.update({
 resolve();
 ```
 
-成功写入 DB 后，`link.monolith` 字段从 `null` 变为具体路径，finally 块读到该值时就不会再标记为 "unavailable"。
+成功写入 DB 后，`monolith` 字段从 `null` 变为具体路径字符串（truthy），finally 块读到该值时 `!truthy = false` → 传 `undefined` → 不动。
+
+**失败路径**：handleMonolith 内部 reject 后，被外层 `.catch(err => console.error(err))` 吞掉：
+1. 错误不抛到外层，不影响其他格式执行
+2. `monolith` 字段**保持 `null`**
+3. finally 块读到 `null` → `!null = true` → 标记为 `"unavailable"`
+4. `"unavailable"` 是 truthy 字符串，进入终止态——不会自动重试，只有手动重置为 `null` 才会重新执行
 
 ### 4.6 与 Playwright 的"回填"机制
 
@@ -267,7 +281,11 @@ resolve();
 - 截图：`page.screenshot({ fullPage: true, type: "jpeg" })` → `archives/{cid}/{id}.jpeg`，上限 `SCREENSHOT_MAX_BUFFER`（100MB）
 - PDF：`page.pdf({ width: "1366px", height: "1931px", printBackground: true, margin: {top/bottom: 15px} })` → `archives/{cid}/{id}.pdf`，上限 `PDF_MAX_BUFFER`（100MB）
 
-**存在性检查**：`!link.image?.startsWith("archive")`，即已有归档路径则跳过。
+**双层存在性检查**：
+1. 外层（archiveHandler.ts:176-179）：`archivalSettings.archiveAsScreenshot && !link.image`——字段为 `null` 才会调用此 handler（`"unavailable"` 和 `"archives/..."` 都是 truthy，被跳过）
+2. 内层（handleScreenshotAndPdf.ts:22-24,58）：`!link.image?.startsWith("archive")`——进一步确保真实归档路径不重复生成
+
+**静默失败**：Buffer 超限 `console.log` + `return`，截图/PDF Promise reject 被 `Promise.allSettled` 吞掉，字段保持 `null`，finally 标记为 `"unavailable"`。
 
 ### 5.2 预览小图 — [handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)
 
@@ -281,6 +299,12 @@ resolve();
 - 上限 `PREVIEW_MAX_BUFFER`（10MB）
 - 输出：`archives/preview/{cid}/{id}.jpeg`
 
+**双层存在性检查**：
+1. 外层（archiveHandler.ts:169）：`!link.preview`——字段为 `null` 才会调用此 handler
+2. 内层（handleArchivePreview.ts:42,59）：`!link.preview?.startsWith("archive")`——仅真实归档路径会被内层拦截，`"unavailable"` 在此处不拦截（但外层已拦截，实际走不到）
+
+**静默失败**：Buffer 超限 `console.log` + `return`，字段保持 `null`，finally 标记为 `"unavailable"`。
+
 ### 5.3 直链图片/PDF — [imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts) / [pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts)
 
 当 `determineLinkType()` 通过 HEAD 请求的 `Content-Type` 判断出链接本身是图片或 PDF 时，不走浏览器，直接：
@@ -288,6 +312,12 @@ resolve();
 - 生成预览
 - 存文件 + 更新 DB
 - `return` 提前退出，不执行后面的浏览器渲染流程
+
+**外层跳过条件**（archiveHandler.ts:122,125）：`linkType === "image" && !link.image`（pdf 同理）。字段为 `null` 才会调用，`"unavailable"` 和真实路径都会跳过。
+
+**失败行为**：与其他格式不同，imageHandler/pdfHandler **没有** `.catch()` 包裹。如果下载失败（safeFetch 抛错、Buffer 超限 return 之前的网络错误等），异常会抛到外层，导致整个 archiveHandler 进入 catch 分支并 `throw err`——随后 linkProcessing 会捕获该异常并打印日志。但无论如何，finally 块仍会执行，把已为 `null` 的字段标记为 `"unavailable"`。
+
+Buffer 超限的情况是静默 return，同其他格式。
 
 ### 5.4 Wayback Machine — [sendToWayback.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/sendToWayback.ts)
 
@@ -310,18 +340,71 @@ resolve();
 | `monolith` | String? | Monolith HTML 路径 | `null` / `"archives/..."` / `"unavailable"` |
 | `lastPreserved` | DateTime? | 最近一次处理时间戳 | `null` / 时间 |
 
-### 6.2 状态值语义
+### 6.2 状态值语义与 JavaScript 真值
 
-- **`null`（待处理/未产出）**：从未尝试过保存、被手动重置（"重新归档"按钮）、或该格式尚未完成写入
-- **`"archives/..."`（已成功）**：对应格式文件已落盘，值为相对路径。成功格式在各 handler 内部成功写盘后**立即**写入 DB，不等 finally
-- **`"unavailable"`（已终结）**：经过一轮完整处理后该格式仍未产出。可能原因：
+在分析之前，先明确 JavaScript 中的布尔判断（这是理解整个状态机的关键）：
+
+```javascript
+!null          // → true   (null 是 falsy)
+!undefined     // → true
+!"unavailable" // → false  (非空字符串是 truthy，!truthy = false)
+!"archives/123.jpeg" // → false (非空字符串是 truthy)
+```
+
+| 字段值 | JavaScript 真值 | 含义 | Worker 行为 |
+|--------|----------------|------|------------|
+| `null` | falsy | **待处理/已重置** | `!null = true` → 会执行该格式 handler |
+| `"archives/..."` | truthy | **已成功** | `!"archives/..." = false` → 跳过 |
+| `"unavailable"` | truthy | **已终止** | `!"unavailable" = false` → **跳过，不会自动重试** |
+
+**三个状态的精确定义**：
+
+- **`null`（待处理）**：从未尝试过保存，或通过"重新归档"/"批量修复"被手动重置。只有 `null` 才会触发格式 handler 执行。
+- **`"archives/..."`（已成功）**：对应格式文件已落盘，值为相对路径。在各 handler 内部成功写盘后**立即**写入 DB，不等 finally。
+- **`"unavailable"`（已终止）**：经过一轮完整处理后该格式仍未产出。这是一个**终止态**——一旦被标记，除非被外部 API 重置回 `null`，否则永远不会再执行。可能原因：
   1. URL 本身不支持（非 http(s)、SSRF 不通过、`DISABLE_PRESERVATION` 全局关闭）
   2. 该格式执行失败（被 catch 吞掉或抛错）
   3. **用户未开启该格式**（finally 块不区分"失败"和"未开启"）
 
-### 6.3 finally 块的精确标记逻辑
+### 6.3 archiveHandler 外层的格式跳过条件
 
-[archiveHandler.ts:208-224](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L224) 中 finally 块的判定：
+在 [archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts) 中，每个格式的 handler 被调用前都有外层判断：
+
+| 格式 | 代码行 | 外层判断条件 | 字段为 `"unavailable"` 时结果 | 字段为 `null` 时结果 |
+|------|--------|-------------|--------------------------|---------------------|
+| preview | L169 | `!link.preview` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| readable | L172 | `archiveAsReadable && !link.readable` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| image(截图) | L177 | `archiveAsScreenshot && !link.image` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| pdf | L178 | `archiveAsPDF && !link.pdf` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| monolith | L185-186 | `archiveAsMonolith && !link.monolith` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| imageHandler(直链图) | L122 | `linkType==="image" && !link.image` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| pdfHandler(直链PDF) | L125 | `linkType==="pdf" && !link.pdf` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+
+> **核心结论**：`"unavailable"` 与 `"archives/..."` 在跳过判断上等价——二者都是 truthy 字符串，都会导致 `!link.xxx = false`，从而跳过对应 handler。只有 `null` 才会触发执行。
+
+### 6.4 各 handler 内部的第二层跳过条件
+
+部分 handler 在被调用后，内部还有更严格的 `startsWith("archive")` 检查：
+
+**handleArchivePreview** ([handleArchivePreview.ts:42,59](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts#L42-L59))：
+```typescript
+!link.preview?.startsWith("archive")
+```
+- `"unavailable".startsWith("archive")` → false → `!false` = true → 内部不拦截（但外层 `!link.preview=false` 已跳过，实际走不到这里）
+- `"archives/preview/...".startsWith("archive")` → true → `!true` = false → 内部拦截
+
+**handleScreenshotAndPdf** ([handleScreenshotAndPdf.ts:22-24,58](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L22-L24))：
+```typescript
+!link.image?.startsWith("archive")
+!link.pdf?.startsWith("archive")
+```
+同上逻辑。
+
+**handleReadability / handleMonolith / imageHandler / pdfHandler**：内部没有二次检查，只要被外层调用就直接执行。
+
+### 6.5 finally 块的精确标记逻辑与幂等性
+
+[archiveHandler.ts:208-224](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L224)：
 
 ```typescript
 const finalLink = await prisma.link.findUnique({ where: { id: link.id } });
@@ -342,37 +425,53 @@ await prisma.link.update({
 
 **关键观察**：
 
-1. **判定条件完全不涉及 `archivalSettings`**。它只是简单地检查从 DB 重新读取的 `finalLink` 字段是否为 truthy。
-2. 因此无论用户是否开启该格式（如 `archiveAsMonolith = false`），只要最终字段未被成功格式写入具体路径，就会被标记为 `"unavailable"`。
-3. `"unavailable"` 既表示"尝试了但失败"，也表示"用户根本没开启该格式"——这两种情况在 DB 中无法区分。
+1. **判定条件完全不涉及 `archivalSettings`**。只检查从 DB 重新读取的 `finalLink` 字段是否为 truthy。
+2. **无论用户是否开启该格式**，只要最终字段未被成功格式写入具体路径（即仍为 `null`），就会被标记为 `"unavailable"`。
+3. **`"unavailable"` 既表示"尝试了但失败"，也表示"用户根本没开启该格式"**——这两种情况在 DB 中无法区分。
+4. **幂等性**：如果 `finalLink.readable` 已经是 `"unavailable"`，则 `!"unavailable"` = false，传入 `undefined`，Prisma **不会修改该字段**。因此 finally 块对已标记 unavailable 的字段是安全的重复调用。
 
-**以 Monolith 为例的状态流转路径**：
+### 6.6 以 Monolith 为例的完整状态流转
 
 ```
-  monolith 字段起始值 = null
+  monolith 字段起始值 = null (新创建链接)
        │
-       ├─ 用户没开 archiveAsMonolith
-       │    └─ handleMonolith 不被调用 → 字段维持 null
-       │                               → finally 读到 null → 标记 "unavailable"
+       ├─ Worker 拾取 (lastPreserved IS NULL)
        │
-       ├─ 用户开了 archiveAsMonolith，但 Monolith 失败
-       │    ├─ handleMonolith 被调用，但在子进程内 reject
+       ├─ 场景A：用户没开 archiveAsMonolith
+       │    ├─ archiveHandler L184: !archivalSettings.archiveAsMonolith → false
+       │    ├─ handleMonolith 不被调用 → 字段维持 null
+       │    ├─ finally: !null = true → 标记 "unavailable"
+       │    ├─ lastPreserved = now()
+       │    └─ 结果：terminated (终止态，不会再被 Worker 拾取)
+       │
+       ├─ 场景B：用户开了，但 Monolith 子进程失败
+       │    ├─ handleMonolith 被调用，但在内部 reject
        │    ├─ 错误被 .catch(console.error) 吞掉 → 不抛到外层
        │    ├─ 字段维持 null
-       │    └─ finally 读到 null → 标记 "unavailable"
+       │    ├─ finally: !null = true → 标记 "unavailable"
+       │    ├─ lastPreserved = now()
+       │    └─ 结果：terminated (同上)
        │
-       └─ 用户开了 archiveAsMonolith，且 Monolith 成功
-            ├─ handleMonolith 成功写盘 → **立即** update DB: monolith = "archives/..."
-            └─ finally 读到 "archives/..." → truthy → 不动 (undefined)
+       ├─ 场景C：用户开了，且 Monolith 成功
+       │    ├─ handleMonolith 成功写盘 → **立即** update DB: monolith = "archives/..."
+       │    ├─ finally: !"archives/..." = false → 传 undefined，不动
+       │    ├─ lastPreserved = now()
+       │    └─ 结果：success
+       │
+       └─ 场景D：手动点击"重新归档" (PUT /api/v1/links/[id]/archive)
+            ├─ DB 更新: monolith = null, lastPreserved = null
+            ├─ removeFiles() 删除磁盘文件
+            └─ 回到起始状态 null → Worker 再次拾取，从场景 A/B/C 重新开始
 ```
 
-### 6.4 流转总图
+### 6.7 流转总图
 
 ```
  链接创建 (postLink)
       │
       ├─ URL 不安全或 DISABLE_PRESERVATION
       │     └─ 立即 → 全部字段 = "unavailable"，lastPreserved = now
+      │        结果：terminated
       │
       └─ 正常 → 全部字段 = null，lastPreserved = null
                  │
@@ -380,36 +479,35 @@ await prisma.link.update({
            Worker 拾取 (lastPreserved IS NULL)
                  │
                  ▼
-           archiveHandler 执行 (按 archivalSettings 过滤)
-            ├─ 成功的格式 → handler 内部立即写盘 + DB 写入 "archives/..." 路径
-            ├─ 失败的格式 → 错误被 catch 吞掉，字段保持 null
-            └─ 用户未开的格式 → 对应 handler 不调用，字段保持 null
+           archiveHandler 执行
+            ├─ 外层判断：仅 null 字段对应格式会被执行
+            ├─ 成功格式 → handler 内部立即写盘 + DB 写入 "archives/..."
+            ├─ 失败格式 → 错误被 catch，字段保持 null
+            └─ 用户未开格式 → handler 不调用，字段保持 null
                  │
                  ▼
-           finally 块扫尾 (不区分 archivalSettings)
-            ├─ 每个仍为 null/falsy 的字段 → "unavailable"
-            ├─ lastPreserved = now
-            └─ indexVersion = null (触发重新索引)
+           finally 块
+            ├─ 每个仍为 null 的字段 → "unavailable" (terminated)
+            ├─ 已是 "unavailable" 或 "archives/..." 的字段 → 不动 (幂等)
+            ├─ lastPreserved = now()
+            └─ indexVersion = null
                  │
                  ▼
-           手动点击"重新归档" ([id]/archive PUT)
-            ├─ image/pdf/readable/monolith/preview = null
-            ├─ lastPreserved = null
-            ├─ indexVersion = null
-            ├─ clientSide = false
-            └─ removeFiles() 清盘 → 重新进入 Worker 拾取
+           后续路径
+            ├─ 手动重新归档 PUT: 所有字段 → null, lastPreserved → null → 重新拾取
+            └─ 批量修复 allBroken DELETE: 仅"应该产出但 unavailable"的字段 → null → 重新拾取
 ```
 
-### 6.5 批量修复损坏归档
+### 6.8 批量修复损坏归档 (allBroken)
 
 在 [preservation.tsx:67-164](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L67-L164) 中，管理员可执行 `action === "allBroken"`：
 
-1. 找出该用户下任意字段为 `"unavailable"` 的链接
+1. **精确查找**：`WHERE image = "unavailable" OR pdf = "unavailable" OR ...`（精确字符串匹配）
 2. **重新计算**该链接对应的 `archivalSettings`（Tag 优先，用户默认回退）
-3. 对"用户确实开启了该格式，但字段为 unavailable"的情况，才重置为 `null`
-4. `lastPreserved = null` → 重新进入 Worker 拾取
+3. **条件重置**：仅当 `字段 === "unavailable" && 用户确实开启了该格式` 时，才把该字段改为 `null`
+4. `lastPreserved = null` → Worker 重新拾取
 
-这是为了弥补 finally 块"不区分失败和未开启"的设计缺陷——修复逻辑只重置那些真正应该产出但失败了的字段。
+这是为了弥补 finally 块"不区分失败和未开启"的设计缺陷——修复逻辑只重置那些真正应该产出但失败了的字段，用户没开的格式保持 `"unavailable"` 不动。
 
 ---
 
@@ -441,15 +539,32 @@ await prisma.link.update({
 
 无论成功失败，[archiveHandler.ts:203-229](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L203-L229) 的 finally 块保证：
 1. timeout 被清除
-2. `lastPreserved = now`（避免被反复拾取）
-3. 未产出的快照字段被标记为 `"unavailable"`（避免 UI 永远 loading）
-4. `indexVersion = null`（触发全文索引重建，即使失败也要更新搜索状态）
+2. `lastPreserved = now`——写入当前时间戳，使 `lastPreserved IS NULL` 的 SQL 查询不再命中，该链接**不会被 Worker 再次自动拾取**
+3. 仍为 `null` 的快照字段被标记为 `"unavailable"`——进入终止态，后续即便被重新拾取也会因 `!"unavailable" = false` 被跳过
+4. `indexVersion = null`——触发全文索引重建（即使失败也要更新搜索状态）
 5. 浏览器 context 被关闭
-6. 若链接已被用户删除 → 调用 `removeFiles()` 清理落盘文件
+6. 若链接已被用户删除 → 调用 `removeFiles()` 清理已落盘文件
 
-### 7.7 Monolith 软失败
+> 注意：第 3 点中，已为 `"unavailable"` 或 `"archives/..."` 的字段因 truthy 会被传入 `undefined`，Prisma 不做修改——因此 finally 对这些字段是幂等的。
 
-[archiveHandler.ts:189-193](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L189-L193)：`handleMonolith().catch(err => console.error(err))`，Monolith 失败不会触发整条链接失败，其他格式仍会继续并最终标记完成。
+### 7.7 各格式的静默失败模式
+
+各保存格式的失败不会触发整条链接失败，具体模式：
+
+**Monolith** ([archiveHandler.ts:189-193](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L189-L193))：
+```typescript
+await handleMonolith(...).catch(err => console.error(err));
+```
+显式 `.catch()` 吞掉异常，仅打日志。
+
+**Readability** ([handleReadability.ts:26-61](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts#L26-L61))：
+当 `articleText` 为空或 `undefined`（Readability 没能提取出有效文章内容）时，函数直接 `return`，不抛错也不写 DB，字段维持 `null`，等待 finally 标记为 `"unavailable"`。Buffer 超限时也是 `console.error` + `return`。
+
+**handleArchivePreview / handleScreenshotAndPdf**：内部用 `.then().catch()` 或 `Promise.allSettled`，截图/PDF 异常被吞掉。Buffer 超限时 `console.log` + `return`。
+
+**imageHandler / pdfHandler**：未被 `.catch()` 包裹，异常会正常抛出。但这两个 handler 仅在 URL 的 `Content-Type` 本身就是 image/pdf 时才会被调用，且外层是 `async () => { ... }`，异常会抛到 `Promise.race`，导致整个 archiveHandler 异常——此时 finally 仍会执行，把尚未写入的字段标记为 `"unavailable"`。
+
+因此，除直链 image/pdf 外的所有格式都具备"静默失败 + finally 兜底 unavailable"的特性。单格式失败不会中断其他格式的执行。
 
 ---
 
@@ -567,19 +682,34 @@ Monolith 输出的 HTML 中，资源已被转换为 base64 data-URI：
 1. **无法在文件系统层识别重复资源**：data-URI 直接嵌在 HTML 里，没有独立文件，系统级文件去重（如 ZFS dedup、S3 相同对象合并）无法在资源粒度生效。
 2. **无法通过 URL 追踪来源**：输出文件中不再保留原始资源 URL，因此也无法事后通过 URL 做反向去重。
 
-### 10.5 存在性检查（幂等性）
+### 10.5 存在性检查（幂等性）与重试触发条件
 
-每种保存格式在执行前都会检查对应字段是否已有 `"archives/..."` 路径：
+每种保存格式的执行都需要同时满足"用户开启"和"字段为 null"两个条件：
 
-- `handleArchivePreview`：`!link.preview?.startsWith("archive")`
-- `handleReadability`：`!link.readable`
-- `handleScreenshotAndPdf`：`!link.image?.startsWith("archive")` / `!link.pdf?.startsWith("archive")`
-- `handleMonolith`：在 [archiveHandler.ts:184-187](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L184-L187) 中为 `!link.monolith`
+| 格式 | 外层判断代码 | 判断逻辑拆解 |
+|------|-------------|-------------|
+| preview | `!link.preview` | `null` → true (执行); `"unavailable"` → false (跳过); `"archives/..."` → false (跳过) |
+| readable | `archiveAsReadable && !link.readable` | 需同时满足: 开关=true **且** 字段=null |
+| image | `archiveAsScreenshot && !link.image` | 同上 |
+| pdf | `archiveAsPDF && !link.pdf` | 同上 |
+| monolith | `archiveAsMonolith && !link.monolith` | 同上 |
 
-这保证了 Worker 即使重复拾取同一链接，也不会重复执行已成功的格式。但注意：
+**关于 `"unavailable"` 的关键事实**：
+- 在 JavaScript 中，非空字符串 `"unavailable"` 是 **truthy** 的
+- `!"unavailable"` → `false`
+- 因此字段一旦被标记为 `"unavailable"`，就会被当作"已处理完成"而**永远跳过**
+- `"unavailable"` 是一个**终止态**，不会自动重试
 
-- `"unavailable"` 被当作 falsy，因此失败的格式在"重新归档"（字段被重置为 `null`）时会自动重试
-- 检查使用的是**进入 archiveHandler 时传入的旧 link 对象**，不是实时从 DB 读取——不过由于单链接串行处理，实际没有竞态
+**重试的唯一触发方式：把字段重置为 `null`**
+
+实现这一点的两个入口：
+
+1. **手动"重新归档"按钮** ([links/[id]/archive/index.ts:51-67](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/web/pages/api/v1/links/%5Bid%5D/archive/index.ts#L51-L67))：PUT 请求把所有字段重置为 `null`，同时把 `lastPreserved` 重置为 `null`，并 `removeFiles()` 删除磁盘文件。
+2. **管理员批量修复 allBroken** ([preservation.tsx:67-164](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L67-L164))：仅把"用户确实开启了该格式且字段为 `"unavailable"`"的字段重置为 `null`。
+
+只有当字段被重置为 `null`（falsy）时，`!link.xxx` 才会返回 `true`，对应的格式 handler 才会被再次执行。
+
+另外，部分 handler 内部还有第二层 `startsWith("archive")` 检查（见 6.4 节），但由于外层已经用 `!link.xxx` 把 `"unavailable"` 和 `"archives/..."` 都过滤掉了，这个内层检查对 unavailable 实际上没有影响——handleArchivePreview 和 handleScreenshotAndPdf 在字段为 unavailable 时根本不会被调用。
 
 ### 10.6 Monolith 与去重的关系总结
 
