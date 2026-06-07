@@ -168,8 +168,11 @@ content (Playwright 渲染后的完整 HTML)
 - **输入来源**：使用 Playwright 渲染后的 HTML（而非原始 HTTP 响应），对 SPA/动态渲染页面友好
 - **双重净化**：先 DOMPurify 再 Readability，避免提取出的 HTML 中包含恶意脚本
 - **双字段存储**：完整文章对象存 JSON 文件，纯文本摘要存 `Link.textContent` 字段供 MeiliSearch 建索引
-- **静默失败**：Readability 无法提取有效文章（返回 null 或文本为空）、Buffer 超限均为静默 return，不抛错。字段保持 `null`，由 finally 块兜底标记为 `"unavailable"`（终止态）
 - **可选 keepContent**：参数 `keepContent=true` 时把完整净化后 HTML 塞进 `article.content`（未被默认路径调用）
+
+**失败传播**：
+- **静默场景**：`articleText` 为空/不存在（Readability 提取不到有效文章）、Buffer 超限 → `console.error` + 静默 `return`，不抛错，字段保持 `null` → finally 标 `"unavailable"`
+- **冒泡场景**：`createFile()` 写盘/S3 失败、`prisma.link.update()` DB 失败 → 被 `await` 了但外层无 try/catch，**异常冒泡到 archiveHandler，中断后续 handleScreenshotAndPdf 和 handleMonolith 的执行**
 
 ---
 
@@ -285,7 +288,9 @@ resolve();
 1. 外层（archiveHandler.ts:176-179）：`archivalSettings.archiveAsScreenshot && !link.image`——字段为 `null` 才会调用此 handler（`"unavailable"` 和 `"archives/..."` 都是 truthy，被跳过）
 2. 内层（handleScreenshotAndPdf.ts:22-24,58）：`!link.image?.startsWith("archive")`——进一步确保真实归档路径不重复生成
 
-**静默失败**：Buffer 超限 `console.log` + `return`，截图/PDF Promise reject 被 `Promise.allSettled` 吞掉，字段保持 `null`，finally 标记为 `"unavailable"`。
+**失败传播**：
+- **静默场景**：截图/PDF 各自的 Buffer 超限（`console.log` + `return`）、`page.screenshot()` / `page.pdf()` Playwright 抛错、`createFile()` 写盘失败、`prisma.update()` DB 失败 — 这些都发生在 `.then()` 内部，被外层 `Promise.allSettled` 吞掉，字段保持 `null`，finally 标记 `"unavailable"`，**不影响其他格式**。
+- **冒泡场景**：`page.evaluate(autoScroll)`（L12，自动滚动）抛错、`prisma.link.findUnique()`（L15，检查链接是否仍存在）抛错 — 这两行在 `Promise.allSettled` 之外且无 try/catch，**异常会冒泡到 archiveHandler，中断后续 handleMonolith 的执行**。
 
 ### 5.2 预览小图 — [handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)
 
@@ -328,9 +333,17 @@ resolve();
 
 **外层跳过条件**（archiveHandler.ts:122,125）：`linkType === "image" && !link.image`（pdf 同理）。字段为 `null` 才会调用，`"unavailable"` 和真实路径都会跳过。
 
-**失败行为**：与其他格式不同，imageHandler/pdfHandler **没有** `.catch()` 包裹。如果下载失败（safeFetch 抛错、Buffer 超限 return 之前的网络错误等），异常会抛到外层，导致整个 archiveHandler 进入 catch 分支并 `throw err`——随后 linkProcessing 会捕获该异常并打印日志。但无论如何，finally 块仍会执行，把已为 `null` 的字段标记为 `"unavailable"`。
+**失败传播**：
 
-Buffer 超限的情况是静默 return，同其他格式。
+| 场景 | 是否冒泡 | 中断影响 | 最终字段状态 |
+|------|---------|---------|-------------|
+| `safeFetch(url).buffer()` 网络错误 | ✅ 冒泡 | 本来就走 return 分支，不影响其他格式 | image/pdf 为 `null` → finally 标 `"unavailable"` |
+| Buffer 超限 | ❌ 静默 (`console.log` + `return`) | 同上 | image/pdf 为 `null` → finally 标 `"unavailable"` |
+| `generatePreview()` 内部异常 | ❌ 静默 (内部 try/catch 吞掉，返回 false) | 同上 | image 为 `null` → finally 标 `"unavailable"`（preview 也为 null → finally 标 unavailable） |
+| `createFile()` 写盘/S3 失败 | ✅ 冒泡 (await 抛错，无 try/catch) | 同上 | image/pdf 为 `null` → finally 标 `"unavailable"` |
+| `prisma.update()` DB 失败 | ✅ 冒泡 (await 抛错，无 try/catch) | 同上 | image/pdf 为 `null` → finally 标 `"unavailable"` |
+
+> 注意：imageHandler/pdfHandler 成功执行完后会 `return` 提前退出整个 IIFE，后续 browser 渲染流程（preview/readability/screenshot/pdf/monolith）**完全不执行**，这些格式的字段保持 `null`，由 finally 统一标记为 `"unavailable"`。异常冒泡场景下也是如此——因为已经进入了 return 分支，不走 browser 流程。
 
 ### 5.4 Wayback Machine — [sendToWayback.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/sendToWayback.ts)
 
@@ -566,26 +579,94 @@ await prisma.link.update({
 
 > 注意：第 3 点中，已为 `"unavailable"` 或 `"archives/..."` 的字段因 truthy 会被传入 `undefined`，Prisma 不做修改——因此 finally 对这些字段是幂等的。
 
-### 7.7 各格式的静默失败模式
+### 7.7 失败传播全景分析
 
-各保存格式的失败不会触发整条链接失败，具体模式：
+#### 7.7.1 核心执行模型
 
-**Monolith** ([archiveHandler.ts:189-193](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L189-L193))：
-```typescript
-await handleMonolith(...).catch(err => console.error(err));
+在 [archiveHandler.ts:109-198](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L109-L198) 中，所有格式在同一个 async IIFE 内**串行 await** 执行：
+
 ```
-显式 `.catch()` 吞掉异常，仅打日志。
+determineLinkType
+  → 分支: imageHandler / pdfHandler / (浏览器流程)
+浏览器流程内串行:
+  page.goto → Monolith预加载 → metaDescription → page.content()
+  → handleArchivePreview → handleReadability → handleScreenshotAndPdf → handleMonolith(.catch())
+```
 
-**Readability** ([handleReadability.ts:26-61](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts#L26-L61))：
-当 `articleText` 为空或 `undefined`（Readability 没能提取出有效文章内容）时，函数直接 `return`，不抛错也不写 DB，字段维持 `null`，等待 finally 标记为 `"unavailable"`。Buffer 超限时也是 `console.error` + `return`。
+**串行 await 的关键语义**：任何一个未被 catch 的 Promise reject 都会**立即中断后续所有 await 语句**，直接跳到 archiveHandler 的 catch 块，然后进入 finally。
 
-**handleArchivePreview**：仅 OG 路径的 Jimp 异常和 fallback 的 Buffer 超限是静默的；`page.goto(ogImageUrl)` 非 SSRF 错误、fallback 的 `page.screenshot()`/`createFile()`/`prisma.update()` 异常都会冒泡到 archiveHandler，中断后续格式执行。详见 5.2 节的场景表。
+finally 块**无条件执行**，无论是否有异常抛出，它都会把所有仍为 `null` 的字段标记为 `"unavailable"`（幂等，已有 truthy 值的字段不动）。
 
-**handleScreenshotAndPdf**：内部用 `Promise.allSettled`，截图/PDF 异常被吞掉。Buffer 超限时 `console.log` + `return`。
+---
 
-**imageHandler / pdfHandler**：未被 `.catch()` 包裹，异常会正常抛出。但这两个 handler 仅在 URL 的 `Content-Type` 本身就是 image/pdf 时才会被调用，且外层是 `async () => { ... }`，异常会抛到 `Promise.race`，导致整个 archiveHandler 异常——此时 finally 仍会执行，把尚未写入的字段标记为 `"unavailable"`。
+#### 7.7.2 各格式失败传播完整对照表
 
-因此，**Monolith、Readability、Screenshot/PDF** 具备"静默失败 + finally 兜底 unavailable"的特性，单格式失败不会中断其他格式的执行。**handleArchivePreview、imageHandler、pdfHandler** 的异常场景会冒泡中断后续格式，但 finally 始终执行，所有未成功写入的字段最终都会被标记为 `"unavailable"`。
+| 格式 | 失败场景 | 异常是否冒泡 | 是否中断后续格式 | 该字段最终状态 |
+|------|---------|------------|----------------|---------------|
+| **Monolith** | CLI 非零退出 / stdout 为空 / Buffer 超限 / createFile 失败 / prisma.update 失败 | ❌ **永不冒泡**（外层显式 `.catch(err => console.error(err))` 全部吞掉） | 否（最后一个格式，无后续） | `null` → finally 标 `"unavailable"` |
+| **Readability** | articleText 为空（提取失败） | ❌ 静默（`if` 不进入，直接 return） | 否 | `null` → finally 标 `"unavailable"` |
+| | Buffer 超限 | ❌ 静默（`console.error` + return） | 否 | `null` → finally 标 `"unavailable"` |
+| | createFile 写盘/S3 失败 | ✅ 冒泡（await 抛错，无 try/catch） | **是**（中断 ScreenshotAndPdf、Monolith） | `null` → finally 标 `"unavailable"` |
+| | prisma.update DB 失败 | ✅ 冒泡 | **是**（同上） | `null` → finally 标 `"unavailable"` |
+| **ScreenshotAndPdf** | 截图/PDF Buffer 超限 | ❌ 静默（`.then()` 内 return） | 否 | `null` → finally 标 `"unavailable"` |
+| | `page.screenshot()` / `page.pdf()` Playwright 抛错 | ❌ 静默（Promise reject → allSettled 吞掉） | 否 | `null` → finally 标 `"unavailable"` |
+| | createFile 失败 / prisma.update 失败 | ❌ 静默（`.then()` async 抛错 → allSettled 吞掉） | 否 | `null` → finally 标 `"unavailable"` |
+| | `page.evaluate(autoScroll)` 抛错（自动滚动） | ✅ 冒泡（在 allSettled 之外，无 try/catch） | **是**（中断 Monolith） | `null` → finally 标 `"unavailable"` |
+| | `prisma.findUnique` 抛错（检查链接存在性） | ✅ 冒泡（在 allSettled 之外，无 try/catch） | **是**（中断 Monolith） | `null` → finally 标 `"unavailable"` |
+| **Preview** | OG 路径 Jimp 异常 | ❌ 静默（generatePreview 内部 catch，返回 false → 走 fallback） | 否 | 取决于 fallback |
+| | OG 路径 Buffer 超限 | ❌ 静默（generatePreview **主动写库** `preview="unavailable"`，返回 false → fallback 被内层检查拦截） | 否 | `"unavailable"`（generatePreview 自己写的，finally 不动） |
+| | OG 路径 `page.goto()` 非 SSRF 错误 | ✅ 冒泡（try/catch 内 `throw error` 重新抛出） | **是**（中断 Readability、ScreenshotAndPdf、Monolith） | `null` → finally 标 `"unavailable"` |
+| | Fallback `page.screenshot()` 抛错 | ✅ 冒泡（`.then()` 无 catch，Promise reject） | **是**（同上） | `null` → finally 标 `"unavailable"` |
+| | Fallback createFile / prisma.update 失败 | ✅ 冒泡（`.then()` async 抛错 → Promise reject） | **是**（同上） | `null` → finally 标 `"unavailable"` |
+| | Fallback Buffer 超限 | ❌ 静默（`console.log` + return） | 否 | `null` → finally 标 `"unavailable"` |
+| **imageHandler（直链图）** | safeFetch 网络错误 | ✅ 冒泡（无 try/catch） | —（进入 return 分支，本就不走后续 browser 流程） | `null` → finally 标 `"unavailable"` |
+| | Buffer 超限 | ❌ 静默（`console.log` + return） | —（同上） | `null` → finally 标 `"unavailable"` |
+| | generatePreview 内部异常 | ❌ 静默（内部 catch 吞掉，返回 false） | —（同上） | `null` → finally 标 `"unavailable"` |
+| | createFile / prisma.update 失败 | ✅ 冒泡（await 抛错，无 try/catch） | —（同上） | `null` → finally 标 `"unavailable"` |
+| **pdfHandler（直链PDF）** | safeFetch 网络错误 | ✅ 冒泡 | —（同上，本就不走后续 browser 流程） | `null` → finally 标 `"unavailable"` |
+| | Buffer 超限 | ❌ 静默 | —（同上） | `null` → finally 标 `"unavailable"` |
+| | createFile / prisma.update 失败 | ✅ 冒泡 | —（同上） | `null` → finally 标 `"unavailable"` |
+
+---
+
+#### 7.7.3 前置步骤的失败传播（非格式但会中断所有格式）
+
+以下步骤发生在各格式 handler 调用之前，它们的异常会中断所有后续格式：
+
+| 步骤 | 代码行 | 异常是否冒泡 | 后果 |
+|------|--------|------------|------|
+| `determineLinkType()` 的 `fetchHeaders` | L112 + L246 | ✅ 冒泡 | 中断所有格式 → finally 全部标 unavailable |
+| `page.goto(link.url)` | L129 | ✅ 冒泡 | 中断 preview/readability/screenshot/pdf/monolith → finally 全部标 unavailable |
+| Monolith 预加载的 `readFile()` | L134 | ✅ 冒泡 | 同上 |
+| `page.evaluate()` 提取 metaDescription | L151 | ✅ 冒泡 | 同上 |
+| `prisma.update()` 存 metaDescription | L158 | ✅ 冒泡 | 同上 |
+| `page.content()` 获取渲染 HTML | L166 | ✅ 冒泡 | 同上 |
+
+---
+
+#### 7.7.4 特殊：Wayback Machine 的完全隔离
+
+[archiveHandler.ts:118-120](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L118-L120)：
+
+```typescript
+if (archivalSettings.archiveAsWaybackMachine && link.url) {
+  sendToWayback(link.url);  // 无 await，fire-and-forget
+}
+```
+
+无 `await`，Promise 结果完全被忽略。成功失败都不影响主流程，也不会导致 finally 行为变化。
+
+---
+
+#### 7.7.5 总结
+
+| 分类 | 格式 | 特点 |
+|------|------|------|
+| **100% 全静默** | Monolith、Wayback Machine | 任何失败都不冒泡，不影响任何其他格式 |
+| **部分静默 / 部分冒泡** | Readability、ScreenshotAndPdf、Preview | 部分失败场景静默（如提取不到内容、Buffer 超限、Playwright 截图 reject 被 allSettled 吞）；部分失败场景冒泡中断后续（如写盘失败、DB 失败、autoScroll 失败、preview 的 page.screenshot 失败） |
+| **多数冒泡** | imageHandler、pdfHandler（直链） | 除 Buffer 超限时静默外，网络错误、写盘、DB 失败全部冒泡；但因位于 return 分支，本就不走后续 browser 流程 |
+
+**finally 兜底的一致性**：无论哪个格式在哪一步失败、无论异常是否冒泡、无论是否中断了后续格式——finally 块始终会执行，把所有仍为 `null` 的字段标记为 `"unavailable"`，并写入 `lastPreserved = now()`，使该链接不再被 Worker 自动拾取。
 
 ---
 
