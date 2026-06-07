@@ -1,4 +1,4 @@
-# Linkwarden Tagging 与列表筛选组合逻辑深度分析（复核校正版）
+# Linkwarden Tagging 与列表筛选组合逻辑深度分析（最终校正版）
 
 ## 一、数据模型与核心关联
 
@@ -138,24 +138,68 @@ where: {
 
 ---
 
-## 三、pinnedCondition 三路径差异（关键校正点）
+## 三、pinnedOnly 参数传递链路与三路径对比（关键校正）
 
-这是理解整体逻辑的基石。三个接口对 `pinnedOnly=false`（或未传）的处理完全不同。
+### 3.1 pinnedOnly 从前端到后端的完整传递链路
 
-### 3.1 pinnedCondition 的定义对比
+```
+前端组件（Dashboard/Search/Collection/Tag）
+    │
+    ▼
+useLinks(params: LinkRequestQuery)   packages/router/links.tsx#L26
+    │  pinnedOnly: params.pinnedOnly ?? undefined
+    │  （不在 /links/pinned 页面时，params.pinnedOnly 为 undefined）
+    ▼
+buildQueryString(params)              packages/router/links.tsx#L106-L116
+    │  filter((key) => params[key] !== undefined)
+    │  （pinnedOnly=undefined 时不会出现在 URL 中）
+    ▼
+GET /api/v1/search?...（无 pinnedOnly 参数）
+    │
+    ▼
+API 路由层解析                       apps/web/pages/api/v1/search/index.ts#L22-L24
+    │  pinnedOnly: req.query.pinnedOnly
+    │    ? req.query.pinnedOnly === "true"
+    │    : undefined    ← 🔑 URL 无参数时 pinnedOnly = undefined
+    ▼
+Controller 层（searchLinks / getLinks）
+```
 
-| 接口 | 代码位置 | pinnedOnly=true | pinnedOnly=false / 未传 |
-|------|---------|----------------|------------------------|
-| **旧列表接口 getLinks** | `apps/web/lib/api/controllers/links/getLinks.ts#L117-L120` | `{ pinnedBy: { some: { id: userId } } }` | `undefined` |
+### 3.2 pinnedCondition 三路径定义对比（校正版）
+
+| 接口 | 代码位置 | pinnedOnly=true | pinnedOnly=false / undefined |
+|------|---------|----------------|-----------------------------|
+| **旧列表接口 getLinks** | `apps/web/lib/api/controllers/links/getLinks.ts#L117-L121` | `{ pinnedBy: { some: { id: userId } } }` | `{ pinnedBy: undefined }`（对象，属性值为 undefined） |
 | **搜索接口 searchLinks**（两路径共用） | `apps/web/lib/api/controllers/search/searchLinks.ts#L51-L52` | `{ pinnedBy: { some: { id: userId } } }` | `{}`（空对象） |
 
-**核心差异：**
-- `undefined` 在 Prisma 数组中会被**完全忽略**
-- `{}`（空对象）在 Prisma WHERE 子句中表示 **TRUE（匹配所有记录）**
+### 3.3 Prisma 对 undefined 属性值的处理（核心校正）
+
+**关键发现：** getLinks 中 `{ pinnedBy: undefined }` 不是 `undefined` 值本身，而是一个**对象** `{ pinnedBy: undefined }` 被放入 Prisma 的 AND/OR 条件数组中。
+
+Prisma 在处理 WHERE 条件对象时，值为 `undefined` 的属性会被**忽略并剔除**。因此：
+
+```
+getLinks:  { pinnedBy: undefined }  →  Prisma 剔除 undefined 属性  →  {}（空对象）
+searchLinks:  {}（直接是空对象）  →  无需处理  →  {}（空对象）
+```
+
+**最终结论：三路径在 pinnedOnly=false/undefined 时的行为完全一致！**
+都是在 AND/OR 数组中放入空对象 `{}`，而 Prisma WHERE 子句中的空对象 `{}` 表示 **TRUE（匹配所有记录）**。
+
+### 3.4 空对象 `{}` 在 Prisma AND/OR 数组中的行为
+
+在 Prisma 的布尔逻辑数组中：
+
+| 数组元素 | 含义 | 对 AND 的影响 | 对 OR 的影响 |
+|---------|------|-------------|-------------|
+| `{ name: "test" }` | 条件：name = "test" | 必须满足 | 任一满足即可 |
+| `{}`（空对象） | 无任何条件 = TRUE | AND [TRUE, ...] = 不影响其他条件 | OR [TRUE, ...] = **整个表达式恒为 TRUE** |
+
+**🔴 严重后果：** 当 `{}` 出现在 OR 数组中时，整个 OR 条件恒为 TRUE，数组中的其他条件（包括 tagId、searchConditions）全部失效。
 
 ---
 
-## 四、多条件筛选的 AND/OR 嵌套逻辑（复核校正）
+## 四、多条件筛选的 AND/OR 嵌套逻辑（校正版）
 
 ### 4.1 查询参数类型
 
@@ -207,7 +251,7 @@ where: {
             {
               pinnedBy: query.pinnedOnly
                 ? { some: { id: userId } }
-                : undefined,  // undefined 时 Prisma 忽略该条件
+                : undefined,  // 🔴 { pinnedBy: undefined } → Prisma 忽略属性 → {}
             },
             ...searchConditions,  // name/url/description/tags.name contains
           ],
@@ -242,9 +286,9 @@ searchConditions = [
 
 ---
 
-#### 用布尔逻辑表达式表示（四条件同时存在时）
+#### pinnedOnly=true + 四条件同时存在时
 
-当 `tagId=T`、`searchQueryString=S`、`collectionId=C`、`pinnedOnly=true` **全部传入**时：
+当 `tagId=T`、`searchQueryString=S`、`collectionId=C`、`pinnedOnly=true` 全部传入时：
 
 ```
 权限过滤
@@ -261,24 +305,24 @@ searchConditions = [
   )
 ```
 
-**语义：** 链接必须属于指定集合，且满足以下条件之一：
+**语义：** 属于指定集合，且满足以下条件之一：
 1. 被打了指定标签（tagId=T），**不管是否置顶、不管名称是否匹配**
 2. **或者**（已置顶 OR 名称匹配 OR URL 匹配 OR 描述匹配 OR 标签名匹配）
 
 ---
 
-#### pinnedOnly=false 时的真实行为（getLinks）
+#### pinnedOnly=undefined（未传递）+ 其他条件存在时（校正版）
 
-当 `pinnedOnly=false`（或未传），但 `tagId=T`、`searchQueryString=S`、`collectionId=C` 同时存在时：
+当 `tagId=T`、`searchQueryString=S`、`collectionId=C`，但 **未传 pinnedOnly**（即 `pinnedOnly=undefined`）时：
 
 ```typescript
 // 分支 B 变成：
 OR: [
-  { pinnedBy: undefined },  // Prisma 忽略 undefined，数组元素消失
+  { pinnedBy: undefined },  // 🔴 Prisma 忽略 undefined 属性 → 变成 {} = TRUE
   ...searchConditions,
 ]
-// 实际等价于：
-OR: [...searchConditions]
+// = OR: [TRUE, ...searchConditions]
+// = TRUE（第一个元素就为真，整个 OR 恒为真）
 ```
 
 完整逻辑变为：
@@ -287,12 +331,37 @@ OR: [...searchConditions]
 权限过滤
   AND collectionId = C
   AND (
-    tagId = T
-    OR (name 包含 S OR url 包含 S OR description 包含 S OR tags.name 包含 S)
+    tagId = T     ← 分支 A
+    OR TRUE       ← 分支 B：OR [TRUE, ...] = 恒为 TRUE
   )
+// = 权限过滤 AND collectionId = C AND TRUE
+// = 权限过滤 AND collectionId = C
 ```
 
-**语义：** 属于集合 C，且（打了标签 T **或者** 关键词匹配任一字段）
+**🔴 严重后果：tagId=T 和 searchQueryString=S 完全失效！** 结果仅为「属于集合 C 的所有有权限链接」，tag 过滤和搜索条件全部不起作用。
+
+---
+
+#### 只有 tagId=T、collectionId=C，无 pinnedOnly、无 search 时
+
+```typescript
+// 分支 B 变成：
+AND: [
+  { pinnedBy: undefined },  // → {} = TRUE
+  ...[],                    // searchConditions 为空
+]
+// = AND: [TRUE] = TRUE
+```
+
+完整逻辑：
+
+```
+权限过滤 AND collectionId = C AND (tagId=T OR TRUE)
+= 权限过滤 AND collectionId = C AND TRUE
+= 权限过滤 AND collectionId = C
+```
+
+**同样：tagId=T 完全失效！**
 
 ---
 
@@ -317,7 +386,7 @@ OR: [...searchConditions]
 │        否则 → ["(collectionOwnerId = U) OR (collectionMemberIds = U)"] │
 │      ② 搜索语法解析出的过滤器（从 searchQueryString 解析）：     │
 │         tag:xxx / !tag:xxx                                    │
-│         collection:xxx / !collection:xxx  ← 注意：这是按集合名，不是 query.collectionId │
+│         collection:xxx / !collection:xxx  ← 注意：按集合名，不是 query.collectionId │
 │         pinned:true/false                                     │
 │         url:xxx / name:xxx / description:xxx / type:xxx       │
 │         before:xxx / after:xxx / public:true                  │
@@ -346,7 +415,7 @@ OR: [...searchConditions]
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**🔑 关键校正：collectionId 在 MeiliSearch 过滤器中不存在！**
+**🔑 关键校正 1：collectionId 在 MeiliSearch 过滤器中不存在！**
 
 `buildMeiliFilters` 的函数签名 `apps/web/lib/api/searchQueryBuilder.ts#L93-L101`：
 
@@ -364,9 +433,11 @@ export function buildMeiliFilters({
 
 没有 `collectionId` 参数。`query.collectionId` 仅在阶段 2 的 PostgreSQL 二次过滤中通过 `...collectionCondition` 生效。
 
+注意：搜索语法中的 `collection:Name`（按集合名在 Meili 阶段过滤）与 URL 参数 `collectionId=5`（按 ID 在 PG 阶段过滤）是两个独立机制。
+
 ---
 
-#### 阶段 2 中 pinnedCondition 的特殊行为（关键校正）
+#### 阶段 2 中 pinnedCondition 的特殊行为
 
 MeiliSearch 路径阶段 2 的代码 `apps/web/lib/api/controllers/search/searchLinks.ts#L116-L123`：
 
@@ -387,34 +458,33 @@ MeiliSearch 路径阶段 2 的代码 `apps/web/lib/api/controllers/search/search
 pinnedCondition = { pinnedBy: { some: { id: userId } } }
 // 展开后：
 OR: [
-  ...tagCondition,                    // 可能有 { tags: { some: { id: T } } }
+  ...tagCondition,                        // [{ tags: { some: { id: T } } }]
   { pinnedBy: { some: { id: userId } } },  // 置顶条件
 ]
 ```
 
 语义：`tagId 匹配 OR 已置顶` ✓
 
-**情况 2：pinnedOnly=false（或未传）**
+**情况 2：pinnedOnly=undefined（或 false）**
 
 ```typescript
 pinnedCondition = {}  // 空对象
 // 展开后：
 OR: [
-  ...tagCondition,  // 可能有 { tags: { some: { id: T } } }
+  ...tagCondition,  // [{ tags: { some: { id: T } } }]
   {},               // 🔴 空对象 = TRUE（匹配所有记录）
 ]
-// 整个 OR 表达式恒为 TRUE！
+// = OR: [tagCondition, TRUE]
+// = TRUE（整个 OR 表达式恒为真！）
 ```
 
-**🔴 严重后果：当 pinnedOnly=false 且 tagId 存在时，tagId 过滤也失效了。**
-
-因为 `OR: [条件A, TRUE]` 结果永远是 TRUE，无论条件A是否满足。
+**🔴 严重后果：tagId 过滤完全失效。**
 
 ---
 
-#### 四条件同时存在且 pinnedOnly=true 时（MeiliSearch 路径）
+#### 四条件同时存在且 pinnedOnly=undefined 时（MeiliSearch 路径）
 
-`tagId=T`、`searchQueryString=S`、`collectionId=C`、`pinnedOnly=true`：
+`tagId=T`、`searchQueryString=S`、`collectionId=C`、`pinnedOnly=undefined`：
 
 ```
 【阶段 1：MeiliSearch】
@@ -428,38 +498,16 @@ AND filter:
 AND
 ├── id IN (meiliIds)
 ├── 权限过滤
-├── collection.id = C           ← collectionId 仅在此生效
-└── OR
-    ├── tags.some: id = T       ← 分支 A：tagId 匹配
-    └── pinnedBy.some: id = U   ← 分支 B：已置顶
-```
-
-**结果语义 =**
-（MeiliSearch 搜索 "S" 的结果） AND （属于集合 C） AND （被打了 tag#T **OR** 已置顶）
-
-**⚠️ 关键差异：** searchQueryString 只在阶段 1 的 Meili 全文检索生效，阶段 2 的 PG 二次过滤不再检查名称/URL/描述/标签名匹配。
-
----
-
-#### 四条件同时存在且 pinnedOnly=false 时（MeiliSearch 路径）
-
-`tagId=T`、`searchQueryString=S`、`collectionId=C`、`pinnedOnly=false`：
-
-```
-【阶段 2：PostgreSQL】
-AND
-├── id IN (meiliIds)
-├── 权限过滤
 ├── collection.id = C
 └── OR
-    ├── tags.some: id = T       ← 分支 A
-    └── {}                      ← 分支 B：空对象 = TRUE
-//                                  → 整个 OR = TRUE，完全不过滤！
+    ├── tags.some: id = T    ← 分支 A
+    └── {}                    ← 分支 B：空对象 = TRUE
+//                                → 整个 OR = TRUE，完全不过滤！
 ```
 
 **结果语义 =**
 （MeiliSearch 搜索 "S" 的结果） AND （属于集合 C）
-**tagId 过滤完全失效！** 🔴
+**tagId=T 过滤完全失效！** 🔴
 
 ---
 
@@ -481,7 +529,7 @@ where: {
         {
           // 有 search 用 OR，无 search 用 AND
           [query.searchQueryString ? "OR" : "AND"]: [
-            pinnedCondition,  // 🔑 pinnedOnly=false 时是 {}（空对象）
+            pinnedCondition,  // 🔑 pinnedOnly=undefined 时是 {}（空对象）
             ...searchConditions,
           ],
         },
@@ -495,12 +543,15 @@ where: {
 
 | 差异点 | getLinks | searchLinks Fallback |
 |--------|----------|---------------------|
-| pinnedOnly=false 时 | `undefined`（Prisma 忽略） | `{}`（空对象 = TRUE） |
+| pinnedOnly=undefined 时 | `{ pinnedBy: undefined }` → Prisma 忽略属性 → `{}` | 直接是 `{}`（空对象） |
+| 最终效果 | `{}` = TRUE | `{}` = TRUE |
 | tags.name 搜索可见性校验 | ✅ 有 `OR: [ownerId, members]` | ❌ 无 |
+
+**校正结论：** pinnedOnly=undefined 时，三路径最终效果完全一致，都是 `{}`（空对象 = TRUE）放入条件数组。唯一差异仅在于 tags.name 搜索的可见性校验。
 
 ---
 
-#### Fallback 路径中 pinnedCondition 的特殊行为（关键校正）
+#### Fallback 路径中 pinnedCondition 的行为（校正版）
 
 **情况 1：pinnedOnly=true + 有 searchQueryString**
 
@@ -515,7 +566,7 @@ OR: [
 
 语义：`置顶 OR 搜索匹配` ✓
 
-**情况 2：pinnedOnly=false + 有 searchQueryString**
+**情况 2：pinnedOnly=undefined + 有 searchQueryString**
 
 ```typescript
 pinnedCondition = {}  // 空对象
@@ -524,12 +575,13 @@ OR: [
   {},               // 🔴 TRUE
   ...searchConditions,
 ]
-// 整个 OR = TRUE（第一个元素就为真）
+// = OR: [TRUE, ...]
+// = TRUE（整个 OR 恒为真）
 ```
 
-**🔴 后果：** 分支 B 恒为 TRUE → 外层 OR（tagId OR 分支B）也恒为 TRUE → **tagId 过滤完全失效！**
+**🔴 后果：** 分支 B 恒为 TRUE → 外层 OR（tagId OR 分支B）也恒为 TRUE → **tagId 和 searchConditions 都完全失效！**
 
-**情况 3：pinnedOnly=false + 无 searchQueryString**
+**情况 3：pinnedOnly=undefined + 无 searchQueryString**
 
 ```typescript
 pinnedCondition = {}  // 空对象
@@ -538,14 +590,14 @@ AND: [
   {},               // TRUE
   ...[],            // searchConditions 为空
 ]
-// AND [TRUE] = TRUE
+// = AND: [TRUE] = TRUE
 ```
 
-同样：分支 B 恒为 TRUE → tagId 过滤完全失效！🔴
+同样：分支 B 恒为 TRUE → **tagId 过滤完全失效！** 🔴
 
 ---
 
-### 4.4 三接口四条件叠加对比表（校正版）
+### 4.4 三接口四条件叠加对比表（最终校正版）
 
 当 **tagId=T、searchQueryString=S、collectionId=C、pinnedOnly=PO** 同时传入时：
 
@@ -554,10 +606,12 @@ AND: [
 | **权限过滤** | ✅ AND | ✅ Meili阶段(权限filter) + PG阶段 AND | ✅ AND |
 | **collectionId=C** | ✅ AND（PG） | ⚠️ 仅 PG 阶段 AND，**Meili 阶段不过滤** | ✅ AND（PG） |
 | **搜索语法 collection:Name** | ❌ 不支持 | ✅ Meili filter 阶段按集合名过滤 | ❌ 不支持 |
-| **tagId=T** | ✅ OR 分支A | ⚠️ PG 阶段 OR 分支A（但 PO=false 时失效） | ⚠️ OR 分支A（PO=false 时失效） |
+| **tagId=T（PO=true 时）** | ✅ OR 分支A | ✅ PG 阶段 OR 分支A | ✅ OR 分支A |
+| **tagId=T（PO=undefined 时）** | 🔴 `{pinnedBy:undefined}`→`{}`→OR恒TRUE→**tagId失效** | 🔴 `{}`→OR恒TRUE→**tagId失效** | 🔴 `{}`→OR恒TRUE→**tagId失效** |
 | **pinnedOnly=true** | ✅ OR 分支B-1 | ✅ PG 阶段 OR 分支B | ✅ OR 分支B-1 |
-| **pinnedOnly=false** | ✅ undefined（被忽略） | 🔴 `{}` → OR恒TRUE → tagId也失效 | 🔴 `{}` → OR恒TRUE → tagId也失效 |
-| **S 匹配 name/url/description** | ✅ OR 分支B-2~4 | ✅ Meili 全文检索（PG阶段不重复） | ✅ OR 分支B-2~4 |
+| **pinnedOnly=undefined** | 🔴 变 `{}`→OR恒TRUE→tagId/search均失效 | 🔴 `{}`→OR恒TRUE→tagId失效 | 🔴 `{}`→OR恒TRUE→tagId/search均失效 |
+| **S 匹配 name/url/description（PO=true）** | ✅ OR 分支B-2~4 | ✅ Meili 全文检索（PG阶段不重复） | ✅ OR 分支B-2~4 |
+| **S 匹配 name/url/description（PO=undefined）** | 🔴 OR恒TRUE→**search也失效** | ✅ Meili 阶段正常执行（PG阶段不过滤） | 🔴 OR恒TRUE→**search也失效** |
 | **S 匹配 tags.name（含可见性校验）** | ✅ OR 分支B-5（有校验） | ✅ Meili tags 字段索引 | ✅ OR 分支B-5（**无可见性校验**） |
 | **高级语法** `tag:`/`!tag:`/`pinned:` 等 | ❌ 不支持 | ✅ Meili filter 解析 | ❌ 不支持 |
 | **搜索结果排序** | PG 按字段排序 | Meili 按相关性 + 指定字段排序 | PG 按字段排序 |
@@ -568,7 +622,7 @@ AND: [
 
 ## 五、多条件同时存在时的完整查询树可视化（校正版）
 
-### 5.1 场景 A：全部四个条件同时传入且 pinnedOnly=true
+### 5.1 场景 A：pinnedOnly=true，全部四条件传入
 
 请求参数示例：
 ```
@@ -577,7 +631,7 @@ GET /api/v1/search?collectionId=5&tagId=12&pinnedOnly=true&searchQueryString=rea
 
 ---
 
-#### 旧列表接口 getLinks 的查询树
+#### 旧列表接口 getLinks
 
 ```
 AND
@@ -603,7 +657,7 @@ AND
 
 ---
 
-#### 搜索接口 MeiliSearch 路径的查询树
+#### 搜索接口 MeiliSearch 路径
 
 ```
 【阶段 1：MeiliSearch】
@@ -633,58 +687,67 @@ AND
 
 ---
 
-### 5.2 场景 B：pinnedOnly=false，其他三条件存在
+### 5.2 场景 B：pinnedOnly=undefined（未传递），tagId、search、collectionId 存在
 
-请求参数示例：
+请求参数示例（注意无 pinnedOnly 参数）：
 ```
-GET /api/v1/search?collectionId=5&tagId=12&pinnedOnly=false&searchQueryString=react
+GET /api/v1/search?collectionId=5&tagId=12&searchQueryString=react
 ```
 
 ---
 
-#### 旧列表接口 getLinks
+#### 旧列表接口 getLinks（校正版）
 
 ```
 AND
 ├── 权限
 ├── collection.id = 5
 └── OR
-    ├── tags.some: id = 12      ← 分支 A：tagId 匹配
-    └── OR
-        ├── pinnedBy: undefined  ← 被 Prisma 忽略，从数组中移除
+    ├── 【分支A】tags.some: id = 12
+    │
+    └── 【分支B】OR
+        ├── { pinnedBy: undefined }  → Prisma 剔除 undefined 属性 → {} = TRUE
         ├── name ILIKE "%react%"
         ├── url ILIKE "%react%"
         ├── description ILIKE "%react%"
-        └── tags.name ILIKE "%react%"（含可见性校验）
+        └── tags.name ILIKE "%react%"
+        // → OR: [TRUE, ...] = 整个分支B = TRUE
+//
+// → 外层 OR: [分支A, TRUE] = TRUE（完全不过滤！）
 ```
 
-**结果语义 =** （属于集合 5） AND （tag#12 **OR** 关键词匹配）
-
-tagId 过滤正常生效 ✓
+**结果语义 =** （属于集合 5） AND TRUE = **仅属于集合 5**
+**tagId=12 和 searchQueryString="react" 完全失效！** 🔴
 
 ---
 
-#### 搜索接口 MeiliSearch 路径
+#### 搜索接口 MeiliSearch 路径（校正版）
 
 ```
+【阶段 1：MeiliSearch】
+全文检索 query = "react"
+AND filter: 权限
+        ↓ 输出 meiliIds
+
 【阶段 2：PostgreSQL】
 AND
 ├── id IN (meiliIds)
 ├── 权限
 ├── collection.id = 5
 └── OR
-    ├── tags.some: id = 12   ← 分支 A
-    └── {}                   ← 分支 B：空对象 = TRUE
-//                                  → 整个 OR = TRUE
+    ├── tags.some: id = 12    ← 分支 A
+    └── {}                    ← 分支 B：空对象 = TRUE
+//                                → 整个 OR = TRUE
 ```
 
-**结果语义 =** （Meili 搜索 "react" 结果） AND （属于集合 5）
-
-**tagId=12 过滤完全失效！** 🔴 所有 Meili 返回且属于集合 5 的链接都会被返回，不管是否打了 tag#12。
+**结果语义 =** （Meili 搜索 "react" 结果） AND （属于集合 5） AND TRUE
+= （Meili 搜索结果） AND （属于集合 5）
+**tagId=12 在 PG 阶段完全失效！** 🔴
+（但 searchQueryString="react" 在 Meili 阶段仍正常生效）
 
 ---
 
-#### 搜索接口 Fallback
+#### 搜索接口 Fallback（校正版）
 
 ```
 AND
@@ -699,9 +762,8 @@ AND
 //              → 内层 OR = TRUE → 外层 OR = TRUE
 ```
 
-**结果语义 =** （属于集合 5）
-
-**tagId=12 和 searchQueryString="react" 都失效！** 🔴 所有属于集合 5 的链接都会被返回，tag 和搜索条件完全不起作用。
+**结果语义 =** （属于集合 5） AND TRUE = **仅属于集合 5**
+**tagId=12 和 searchQueryString="react" 都完全失效！** 🔴
 
 ---
 
@@ -715,28 +777,31 @@ AND
 | **collectionId 过滤阶段** | 仅 PG 二次过滤阶段（Meili 阶段不过滤） | PG 单阶段（与其他条件同树） |
 | **搜索能力** | 全文检索 + 排名打分 + 高级语法 | 简单 `contains` 子串匹配，无排名 |
 | **高级语法** | `tag:` `collection:` `pinned:` `before:` `after:` `!否定` | 不支持 |
-| **pinnedOnly=false 对 tagId 的影响** | 🔴 tagId 完全失效（OR 恒 TRUE） | getLinks: ✓ 正常；Fallback: 🔴 tagId 失效 |
-| **pinnedOnly=false + 有 search 对 search 的影响** | search 在 Meili 阶段正常执行 | Fallback: 🔴 search 也失效（OR 恒 TRUE） |
+| **PO=undefined 对 tagId 的影响** | 🔴 PG 阶段 tagId 失效（OR 恒 TRUE） | 🔴 tagId 完全失效（OR 恒 TRUE） |
+| **PO=undefined 对 search 的影响** | ✅ Meili 阶段正常执行 | 🔴 search 也失效（OR 恒 TRUE） |
+| **PO=undefined + 无 tagId + 有 search** | ✅ Meili 正常 + PG 仅不过滤 tag/pinned | 🔴 search 完全失效 |
 | **标签名搜索的可见性校验** | Meili 索引时已过滤 | getLinks: ✅ 有；Fallback: ❌ 无 |
 | **一致性** | 最终一致（依赖 indexVersion 异步同步） | 强一致 |
 | **分页方式** | offset-based（数字） | cursor-based（ID 游标） |
 
 ### 6.2 可能导致结果不一致的场景
 
-#### 场景 1：tagId 存在 + searchQueryString 存在 + pinnedOnly=false
+#### 场景 1：tagId 存在 + searchQueryString 存在 + pinnedOnly=undefined
 
 | 路径 | 结果 |
 |------|------|
-| getLinks | tagId OR 搜索匹配 → tagId 正常 ✓ |
-| search Meili | （Meili 搜索结果） AND collectionId → **tagId 失效** 🔴 |
-| search Fallback | 仅 collectionId → **tagId 和 search 都失效** 🔴 |
+| getLinks | **tagId 和 search 均失效** → 仅权限 + collectionId 🔴 |
+| search Meili | search 在 Meili 阶段生效，**tagId 在 PG 阶段失效** → Meili搜索结果 AND collectionId |
+| search Fallback | **tagId 和 search 均失效** → 仅权限 + collectionId 🔴 |
+
+**不一致：** MeiliSearch 路径返回的是搜索结果，Fallback/getLinks 返回的是集合所有链接。
 
 #### 场景 2：tagId 存在 + searchQueryString 存在 + pinnedOnly=true
 
 | 路径 | 结果 |
 |------|------|
 | getLinks | tagId OR (置顶 OR 搜索匹配) |
-| search Meili | （Meili 搜索结果） AND (tagId OR 置顶) |
+| search Meili | (Meili 搜索结果) AND (tagId OR 置顶) |
 | search Fallback | tagId OR (置顶 OR 搜索匹配) |
 
 **差异：** 如果某链接打了 tag#12 但名称/URL/描述/标签名都不含 "react"：
@@ -876,11 +941,11 @@ Worker 后台扫描 indexVersion=null 的链接
 
 ---
 
-## 九、关键设计要点（校正总结）
+## 九、关键设计要点（最终校正总结）
 
 ### ✅ 已确认正确的设计
 
-1. **tagId 与 (pinned + search) 是 OR 关系，不是 AND**：指定 tagId 后，即使 pinnedOnly=true，未置顶但打了该标签的链接也会被返回（getLinks 中）。
+1. **tagId 与 (pinned + search) 是 OR 关系，不是 AND**：当 pinnedOnly=true 时，指定 tagId 后，即使 pinnedOnly=true，未置顶但打了该标签的链接也会被返回。
 
 2. **标签所有权归集合所有者**：成员打标签时，标签 owner 是集合创建者，通过 `name_ownerId` 唯一约束实现跨链接去重。
 
@@ -888,12 +953,11 @@ Worker 后台扫描 indexVersion=null 的链接
 
 ### 🔴 复核发现的潜在问题
 
-4. **pinnedOnly=false 时 searchLinks 的 tagId 过滤失效**：
-   - searchLinks 中 `pinnedCondition = {}`（空对象）而非 `undefined`
-   - 空对象在 Prisma OR 数组中 = TRUE，导致整个 OR 分支恒为 TRUE
-   - **MeiliSearch 路径：** tagId 失效
-   - **Fallback 路径：** tagId 和 searchConditions 都失效（分支 B 恒 TRUE）
-   - **getLinks 不受影响**（使用 `undefined`，Prisma 忽略）
+4. **pinnedOnly=undefined（未传递）时，三路径均存在 tagId 和 search 过滤失效**：
+   - getLinks：`{ pinnedBy: undefined }` → Prisma 剔除 undefined 属性 → `{}`（空对象 = TRUE）→ OR 分支恒真 → **tagId 和 search 均失效**
+   - search MeiliSearch：`pinnedCondition = {}` → PG 二次过滤 OR 恒真 → **tagId 失效**（但 Meili 阶段 search 正常）
+   - search Fallback：`pinnedCondition = {}` → OR 分支恒真 → **tagId 和 search 均失效**
+   - **注意：** 前端默认不传 pinnedOnly（仅在 `/links/pinned` 页面传 `pinnedOnly=true`），因此绝大多数场景下 pinnedOnly=undefined，tagId 过滤在 DB 查询层实际上**永远不生效**。
 
 5. **searchLinks Fallback 的 tags.name 搜索缺少可见性校验**：getLinks 在搜索标签名时有额外的 `OR: [ownerId, members]` 校验，search Fallback 没有，可能搜索到不应可见的标签。
 
