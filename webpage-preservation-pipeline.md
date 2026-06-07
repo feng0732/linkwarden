@@ -101,10 +101,10 @@ archiveHandler(link, browser)
     │   └─ URL 类型 → 浏览器渲染 page.goto()
     │       ├─ metaDescription 提取并存库
     │       ├─ content = page.content() → 获取渲染后 HTML
-    │       ├─ handleArchivePreview()  → 生成预览小图
-    │       ├─ handleReadability()     → Readability JSON
-    │       ├─ handleScreenshotAndPdf()→ 全屏截图 + PDF
-    │       └─ handleMonolith()        → 单文件 HTML 归档
+    │       ├─ handleArchivePreview()  → 生成预览小图 (★ 不受任何归档开关控制，始终执行)
+    │       ├─ handleReadability()     → Readability JSON (需 archiveAsReadable=true)
+    │       ├─ handleScreenshotAndPdf()→ 全屏截图 + PDF (需 archiveAsScreenshot/PDF=true)
+    │       └─ handleMonolith()        → 单文件 HTML 归档 (需 archiveAsMonolith=true)
     │
     └─ finally
         ├─ 清理 timeout
@@ -289,9 +289,11 @@ resolve();
 
 ### 5.2 预览小图 — [handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)
 
-优先级：
-1. 读取页面 `<meta property="og:image">`，若存在则 `page.goto()` 该图片 URL，调用 `generatePreview(buffer)`
-2. 回退：低质量截图 `page.screenshot({ type: "jpeg", quality: 20 })`
+**不受任何归档开关控制**：对比 readable/image/pdf/monolith 都有 `archivalSettings.archiveAsXxx` 判断，preview 在 [archiveHandler.ts:169](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L169) 仅判断 `!link.preview`，即使用户关闭了所有归档格式，preview 也会尝试生成。
+
+两条生成路径（有优先级）：
+1. **OG 图片路径**：读取页面 `<meta property="og:image">`，若存在则 `page.goto()` 该图片 URL，调用 `generatePreview(buffer)` 做 Jimp 压缩
+2. **Fallback 截图路径**：低质量截图 `page.screenshot({ type: "jpeg", quality: 20 })`
 
 `generatePreview` 位于 [generatePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/packages/lib/generatePreview.ts)，使用 Jimp：
 - resize 宽度 1000px，高度自适应
@@ -303,7 +305,18 @@ resolve();
 1. 外层（archiveHandler.ts:169）：`!link.preview`——字段为 `null` 才会调用此 handler
 2. 内层（handleArchivePreview.ts:42,59）：`!link.preview?.startsWith("archive")`——仅真实归档路径会被内层拦截，`"unavailable"` 在此处不拦截（但外层已拦截，实际走不到）
 
-**静默失败**：Buffer 超限 `console.log` + `return`，字段保持 `null`，finally 标记为 `"unavailable"`。
+**失败传播与状态标记**：
+
+| 场景 | 行为 | 最终 preview 字段 |
+|------|------|------------------|
+| OG 图片路径 Jimp 处理异常 | `generatePreview` 内部 try/catch 吞掉，返回 `false`，继续走 fallback | 取决于 fallback |
+| OG 图片路径 Buffer 超限 | `generatePreview` **主动写库** `preview = "unavailable"` 后返回 `false` → 内层 `startsWith("archive")` 检查拦截 fallback → 不再走截图路径 | `"unavailable"`（generatePreview 自己写的） |
+| OG 图片 `page.goto()` 非 SSRF 错误 | try/catch 里 `throw error` 重新抛出 → 冒泡到 handleArchivePreview → archiveHandler 外层 catch | `null` → finally 标记 `"unavailable"` |
+| Fallback `page.screenshot()` 抛错 | `.then()` 无配套 `.catch()` → Promise reject 冒泡 → archiveHandler 异常 | `null` → finally 标记 `"unavailable"` |
+| Fallback `createFile()` / `prisma.update()` 抛错 | 同上，await 了所以 reject 冒泡 | `null` → finally 标记 `"unavailable"` |
+| Fallback Buffer 超限 | `console.log` + 静默 `return`，不抛错不写库 | `null` → finally 标记 `"unavailable"` |
+
+总结：只有 **OG 路径的 Jimp 异常**和**fallback 的 Buffer 超限**是静默的；其他异常会冒泡中断整个 archiveHandler。但无论如何，finally 都会兜底（除非 generatePreview 已主动写了 unavailable，此时 finally 因 truthy 不动）。
 
 ### 5.3 直链图片/PDF — [imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts) / [pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts)
 
@@ -372,7 +385,7 @@ Buffer 超限的情况是静默 return，同其他格式。
 
 | 格式 | 代码行 | 外层判断条件 | 字段为 `"unavailable"` 时结果 | 字段为 `null` 时结果 |
 |------|--------|-------------|--------------------------|---------------------|
-| preview | L169 | `!link.preview` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
+| preview | L169 | `!link.preview`（**不受归档开关控制，始终执行**） | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
 | readable | L172 | `archiveAsReadable && !link.readable` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
 | image(截图) | L177 | `archiveAsScreenshot && !link.image` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
 | pdf | L178 | `archiveAsPDF && !link.pdf` | `!"unavailable"` = false → **跳过** | `!null` = true → 执行 |
@@ -502,12 +515,18 @@ await prisma.link.update({
 
 在 [preservation.tsx:67-164](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L67-L164) 中，管理员可执行 `action === "allBroken"`：
 
-1. **精确查找**：`WHERE image = "unavailable" OR pdf = "unavailable" OR ...`（精确字符串匹配）
+1. **精确查找**：`WHERE image = "unavailable" OR pdf = "unavailable" OR readable = "unavailable" OR monolith = "unavailable" OR preview = "unavailable"`（精确字符串匹配）
 2. **重新计算**该链接对应的 `archivalSettings`（Tag 优先，用户默认回退）
-3. **条件重置**：仅当 `字段 === "unavailable" && 用户确实开启了该格式` 时，才把该字段改为 `null`
+3. **条件重置**：仅当 `字段 === "unavailable" && 用户确实开启了对应格式` 时，才把该字段改为 `null`
 4. `lastPreserved = null` → Worker 重新拾取
 
 这是为了弥补 finally 块"不区分失败和未开启"的设计缺陷——修复逻辑只重置那些真正应该产出但失败了的字段，用户没开的格式保持 `"unavailable"` 不动。
+
+**preview 字段的特殊处理**：
+- 查询条件（L82）包含 `{ preview: "unavailable" }`，即 preview=unavailable 的链接会被查到
+- 但 `needsReprocessing` 判断（L127-132）**完全不检查 preview**——只看 image/pdf/readable/monolith
+- `update` 数据（L138-156）**也完全不处理 preview 字段**——preview 保持 `"unavailable"` 不变
+- 结论：**`allBroken` 不会重置 preview 字段**。preview 失效后只能通过"手动重新归档 PUT"来触发重试（PUT 接口把所有字段包括 preview 都置为 null）。
 
 ---
 
@@ -560,11 +579,13 @@ await handleMonolith(...).catch(err => console.error(err));
 **Readability** ([handleReadability.ts:26-61](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts#L26-L61))：
 当 `articleText` 为空或 `undefined`（Readability 没能提取出有效文章内容）时，函数直接 `return`，不抛错也不写 DB，字段维持 `null`，等待 finally 标记为 `"unavailable"`。Buffer 超限时也是 `console.error` + `return`。
 
-**handleArchivePreview / handleScreenshotAndPdf**：内部用 `.then().catch()` 或 `Promise.allSettled`，截图/PDF 异常被吞掉。Buffer 超限时 `console.log` + `return`。
+**handleArchivePreview**：仅 OG 路径的 Jimp 异常和 fallback 的 Buffer 超限是静默的；`page.goto(ogImageUrl)` 非 SSRF 错误、fallback 的 `page.screenshot()`/`createFile()`/`prisma.update()` 异常都会冒泡到 archiveHandler，中断后续格式执行。详见 5.2 节的场景表。
+
+**handleScreenshotAndPdf**：内部用 `Promise.allSettled`，截图/PDF 异常被吞掉。Buffer 超限时 `console.log` + `return`。
 
 **imageHandler / pdfHandler**：未被 `.catch()` 包裹，异常会正常抛出。但这两个 handler 仅在 URL 的 `Content-Type` 本身就是 image/pdf 时才会被调用，且外层是 `async () => { ... }`，异常会抛到 `Promise.race`，导致整个 archiveHandler 异常——此时 finally 仍会执行，把尚未写入的字段标记为 `"unavailable"`。
 
-因此，除直链 image/pdf 外的所有格式都具备"静默失败 + finally 兜底 unavailable"的特性。单格式失败不会中断其他格式的执行。
+因此，**Monolith、Readability、Screenshot/PDF** 具备"静默失败 + finally 兜底 unavailable"的特性，单格式失败不会中断其他格式的执行。**handleArchivePreview、imageHandler、pdfHandler** 的异常场景会冒泡中断后续格式，但 finally 始终执行，所有未成功写入的字段最终都会被标记为 `"unavailable"`。
 
 ---
 
@@ -684,11 +705,11 @@ Monolith 输出的 HTML 中，资源已被转换为 base64 data-URI：
 
 ### 10.5 存在性检查（幂等性）与重试触发条件
 
-每种保存格式的执行都需要同时满足"用户开启"和"字段为 null"两个条件：
+除 preview 外，每种保存格式的执行都需要同时满足"用户开启"和"字段为 null"两个条件；**preview 不受任何归档开关控制**，只要字段为 null 就会执行：
 
 | 格式 | 外层判断代码 | 判断逻辑拆解 |
 |------|-------------|-------------|
-| preview | `!link.preview` | `null` → true (执行); `"unavailable"` → false (跳过); `"archives/..."` → false (跳过) |
+| preview | `!link.preview` | **不受开关控制**。`null` → true (执行); `"unavailable"` → false (跳过); `"archives/..."` → false (跳过) |
 | readable | `archiveAsReadable && !link.readable` | 需同时满足: 开关=true **且** 字段=null |
 | image | `archiveAsScreenshot && !link.image` | 同上 |
 | pdf | `archiveAsPDF && !link.pdf` | 同上 |
@@ -708,6 +729,10 @@ Monolith 输出的 HTML 中，资源已被转换为 base64 data-URI：
 2. **管理员批量修复 allBroken** ([preservation.tsx:67-164](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L67-L164))：仅把"用户确实开启了该格式且字段为 `"unavailable"`"的字段重置为 `null`。
 
 只有当字段被重置为 `null`（falsy）时，`!link.xxx` 才会返回 `true`，对应的格式 handler 才会被再次执行。
+
+**preview 的重试特殊限制**：
+- ✅ 手动重新归档 PUT：会把 `preview` 置为 `null`，可正常重试
+- ❌ 批量修复 allBroken DELETE：**完全不处理 preview 字段**（见 6.8 节），即使 `preview = "unavailable"` 也保持不动，无法通过 allBroken 触发 preview 重试
 
 另外，部分 handler 内部还有第二层 `startsWith("archive")` 检查（见 6.4 节），但由于外层已经用 `!link.xxx` 把 `"unavailable"` 和 `"archives/..."` 都过滤掉了，这个内层检查对 unavailable 实际上没有影响——handleArchivePreview 和 handleScreenshotAndPdf 在字段为 unavailable 时根本不会被调用。
 
