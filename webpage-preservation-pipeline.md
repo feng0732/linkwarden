@@ -122,6 +122,8 @@ archiveHandler(link, browser)
 
 这意味着即使被保存的页面中有恶意资源指向内网 IP，也会被 Playwright 路由层拦截。
 
+> ⚠️ **注意：此防护仅覆盖 Playwright 浏览器进程发起的请求。** Monolith CLI 作为独立子进程下载资源时（见 4.3 节），不走 Playwright 路由，因此其资源请求不在 SSRF 防护范围内。
+
 ---
 
 ## 三、Readability 内容提取
@@ -167,39 +169,88 @@ content (Playwright 渲染后的完整 HTML)
 
 实现位于 [handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts)。
 
-### 4.1 Monolith 调用方式
+### 4.1 Monolith 参数与调用方式
 
-使用外部 CLI 工具 `monolith`（需要系统安装），通过 `child_process.spawn` 调用：
+使用外部 CLI 工具 `monolith`（Y2Z/monolith，Rust 编写），通过 `child_process.spawn` 调用，从 **stdin** 读入 HTML，向 **stdout** 写出单文件结果：
 
 ```bash
-monolith - \
-  -I \                       # 移除 images
-  -b {baseUrl} \             # 基础 URL 用于解析相对路径
-  -j -F -q \                 # 默认选项：去掉 JS、去掉 iframe、静默
+monolith \
+  - \                        # 位置参数: 从 stdin 读取输入 HTML
+  -I \                       # --isolate: 为输出 HTML 添加 CSP 沙箱隔离
+  -b {link.url} \            # --base-url: 基础 URL，用于解析 HTML 中的相对路径
+  -j -F -q \                 # 默认自定义选项 (可被 MONOLITH_CUSTOM_OPTIONS 完全覆盖)
+                             #   -j = --no-js:         排除 JavaScript
+                             #   -F = --no-webfonts:  排除 Web Fonts
+                             #   -q = --quiet:         静默
   -o -                       # 输出到 stdout
-  # 从 stdin 读入 Playwright 渲染后的 HTML
+  # stdin: 写入 Playwright 渲染后的 HTML (page.content())
 ```
 
-> `-j` (no-js) 和 `-F` (no-iframes) 是默认行为，可通过 `MONOLITH_CUSTOM_OPTIONS` 环境变量完全覆盖。
+参数来源：[handleMonolith.ts:14-24](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts#L14-L24)，参考 Monolith 官方文档。
 
-### 4.2 异常与边界
+### 4.2 资源内联方式
 
-- 通过 `AbortSignal` 与外层 5 分钟超时联动（`killSignal: "SIGKILL"`）
-- 退出码非 0 → reject
-- 输出 Buffer 为 0 → reject
-- 输出 > `MONOLITH_MAX_BUFFER`（默认 100MB）→ reject
-- **异常吞掉**：`archiveHandler.ts:189-193` 中 `.catch(err => console.error(err))`，即 Monolith 失败不影响其他格式产出
+Monolith 的默认行为是**把所有可解析到的外部资源转换为 base64 data-URI 内联到 HTML 中**。结合 Linkwarden 的参数：
 
-### 4.3 与 Playwright 的"回填"机制
+| 资源类型 | 是否内联 | 控制参数 |
+|----------|----------|----------|
+| CSS 样式表 | ✅ 默认内联 | `-c` 可排除 |
+| **图片** (`<img src>`、CSS `url()`) | ✅ **默认内联** | `-i` 才可排除（**默认不带**，所以图片会被内联） |
+| JavaScript | ❌ 排除 | `-j`（默认带） |
+| Web Fonts | ❌ 排除 | `-F`（默认带） |
+| iframe | ⚠️ 取决于版本 | `-f` 可显式排除（默认不带，但 JS 被排除后 iframe 也通常无法渲染） |
+| 音频 | ✅ 默认内联 | `-a` 可排除 |
+| 视频 | ✅ 默认内联 | `-v` 可排除 |
+| NOSCRIPT 内容 | ❌ 默认不提取 | `-n` 可开启 |
 
-在 [archiveHandler.ts:132-149](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L132-L149) 有一段特殊逻辑：
+> **关键纠正**：之前误认为 `-I` 是"移除图片"——`-I` 实际是 `--isolate`（隔离/CSP 沙箱），移除图片需要 `-i`。Linkwarden 默认**不带** `-i`，因此**图片会被完整内联为 data-URI**。排除的是 JS（`-j`）和 Web Fonts（`-F`）。
 
-如果 `link.monolith` 已经是 `.html` 结尾（说明通过客户端上传了 HTML），则：
-1. 读取该文件内容
-2. 用 `page.setContent(fileContent)` 替换浏览器页面
-3. 后续的 Readability、Screenshot、PDF 全都基于这份**客户端上传的 HTML** 生成
+### 4.3 资源请求的独立性与 SSRF 防护缺口
 
-这是客户端侧归档（`clientSide: true`）与服务端侧归档的桥梁。
+Monolith 是独立的子进程，其资源下载行为完全独立于 Playwright：
+
+1. **输入**：通过 stdin 接收 `page.content()`（Playwright 渲染后 DOM 的序列化 HTML，其中 `<img src>`、`<link href>` 仍是原始 URL）
+2. **资源下载**：Monolith 解析该 HTML 后，**自己发起 HTTP/HTTPS 请求**下载 CSS、图片等资源并转 base64
+3. **会话隔离**：Monolith 不使用 Playwright 浏览器的 Cookie、localStorage、缓存；官方文档明确说明 "monolith is not aware of your browser's session"
+4. **SSRF 防护缺口**：Monolith 发起的请求**不经过** [protectPageRequests.ts](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/protectPageRequests.ts) 中注册的 Playwright 路由拦截器，因此对资源 URL 的 SSRF 检查在此处缺失。Playwright 只拦截了页面内浏览器发起的请求。
+5. **代理**：Monolith 会读取系统环境变量 `https_proxy`、`http_proxy`、`no_proxy`（若 Playwright 也通过 `PROXY` 配置了代理则二者共用）
+
+### 4.4 异常与边界
+
+- **超时联动**：通过 `AbortSignal` 与外层 5 分钟浏览器超时联动，超时时 `killSignal: "SIGKILL"` 强杀子进程
+- **退出码非 0** → reject
+- **输出 Buffer 长度为 0** → reject（Monolith 没产出任何内容）
+- **输出大小超限** → `> MONOLITH_MAX_BUFFER`（默认 100MB）时 reject
+- **软失败隔离**：在 [archiveHandler.ts:189-193](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L189-L193) 中用 `.catch(err => console.error(err))` 吞掉异常，Monolith 失败不会中断其他格式产出。
+
+### 4.5 Monolith 的 DB 更新时机
+
+**成功时在 handleMonolith 内部立即写库**，不等 finally：
+
+[handleMonolith.ts:57-66](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts#L57-L66)：
+```typescript
+await createFile({ data: html, filePath: `archives/${collectionId}/${id}.html` });
+await prisma.link.update({
+  where: { id: link.id },
+  data: { monolith: `archives/${collectionId}/${id}.html` },
+});
+resolve();
+```
+
+成功写入 DB 后，`link.monolith` 字段从 `null` 变为具体路径，finally 块读到该值时就不会再标记为 "unavailable"。
+
+### 4.6 与 Playwright 的"回填"机制
+
+在 [archiveHandler.ts:131-149](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L131-L149) 有一段特殊逻辑：
+
+如果进入 archiveHandler 时 `link.monolith` 已经是 `.html` 结尾的路径（说明通过客户端上传了 HTML，见 `clientSide: true`），则：
+
+1. 先执行 `page.goto(link.url)`（仍会发起请求，但结果会被覆盖）
+2. 通过 [readFile](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/packages/filesystem/readFile.ts) 读取已有 HTML 文件
+3. 用 `page.setContent(fileContent, { waitUntil: "domcontentloaded" })` 把 Playwright 页面替换为该 HTML
+4. 后续的 `metaDescription` 提取、`content = page.content()`、`handleArchivePreview`、`handleReadability`、`handleScreenshotAndPdf` 全部基于这份客户端上传的 HTML 生成
+
+这是客户端侧归档（`clientSide: true`）与服务端侧归档的桥梁：用户在自己浏览器登录后抓取页面上传，服务端基于该 HTML 生成其余格式。
 
 ---
 
@@ -261,11 +312,61 @@ monolith - \
 
 ### 6.2 状态值语义
 
-- **`null`（待处理）**：从未尝试过保存，或被手动重置（"重新归档"按钮会把所有字段置 `null` + `lastPreserved = null`）
-- **`"archives/..."`（已成功）**：对应格式文件已落盘，值为相对路径
-- **`"unavailable"`（已失败/不支持）**：已尝试但未产出，或 URL 本身不支持（非 http(s)、SSRF 不通过、`DISABLE_PRESERVATION`）
+- **`null`（待处理/未产出）**：从未尝试过保存、被手动重置（"重新归档"按钮）、或该格式尚未完成写入
+- **`"archives/..."`（已成功）**：对应格式文件已落盘，值为相对路径。成功格式在各 handler 内部成功写盘后**立即**写入 DB，不等 finally
+- **`"unavailable"`（已终结）**：经过一轮完整处理后该格式仍未产出。可能原因：
+  1. URL 本身不支持（非 http(s)、SSRF 不通过、`DISABLE_PRESERVATION` 全局关闭）
+  2. 该格式执行失败（被 catch 吞掉或抛错）
+  3. **用户未开启该格式**（finally 块不区分"失败"和"未开启"）
 
-### 6.3 流转图
+### 6.3 finally 块的精确标记逻辑
+
+[archiveHandler.ts:208-224](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L208-L224) 中 finally 块的判定：
+
+```typescript
+const finalLink = await prisma.link.findUnique({ where: { id: link.id } });
+
+await prisma.link.update({
+  where: { id: link.id },
+  data: {
+    lastPreserved: new Date().toISOString(),
+    readable: !finalLink.readable ? "unavailable" : undefined,
+    image:    !finalLink.image    ? "unavailable" : undefined,
+    monolith: !finalLink.monolith ? "unavailable" : undefined,
+    pdf:      !finalLink.pdf      ? "unavailable" : undefined,
+    preview:  !finalLink.preview  ? "unavailable" : undefined,
+    indexVersion: null,
+  },
+});
+```
+
+**关键观察**：
+
+1. **判定条件完全不涉及 `archivalSettings`**。它只是简单地检查从 DB 重新读取的 `finalLink` 字段是否为 truthy。
+2. 因此无论用户是否开启该格式（如 `archiveAsMonolith = false`），只要最终字段未被成功格式写入具体路径，就会被标记为 `"unavailable"`。
+3. `"unavailable"` 既表示"尝试了但失败"，也表示"用户根本没开启该格式"——这两种情况在 DB 中无法区分。
+
+**以 Monolith 为例的状态流转路径**：
+
+```
+  monolith 字段起始值 = null
+       │
+       ├─ 用户没开 archiveAsMonolith
+       │    └─ handleMonolith 不被调用 → 字段维持 null
+       │                               → finally 读到 null → 标记 "unavailable"
+       │
+       ├─ 用户开了 archiveAsMonolith，但 Monolith 失败
+       │    ├─ handleMonolith 被调用，但在子进程内 reject
+       │    ├─ 错误被 .catch(console.error) 吞掉 → 不抛到外层
+       │    ├─ 字段维持 null
+       │    └─ finally 读到 null → 标记 "unavailable"
+       │
+       └─ 用户开了 archiveAsMonolith，且 Monolith 成功
+            ├─ handleMonolith 成功写盘 → **立即** update DB: monolith = "archives/..."
+            └─ finally 读到 "archives/..." → truthy → 不动 (undefined)
+```
+
+### 6.4 流转总图
 
 ```
  链接创建 (postLink)
@@ -279,14 +380,14 @@ monolith - \
            Worker 拾取 (lastPreserved IS NULL)
                  │
                  ▼
-           archiveHandler 执行
-            ├─ 成功的格式 → 写入 "archives/..." 路径
-            ├─ 失败的格式 → 保持 null
-            └─ 格式用户没开 → 保持 null
+           archiveHandler 执行 (按 archivalSettings 过滤)
+            ├─ 成功的格式 → handler 内部立即写盘 + DB 写入 "archives/..." 路径
+            ├─ 失败的格式 → 错误被 catch 吞掉，字段保持 null
+            └─ 用户未开的格式 → 对应 handler 不调用，字段保持 null
                  │
                  ▼
-           finally 块扫尾
-            ├─ 每个仍为 null 的字段 → "unavailable"
+           finally 块扫尾 (不区分 archivalSettings)
+            ├─ 每个仍为 null/falsy 的字段 → "unavailable"
             ├─ lastPreserved = now
             └─ indexVersion = null (触发重新索引)
                  │
@@ -299,14 +400,16 @@ monolith - \
             └─ removeFiles() 清盘 → 重新进入 Worker 拾取
 ```
 
-### 6.4 批量修复损坏归档
+### 6.5 批量修复损坏归档
 
 在 [preservation.tsx:67-164](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L67-L164) 中，管理员可执行 `action === "allBroken"`：
 
 1. 找出该用户下任意字段为 `"unavailable"` 的链接
-2. 根据用户/tag 设置判断该格式是否本应产出
-3. 对"应该有但实际 unavailable"的字段，重置为 `null`
+2. **重新计算**该链接对应的 `archivalSettings`（Tag 优先，用户默认回退）
+3. 对"用户确实开启了该格式，但字段为 unavailable"的情况，才重置为 `null`
 4. `lastPreserved = null` → 重新进入 Worker 拾取
+
+这是为了弥补 finally 块"不区分失败和未开启"的设计缺陷——修复逻辑只重置那些真正应该产出但失败了的字段。
 
 ---
 
@@ -440,23 +543,54 @@ lastPreserved 被写入 → Worker 不再重试
 **完全没有实现**。所有保存格式都使用固定路径 `archives/{collectionId}/{linkId}.{suffix}`：
 
 - 同一链接多次触发"重新归档"会直接**覆盖**旧文件（`createFile` 是写覆盖语义）
-- 不同链接即使内容完全相同，也会各自独立保存一份
-- 没有内容哈希、没有 de-dupe 索引
+- 不同链接即使内容完全相同（例如同一篇文章被保存两次、不同用户保存同一 URL），也会各自独立保存一份
+- 没有内容哈希、没有 de-dupe 索引、没有跨链接的字节级比较
 
-### 10.3 资源内部去重（Monolith 层）
+### 10.3 Monolith 内部资源去重
 
-Monolith CLI 自身在把 CSS/图片 data-URI 化时是否有重复资源合并，取决于上游 `monolith` 工具实现，Linkwarden 代码层没有相关处理。
+Monolith 的输出是单 HTML 文件，所有资源都已被序列化为 base64 data-URI 嵌入其中。关于去重：
 
-### 10.4 存在性检查（幂等性）
+1. **单文件内部重复资源**：取决于 Monolith 自身实现。如果同一 HTML 中多个 `<img>` 引用相同 URL，Monolith **可能**只下载一次并复用 base64 字符串（Linkwarden 代码层未干预，取决于上游 Rust 实现）。
+2. **跨链接资源去重**：完全不存在。即便链接 A 和链接 B 的页面都引用了同一张 `https://cdn.example.com/logo.png`，Monolith 也会分别下载、分别 base64 编码、分别嵌入到各自的 `.html` 文件中——两份完全相同的 base64 字符串各自占用磁盘空间。
+3. **与 Playwright 缓存的关系**：Playwright 在 `page.goto()` 渲染时已经下载过一次 CSS/图片资源，但 Monolith 是独立子进程，完全不知道这些缓存，会**重新发起独立 HTTP 请求**下载所有引用的资源并内联。这意味着同一份资源在服务端至少被下载两次（一次 Playwright 渲染，一次 Monolith 内联），可能更多（截图又触发一次资源加载）。
+
+### 10.4 资源内联后的不可逆性与去重失效
+
+Monolith 输出的 HTML 中，资源已被转换为 base64 data-URI：
+
+```html
+<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...">
+```
+
+这带来两个去重层面的副作用：
+
+1. **无法在文件系统层识别重复资源**：data-URI 直接嵌在 HTML 里，没有独立文件，系统级文件去重（如 ZFS dedup、S3 相同对象合并）无法在资源粒度生效。
+2. **无法通过 URL 追踪来源**：输出文件中不再保留原始资源 URL，因此也无法事后通过 URL 做反向去重。
+
+### 10.5 存在性检查（幂等性）
 
 每种保存格式在执行前都会检查对应字段是否已有 `"archives/..."` 路径：
 
 - `handleArchivePreview`：`!link.preview?.startsWith("archive")`
 - `handleReadability`：`!link.readable`
 - `handleScreenshotAndPdf`：`!link.image?.startsWith("archive")` / `!link.pdf?.startsWith("archive")`
-- `handleMonolith`：`!link.monolith`
+- `handleMonolith`：在 [archiveHandler.ts:184-187](file:///d:/fz/0601/solo-dogfeeding/code/87-linkwarden/apps/worker/lib/archiveHandler.ts#L184-L187) 中为 `!link.monolith`
 
-这保证了 Worker 即使重复拾取同一链接，也不会重复执行已成功的格式（但注意 `"unavailable"` 被当作不存在，因此失败的格式在重新归档时会重试）。
+这保证了 Worker 即使重复拾取同一链接，也不会重复执行已成功的格式。但注意：
+
+- `"unavailable"` 被当作 falsy，因此失败的格式在"重新归档"（字段被重置为 `null`）时会自动重试
+- 检查使用的是**进入 archiveHandler 时传入的旧 link 对象**，不是实时从 DB 读取——不过由于单链接串行处理，实际没有竞态
+
+### 10.6 Monolith 与去重的关系总结
+
+| 去重维度 | 现状 |
+|----------|------|
+| 同一链接多次归档 | ✅ 覆盖旧文件，不产生新副本 |
+| 不同链接保存相同 URL | ❌ 独立保存，无去重 |
+| 同一 HTML 内重复资源 | ⚠️ 取决于 Monolith 上游实现 |
+| 跨链接相同资源（图片/CSS） | ❌ 完全无去重，均 base64 独立内联 |
+| Playwright 缓存复用 | ❌ Monolith 独立子进程，重新下载所有资源 |
+| 存储层字节级去重 | ❌ 未实现（依赖底层文件系统自行支持） |
 
 ---
 
@@ -510,5 +644,5 @@ data/
 | `ALLOW_INSECURE_TLS` / `IGNORE_HTTPS_ERRORS` | false | 忽略自签名/过期证书 |
 | `PROXY` | - | Playwright + safeFetch 共用代理 URL |
 | `PLAYWRIGHT_WS_URL` | - | 连接远程浏览器（CDP） |
-| `MONOLITH_CUSTOM_OPTIONS` | `-j -F -q` | 覆盖 monolith CLI 参数 |
+| `MONOLITH_CUSTOM_OPTIONS` | `-j -F -q` | 覆盖 monolith CLI 选项（默认: 排除 JS、排除 Web Fonts、静默）。注意 `-I` (隔离/CSP沙箱) 是硬编码的，不受此变量覆盖 |
 | `PDF_MARGIN_TOP` / `PDF_MARGIN_BOTTOM` | 15px | PDF 上下边距 |
