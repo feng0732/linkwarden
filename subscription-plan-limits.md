@@ -112,12 +112,66 @@ verifyUser({ req, res }) 流程：
 ```
 
 **使用 verifyUser 的 API 端点（30+ 个）包括：**
-- `/api/v1/users/*`、`/api/v1/links/*`、`/api/v1/collections/*`
+- `/api/v1/users/*`、`/api/v1/links/*`（含 POST、PUT、DELETE）、`/api/v1/collections/*`
 - `/api/v1/tags/*`、`/api/v1/highlights/*`、`/api/v1/rss/*`
-- `/api/v1/archives/*`、`/api/v1/dashboard/*`、`/api/v1/search/*`
-- `/api/v1/migration/*`、`/api/v1/tokens/*` 等
+- `/api/v1/archives/index.ts`（上传新归档）、`/api/v1/archives/[linkId].ts` POST（更新归档）
+- `/api/v1/dashboard/*`、`/api/v1/search/*`、`/api/v1/migration/*`
+- `/api/v1/tokens/*`、`/api/v1/worker/*` 等
 
-### 3.3 订阅有效性判定逻辑
+### 3.3 verifyToken 与 verifyUser 的关键区别
+
+| 维度 | verifyToken | verifyUser |
+|------|-------------|------------|
+| 校验内容 | JWT token 有效性、过期、撤销状态 | verifyToken + username + emailVerified + **订阅有效性** |
+| 订阅检查 | ❌ 不检查 | ✅ 启用 Stripe 时检查 verifySubscription() |
+| 返回值 | JWT token 对象或错误字符串 | User 对象（含 subscriptions、parentSubscription）或 null |
+| 失败返回 | 不直接返回 HTTP，由调用方处理 | 直接返回 401 JSON 响应 |
+
+**verifyToken** 定义于 [verifyToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyToken.ts#L9-L36)，仅做 token 层面的会话校验，**完全不涉及订阅状态**。
+
+### 3.4 不经过订阅校验的 API 路径
+
+以下路径不调用 `verifyUser`，在订阅降级后仍可访问（前提是满足自身鉴权条件）：
+
+| API 路径 | HTTP 方法 | 鉴权方式 | 降级后能否访问 | 说明 |
+|----------|-----------|----------|----------------|------|
+| `/api/v1/archives/[linkId]` | **GET** | verifyToken + resolveAccessibleArchive | ✅ 可以 | 归档读取，不检查订阅 |
+| `/api/v1/preserved/token` | GET | verifyToken + resolveAccessibleArchive | ✅ 可以 | 获取归档临时访问 URL |
+| `/api/v1/preserved/view` | GET | 独立 JWT token（短期签名） | ✅ 可以 | 通过签名 token 直接读归档文件 |
+| `/api/v1/avatar/[id]` | GET | verifyToken（可选） | ✅ 可以 | 读取任意用户头像 |
+| `/api/v1/public/collections/[id]` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开集合元数据 |
+| `/api/v1/public/collections/links` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开集合下的链接列表 |
+| `/api/v1/public/collections/tags` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开集合下的标签 |
+| `/api/v1/public/links/[id]` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开链接详情 |
+| `/api/v1/public/users/[id]` | GET | 无（仅读取公开资料） | ✅ 可以 | 读取用户公开资料 |
+| `/api/v1/config` | GET | 无 | ✅ 可以 | 获取实例配置（AI、文件大小等） |
+| `/api/v1/logins` | GET | 无 | ✅ 可以 | 获取登录方式列表 |
+| `/api/v1/getFavicon` | GET | 无 | ✅ 可以 | 代理获取网站 favicon |
+| `/api/v1/session` | POST | 用户名密码校验 | ✅ 可以 | 创建 API Token（供外部集成） |
+| `/api/v1/auth/*` | 多种 | NextAuth 内部 | ✅ 可以 | 登录、注册、忘记密码、邮箱验证 |
+| `/api/v1/webhook` | POST | Stripe 签名校验 | ✅ 可以 | Stripe Webhook（必须始终可用） |
+
+### 3.5 归档读取权限判定（resolveAccessibleArchive）
+
+归档读取不经过订阅校验，其权限完全由 **集合访问权限** 决定，见 [resolveAccessibleArchive.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts#L30-L45)：
+
+```sql
+WHERE links.some(id = linkId)
+  AND (ownerId = userId            -- 集合所有者
+       OR members.some(userId)     -- 集合成员
+       OR isPublic = true)         -- 公开集合
+```
+
+**归档访问判断矩阵（订阅降级后）：**
+
+| 场景 | 集合属性 | 登录用户 | 降级后能否读归档 |
+|------|----------|----------|------------------|
+| 自己的私有集合 | isPublic=false, ownerId=me | ✅ 是我 | ✅ 可以（集合权限通过） |
+| 我加入的私有集合 | isPublic=false, members include me | ✅ 是成员 | ✅ 可以（集合权限通过） |
+| 他人的私有集合 | isPublic=false, 我非成员 | ✅ 已登录 | ❌ 401 "You don't have access to this collection." |
+| 公开集合 | isPublic=true | 任意（含未登录） | ✅ 可以（通过 isPublic） |
+
+### 3.6 订阅有效性判定逻辑
 
 **核心函数 `verifySubscription()`**，见 [verifySubscription.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/verifySubscription.ts#L13-L86)
 
@@ -143,7 +197,7 @@ verifySubscription(user) 判定流程：
 - `REQUIRE_CC=false`：免绑卡试用，`daysLeft > 0` 时即使无订阅也有效
 - 试用期计算额外 +1 天：`(1 + TRIAL_PERIOD_DAYS) * 86400000`，用于兼容"当天"
 
-### 3.4 从 Stripe 拉取订阅信息
+### 3.7 从 Stripe 拉取订阅信息
 
 函数 [checkSubscriptionByEmail.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/checkSubscriptionByEmail.ts#L5-L29)
 
@@ -159,7 +213,7 @@ verifySubscription(user) 判定流程：
 }
 ```
 
-### 3.5 Stripe Webhook 同步
+### 3.8 Stripe Webhook 同步
 
 Webhook 端点 [webhook/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/webhook/index.ts#L27-L114)
 
@@ -450,20 +504,58 @@ const hasInactiveSubscription =
 // isLoggedIn && hasInactiveSubscription → 重定向到 /subscribe
 ```
 
-**影响页面**：所有受保护路由（/dashboard、/settings、/collections、/links、/tags、/preserved、/search 等）都会被强制跳转到 `/subscribe` 页面。只有 /login、/register、/forgot、/subscribe、/public/* 等可访问。
+**前端页面访问边界：**
 
-#### 第二层：API 全局拦截（verifyUser）
+| 页面路径 | 降级后能否访问 | 说明 |
+|----------|----------------|------|
+| `/login`、`/register`、`/forgot` | ✅ 可以 | 登录注册相关 |
+| `/subscribe` | ✅ 可以 | 订阅/续费页面 |
+| `/public/collections/[id]` | ✅ 可以 | 公开集合页面 |
+| `/public/links/[id]` | ✅ 可以 | 公开链接详情页面 |
+| `/dashboard`、`/collections`、`/links` | ❌ 被重定向 | 私有数据页面 |
+| `/settings/*` | ❌ 被重定向 | 设置页面 |
+| `/tags`、`/preserved`、`/search` | ❌ 被重定向 | 其他受保护页面 |
+| `/member-onboarding` | 条件性 | 仅被邀请未设置用户名的成员可访问 |
 
-位置 [verifyUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyUser.ts#L60-L70)
+#### 第二层：API 拦截（区分 verifyUser 和非 verifyUser 路径）
 
-所有 `/api/v1/*` 请求在启用 Stripe 时都会经过订阅校验，不通过直接返回：
+**经过 verifyUser 的路径**（约 30+ 个端点）：启用 Stripe 时订阅校验失败直接返回：
 
 ```json
 HTTP 401
 { "response": "You are not a subscriber, feel free to reach out to us at support@linkwarden.app if you think this is an issue." }
 ```
 
-这意味着：降级后即使绕过前端跳转，手动调用 API 也无法进行任何写操作（创建链接、上传、导入等），甚至大部分读操作也会被拦截。
+**⚠️ 重要修正：并非所有 `/api/v1/*` 都经过 verifyUser。**
+
+降级后仍可正常调用的 API（不经过订阅校验）：
+
+| API | 行为 |
+|-----|------|
+| `GET /api/v1/archives/[linkId]` | ✅ 正常返回归档文件（受集合权限控制） |
+| `GET /api/v1/preserved/token` | ✅ 正常返回归档临时 URL |
+| `GET /api/v1/preserved/view?token=...` | ✅ 正常返回归档文件（独立签名 token） |
+| `GET /api/v1/avatar/[id]` | ✅ 正常返回头像文件 |
+| `GET /api/v1/public/*` | ✅ 正常返回公开集合/链接/用户数据 |
+| `GET /api/v1/config` | ✅ 正常返回实例配置 |
+| `GET /api/v1/logins` | ✅ 正常返回登录方式列表 |
+| `GET /api/v1/getFavicon` | ✅ 正常代理 favicon |
+| `POST /api/v1/session` | ✅ 正常创建 API Token |
+| `POST /api/v1/webhook` | ✅ Stripe Webhook 始终可用 |
+| `/api/v1/auth/*` | ✅ 登录、注册、邮箱验证正常可用 |
+
+降级后被拦截的 API（经过 verifyUser）：
+
+| API | 行为 |
+|-----|------|
+| `/api/v1/users/*`（除 public） | ❌ 401 非订阅者 |
+| `/api/v1/links/*`（POST/PUT/DELETE） | ❌ 401 非订阅者 |
+| `/api/v1/collections/*`（除 public） | ❌ 401 非订阅者 |
+| `/api/v1/tags/*`、`/api/v1/highlights/*` | ❌ 401 非订阅者 |
+| `/api/v1/rss/*` | ❌ 401 非订阅者 |
+| `POST /api/v1/archives/*`（上传/更新归档） | ❌ 401 非订阅者 |
+| `/api/v1/dashboard/*`、`/api/v1/search/*` | ❌ 401 非订阅者 |
+| `/api/v1/migration/*`（数据导入） | ❌ 401 非订阅者 |
 
 #### 第三层：Worker 后台任务停止处理
 
@@ -499,19 +591,53 @@ where: {
 
 即使前三层都通过（如 Stripe 临时故障），在具体创建链接、导入数据时，`hasPassedLimit()` 和 `verifyLinkLimit()` 仍会检查。
 
-### 7.3 降级后数据保留
+### 7.3 降级后已有归档资源的访问边界与数据保留
 
-降级后**不会删除任何用户数据**，所有已有资源全部保留：
+降级后**不会删除任何用户数据**，但不同资源的可访问性取决于访问路径是否经过 verifyUser。
 
-| 资源类型 | 是否保留 | 能否查看 |
-|----------|----------|----------|
-| 已有链接（Link 记录） | ✅ 保留 | ✅ 数据库中存在，但 API 被拦截可能无法前端查看 |
-| 归档文件（PDF/图片等） | ✅ 文件系统中保留 | ✅ 同上 |
-| 集合（Collection） | ✅ 保留 | ✅ 同上 |
-| 标签（Tag） | ✅ 保留 | ✅ 同上 |
-| 高亮（Highlight） | ✅ 保留 | ✅ 同上 |
-| 团队成员关系 | ✅ 保留（parentSubscriptionId 不清空） | ✅ 同上 |
-| 用户账户 | ✅ 保留 | ⚠️ 需重新订阅后才能正常使用 |
+#### 7.3.1 数据保留概览
+
+| 资源类型 | 是否保留 | 物理存储位置 |
+|----------|----------|--------------|
+| 已有链接（Link 记录） | ✅ 保留 | 数据库 links 表 |
+| 归档文件（PDF/图片/HTML/Readable） | ✅ 保留 | 文件系统 archives/{collectionId}/ 目录 |
+| 归档预览图 | ✅ 保留 | 文件系统 archives/preview/{collectionId}/ 目录 |
+| 集合（Collection） | ✅ 保留 | 数据库 collections 表 |
+| 标签（Tag） | ✅ 保留 | 数据库 tags 表 |
+| 高亮（Highlight） | ✅ 保留 | 数据库 highlights 表 |
+| 团队成员关系 | ✅ 保留 | parentSubscriptionId 字段不清空 |
+| 用户账户 | ✅ 保留 | users 表记录保留 |
+
+#### 7.3.2 已有归档资源的实际可访问性
+
+归档资源存在多条读取路径，降级后能否访问取决于**走哪条路径**：
+
+| 访问方式 | 降级后能否访问 | 说明 |
+|----------|----------------|------|
+| **前端私有页面查看**（/links/[id]） | ❌ 不能 | 路由被 AuthRedirect 重定向到 /subscribe |
+| **前端公开页面查看**（/public/links/[id]） | ✅ 可以 | /public/* 不受 AuthRedirect 拦截，且归档 GET API 不检查订阅 |
+| **直接调用 GET /api/v1/archives/[linkId]** | ✅ 可以 | 此 API 使用 verifyToken + resolveAccessibleArchive，不经过 verifyUser。只要持有有效会话 token 且对集合有访问权限即可读取 |
+| **调用 GET /api/v1/preserved/token** | ✅ 可以 | 获取归档临时签名 URL，同样不检查订阅 |
+| **调用 GET /api/v1/preserved/view?token=...** | ✅ 可以 | 独立签名 token，不依赖用户会话或订阅 |
+| **前端查看链接列表**（/dashboard） | ❌ 不能 | 路由被重定向，且 GET /api/v1/links 经过 verifyUser 会返回 401 |
+| **公开集合的归档** | ✅ 任何人 | 公开集合（isPublic=true）的归档无需登录即可读取，完全不受订阅影响 |
+
+**关键结论：降级后，只要用户的 JWT 会话尚未过期，且目标集合允许其访问（owner/member/isPublic），用户可以通过直接请求归档 API 来下载和查看已有归档文件——尽管前端界面会被重定向。公开集合的归档资源降级后对任何人都仍可访问。**
+
+#### 7.3.3 各资源访问路径与拦截情况
+
+| 资源 | 读 API 路径 | 是否经过 verifyUser | 降级后能否读取 |
+|------|------------|---------------------|----------------|
+| **私有归档文件** | GET `/api/v1/archives/[linkId]` | ❌ 否（verifyToken + 集合权限） | ✅ 会话有效 + 集合权限 |
+| **公开归档文件** | GET `/api/v1/archives/[linkId]` | ❌ 否 | ✅ 任何人（通过 isPublic） |
+| **私有链接元数据** | GET `/api/v1/links/[id]`、GET `/api/v1/links` | ✅ 是 | ❌ 401 非订阅者 |
+| **公开链接元数据** | GET `/api/v1/public/links/[id]` | ❌ 否 | ✅ 任何人 |
+| **私有集合数据** | GET `/api/v1/collections/[id]` | ✅ 是 | ❌ 401 非订阅者 |
+| **公开集合数据** | GET `/api/v1/public/collections/[id]` | ❌ 否 | ✅ 任何人 |
+| **标签/高亮** | GET `/api/v1/tags`、`/api/v1/highlights` | ✅ 是 | ❌ 401 非订阅者 |
+| **用户头像** | GET `/api/v1/avatar/[id]` | ❌ 否（仅 verifyToken） | ✅ 会话有效即可 |
+| **Dashboard 数据** | GET `/api/v1/dashboard` | ✅ 是 | ❌ 401 非订阅者 |
+| **搜索** | GET `/api/v1/search` | ✅ 是 | ❌ 401 非订阅者 |
 
 ### 7.4 完整错误提示清单
 
