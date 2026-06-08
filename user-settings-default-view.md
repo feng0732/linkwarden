@@ -180,28 +180,38 @@ type LocalSettings = {
 
 ### 4.1 版本公告通知
 
-公告系统完全基于 **localStorage**，不涉及服务端用户设置。
+公告系统完全基于 **localStorage**，不涉及服务端用户设置同步，三个 localStorage 键的读写分布在三个文件中。
 
-**检查更新流程**：
+**localStorage 键与读写责任矩阵**：
 
-1. 触发点：[MainLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/layouts/MainLayout.tsx#L24-L26)
-   - 页面加载时调用 `getLatestVersion(setShowAnnouncement)`
+| 键名 | 写入位置 | 读取位置 | 说明 |
+|------|----------|----------|------|
+| `announcementId` | [getLatestVersion.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/client/getLatestVersion.ts#L19-L20) | [getLatestVersion.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/client/getLatestVersion.ts#L2)、[Announcement.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/components/Announcement.tsx#L11) | 最新公告版本号，如 "2.15.0" |
+| `announcementMessage` | [getLatestVersion.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/client/getLatestVersion.ts#L21-L22) | [getLatestVersion.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/client/getLatestVersion.ts#L3)、[Announcement.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/components/Announcement.tsx#L12) | 自定义公告消息 i18n key，优先级低于 announcementId |
+| `showAnnouncementBar` | [MainLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/layouts/MainLayout.tsx#L28-L33) | [MainLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/layouts/MainLayout.tsx#L14) | "true"/"false"，公告栏显示/隐藏状态 |
 
-2. 版本检查：[getLatestVersion.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/client/getLatestVersion.ts)
-   - 请求 `https://linkwarden.app/blog/latest-announcement.json`
-   - 对比本地 `announcementId` / `announcementMessage` 与远程
-   - 不一致时显示公告栏并更新本地存储
+**完整读写流程**：
 
-3. 展示组件：[Announcement.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/components/Announcement.tsx)
-   - 从 localStorage 读取 `announcementId`（显示版本号）或 `announcementMessage`（显示自定义消息）
-   - 使用 `next-i18next` 的 `<Trans>` 组件渲染带链接的多语言文本
+1. **初始化读取（MainLayout）**：[MainLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/layouts/MainLayout.tsx#L14-L22)
+   - 组件挂载时读取 `showAnnouncementBar`，用于初始化 `showAnnouncement` state（无值则默认显示）
+   - 同时读取 `sidebarIsCollapsed`（非公告相关，但共用同一套写入模式）
 
-**localStorage 中的公告相关键**：
-| 键名 | 说明 |
-|------|------|
-| `showAnnouncementBar` | "true"/"false"，用户是否关闭公告栏 |
-| `announcementId` | 最新公告版本号 |
-| `announcementMessage` | 公告消息 i18n key |
+2. **版本检查 + 写入公告版本/消息（getLatestVersion）**：[getLatestVersion.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/client/getLatestVersion.ts#L1-L24)
+   - 先读取本地 `announcementId` 和 `announcementMessage`
+   - 请求远程 `https://linkwarden.app/blog/latest-announcement.json` 获取最新版本
+   - 若远程版本或消息与本地不一致：
+     - 调用 `setShowAnnouncement(true)` 触发显示公告栏
+     - **写入 `announcementId`**：`localStorage.setItem("announcementId", latestAnnouncement)`
+     - **写入 `announcementMessage`**：`localStorage.setItem("announcementMessage", latestMessage)`
+
+3. **公告栏显示状态持久化（MainLayout useEffect）**：[MainLayout.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/layouts/MainLayout.tsx#L28-L33)
+   - 监听 `showAnnouncement` state 变化
+   - 每次变化（包括用户点击关闭按钮触发的 `toggleAnnouncementBar`）都会**写入 `showAnnouncementBar`**
+
+4. **展示组件（Announcement，只读）**：[Announcement.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/components/Announcement.tsx#L11-L44)
+   - 读取 `announcementId`（优先，显示为带版本号链接的新版公告）
+   - 若无 `announcementId` 则回退读取 `announcementMessage`（显示为自定义 i18n 消息）
+   - 关闭按钮通过 props 调用 `toggleAnnouncementBar`，由 MainLayout 的 useEffect 间接写入 localStorage
 
 ### 4.2 促销邮件通知偏好
 
@@ -429,9 +439,11 @@ new QueryClient({
    - 见 4.2 节，该字段注册后无法通过任何官方途径修改，其缓存值始终等于注册时写入数据库的值
    - 不存在缓存与数据库不一致的风险，但存在用户无法退订促销邮件的合规风险
 
-4. **公告通知（localStorage 层）无缓存一致性风险**：
-   - 公告系统完全基于 localStorage 本地读写，不涉及服务端用户设置同步
-   - `getLatestVersion` 仅做读操作，不存在写失败导致的缓存不一致问题
+4. **公告通知（localStorage 层）存在写入行为，但无异步缓存一致性风险**：
+   - 公告系统的三处写入均为同步 localStorage 操作，不涉及服务端用户设置同步，不存在网络失败导致的缓存不一致
+   - `getLatestVersion` 在检测到新版本时会**写入 `announcementId` 和 `announcementMessage`**（见 4.1 节读写责任矩阵）
+   - `MainLayout` 的 useEffect 监听 `showAnnouncement` state，用户每次关闭/触发显示公告栏都会**写入 `showAnnouncementBar`**
+   - 由于 localStorage 写入是同步的 DOM API，没有异步回滚需求，不存在 React Query 层那种乐观更新失败的问题
 
 #### 乐观更新标准三段式（以 `useUpdateDashboardLayout` 为范本）：
 
