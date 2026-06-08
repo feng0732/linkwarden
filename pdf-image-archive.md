@@ -368,7 +368,7 @@ generatePreview  handleArchivePreview            手动上传图片
          [ "unavailable" ]
 ```
 
-### 5.7 前端对三态的渲染
+### 5.7 前端对三态的渲染与全组件预览图分布
 
 判定函数 `formatAvailable` 位于 `packages/lib/formatStats.ts`：
 
@@ -378,37 +378,69 @@ export function formatAvailable(link, format) {
 }
 ```
 
-前端组件 `apps/web/components/Preservation/PreservationContent.tsx` L256-L277 的分支逻辑：
+#### 缩略图展示组件（4 个，全部使用 `preview=true`）
 
+前端展示缩略图的组件共 **4 个**，它们使用完全一致的 URL 模式和三态渲染逻辑：
+
+**URL 模式**（所有 4 个组件统一）：
 ```
-formatAvailable(link, "preview") === true   → 渲染真实内容（<img>）
-link.preview === "unavailable"               → 渲染 404 "Format not available" 占位
-其他（即 null）                               → 渲染 BeatLoader "preservation_in_queue"
+/api/v1/archives/${link.id}?format=${ArchivedFormat.jpeg}&preview=true&updatedAt=${link.updatedAt}
 ```
 
-跳转兜底：`packages/lib/getFormatBasedOnPreference.ts` 中如果目标格式值为 null 或 `"unavailable"`，返回 null，前端回退到原始 URL。
+**三态渲染**（所有 4 个组件统一）：
+```
+formatAvailable(link, "preview") === true   → 渲染 <Image> 真实缩略图 + onError 隐藏兜底
+link.preview === "unavailable"               → 渲染灰色背景占位（bg-gray-50）
+其他（即 null）                               → 渲染骨架屏（skeleton）loading
+```
+
+**4 个展示缩略图的组件对比：**
+
+| 组件 | 文件路径 | 使用场景 | 三态分支细节差异 |
+|---|---|---|---|
+| **LinkCard** | `apps/web/components/LinkViews/LinkComponents/LinkCard.tsx` L101-L124 | 主视图 Card 网格布局 | 完整三态；缩略图高度随列数变化（h-20 ~ h-44） |
+| **LinkMasonry** | `apps/web/components/LinkViews/LinkComponents/LinkMasonry.tsx` L97-L129 | 主视图 Masonry 瀑布流布局 | 外层加了 `show.image && formatAvailable` 双重守卫；完整三态；高度同 LinkCard |
+| **DashboardLinks（Card 子组件）** | `apps/web/components/DashboardLinks.tsx` L152-L176 | 仪表板横向滚动"最近/收藏"卡片 | 完整三态；固定高度 h-40；自带 refetch 轮询（见下文） |
+| **LinkDetails** | `apps/web/components/LinkDetails.tsx` L156-L184 | 详情页顶部 banner 图 | 完整三态；固定高度 h-40；带 blur(1px) 滤镜；有权限时可点击上传替换缩略图 |
+
+#### 不展示缩略图的组件（3 个，重要区分）
+
+| 组件 | 文件路径 | 说明 |
+|---|---|---|
+| **LinkList** | `apps/web/components/LinkViews/LinkComponents/LinkList.tsx` | 主视图 List 纯列表布局，只展示 `LinkIcon`（favicon/类型图标），完全不渲染 preview 缩略图 |
+| **PreservationContent** | `apps/web/components/Preservation/PreservationContent.tsx` | **之前误判，已纠正**：这是详情页里用来展示**完整归档内容**（full-size image / PDF iframe / Monolith HTML iframe / Readability 文本）的组件，走的是 `formatAvailable(link, type)` 但 type 是 `image`/`pdf`/`monolith`/`readable` 之一，**不是 preview**；请求 URL 中 `preview=false` 或不传 preview，读取的是完整归档文件而非缩略图。其"Format not available" 404 占位和 BeatLoader loading 也是针对完整归档格式，不是缩略图。 |
+| **Links** | `apps/web/components/LinkViews/Links.tsx` | 主视图容器，自己不渲染预览图，只按 layout 分发到 Card/Masonry/List 三个子视图；但有全局 refetch 轮询（见下文） |
+
+#### 缩略图就绪的轮询机制（2 处）
+
+当 Worker 还在后台归档时，前端不会干等——容器层会每 5 秒轮询 refetch，直到 preview 落定（变为成功路径或 "unavailable"）：
+
+1. **主视图 Links 全局轮询**（`apps/web/components/LinkViews/Links.tsx` L405-L425）：
+```typescript
+if (links?.some(e =>
+  !e.preview?.startsWith("archives") && e.preview !== "unavailable"
+)) {
+  interval = setInterval(() => useData.refetch(), 5000);
+}
+```
+
+2. **DashboardLinks 单卡轮询**（`apps/web/components/DashboardLinks.tsx` L110-L130）：
+```typescript
+if (isVisible && !link.preview?.startsWith("archives") && link.preview !== "unavailable") {
+  interval = setInterval(() => refetch(), 5000);
+}
+```
+
+轮询触发条件完全一致：`preview` **不以 "archives" 开头**（即不是成功路径）且 **不等于 "unavailable"**（即仍在处理中）——因为 preview 成功时 DB 存储的值是 `archives/preview/{collectionId}/{linkId}.jpeg`，以 "archives" 开头。
+
+跳转兜底：`packages/lib/getFormatBasedOnPreference.ts` 中如果目标偏好格式值为 null 或 `"unavailable"`，返回 null，前端回退到原始 URL。
 
 ### 5.8 前端缩略图展示路径的关键纠正：DB 字段 ≠ 文件路径
 
-**一个极易混淆的设计：`link.preview` 字段存储的值**只用于**前端三态判定**（是否展示 <Image> 组件），**不用于实际文件读取的路径拼接**。真正读取文件时走的是**约定路径**而非 DB 存储值。
-
-**LinkCard 缩略图展示链路**（`apps/web/components/LinkViews/LinkComponents/LinkCard.tsx` L101-L124）：
-
-```tsx
-{formatAvailable(link, "preview") ? (
-  <Image
-    src={`/api/v1/archives/${link.id}?format=${ArchivedFormat.jpeg}&preview=true&updatedAt=${link.updatedAt}`}
-    ...
-  />
-) : link.preview === "unavailable" ? (
-  <div className="bg-gray-50 ..."></div>  // 灰色占位
-) : (
-  <div className="skeleton ..."></div>      // loading 骨架
-)}
-```
+**一个极易混淆的设计**：`link.preview` DB 字段存储的字符串**只用于三态判定**（是否展示 `<Image>` 组件、是否触发轮询），**不参与实际文件路径的拼接**。真正读取文件时走的是**约定路径**，完全由 URL 参数推导。
 
 **请求实际文件的后端路由**（`apps/web/pages/api/v1/archives/[linkId].ts` L85-L128 `handleGet`）：
-1. 解析 query：`linkId`、`format`、`preview=true|false`
+1. 解析 query：`linkId`（path param）、`format`、`preview=true|false`
 2. 调 `resolveAccessibleArchive` 做权限校验并拼接物理路径
 
 **路径拼接逻辑**（`apps/web/lib/api/archives/resolveAccessibleArchive.ts` L70-L72）：
@@ -419,12 +451,14 @@ const filePath = isPreview
 ```
 
 核心结论：
-- **preview 文件路径完全由约定生成**：`archives/preview/{collectionId}/{linkId}.jpeg`，固定为 jpeg 格式，不依赖 DB 中 `link.preview` 存储的字符串
+- **preview 文件路径完全由约定生成**：`archives/preview/{collectionId}/{linkId}.jpeg`，固定 jpeg 格式，不依赖 DB 中 `link.preview` 存储的字符串
 - **非 preview 文件路径同理**：`archives/{collectionId}/{linkId}{suffix}`，suffix 由 format 参数查表得到（`apps/web/lib/shared/getSuffixFromFormat.ts`）
-- `link.preview` DB 字段**唯一作用**是供 `formatAvailable(link, "preview")` 判定——值是否存在且 ≠ "unavailable"
-- 副作用：如果 someone 手动把 `link.preview` 改成了一个随意字符串但磁盘上文件不存在，`formatAvailable` 会判定为 true，前端会发起请求，后端 `readFile` 会返回 404，此时 `<Image>` 的 `onError` 会隐藏该元素（LinkCard L110-L113）
+- `link.preview` DB 字段**两个作用**：
+  1. 供 `formatAvailable(link, "preview")` 判定是否存在且 ≠ "unavailable"
+  2. 供轮询判定 `!preview?.startsWith("archives") && preview !== "unavailable"`
+- 副作用兜底：如果有人手动把 `link.preview` 改成随意字符串但磁盘文件不存在，`formatAvailable` 判定为 true → 前端发起请求 → 后端 `readFile` 返回 404 → `<Image>` 的 `onError` 会 `target.style.display = "none"` 隐藏元素（LinkCard L110-L113、LinkMasonry L109-L112、DashboardLinks L164-L167、LinkDetails L174-L177，全部 4 个组件都有）
 
-同理，`image`/`pdf`/`monolith`/`readable` 等其他归档字段也只用于判定存在性，实际访问路径由 `format` 和 `linkId` 约定拼接。
+同理，`image`/`pdf`/`monolith`/`readable` 等其他归档字段也只用于判定存在性，实际访问路径由 `format` 参数和 `linkId` 约定拼接。
 
 ### 5.9 现有缺陷汇总
 
