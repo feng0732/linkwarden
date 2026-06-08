@@ -425,6 +425,227 @@ export default async function checkSubscriptionByEmail(email: string) {
 - 特殊副作用：verifySubscription 可能对 Subscription 表执行 `upsert`（同步 Stripe 状态），这是一个写入操作，但只是修改订阅记录，**与 User 及 createdById 级联无关**
 - 注意：这是**进入删除事务之前唯一可能产生副作用的节点**（Subscription upsert），但其错误被 `.catch` 吞掉，不影响后续删除流程
 
+#### 深度分析：Stripe 同步与 sub.status / active 字段
+
+##### Stripe 订阅状态 → 本地 active 字段的映射
+
+代码位置：[checkSubscriptionByEmail.ts#L22-L28](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/stripe/checkSubscriptionByEmail.ts#L22-L28)
+
+```typescript
+return {
+  active: sub.status === "active" || sub.status === "trialing",
+  stripeSubscriptionId: sub.id,
+  currentPeriodStart: item.current_period_start * 1000,
+  currentPeriodEnd: item.current_period_end * 1000,
+  quantity: item.quantity ?? 1,
+};
+```
+
+**Stripe `sub.status` 与本地 `active` 字段映射表：**
+
+| Stripe sub.status | 本地 active 字段 | 说明 |
+|---|---|---|
+| `active` | `true` | 正常付费订阅 |
+| `trialing` | `true` | 试用期内 |
+| `past_due` | `false` | 支付失败，逾期 |
+| `canceled` | `false` | 已取消 |
+| `unpaid` | `false` | 未付款 |
+| `incomplete` | `false` | 支付流程未完成 |
+| `incomplete_expired` | `false` | 支付超时未完成 |
+| `paused` | `false` | 订阅暂停 |
+
+> ⚠️ **关键发现**：只有 `active` 和 `trialing` 两种状态会映射为 `active=true`，其余所有状态均为 `active=false`。
+
+##### verifySubscription 的 6 个决策节点与返回 user 的条件
+
+代码位置：[verifySubscription.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/stripe/verifySubscription.ts)
+
+完整决策树如下：
+
+```
+verifySubscription(user)
+│
+├─ Node V1: if (!user) → return null
+│
+├─ 计算 trialEndTime / daysLeft
+│
+├─ Node V2: 无订阅 && 无父订阅 && (REQUIRE_CC || daysLeft <= 0)
+│   └─ YES → return null
+│
+├─ Node V3: user.parentSubscription?.active === true
+│   └─ YES → return user ✅（子账号，父订阅有效，直接通过）
+│
+├─ Node V4: 触发 Stripe 回查的条件
+│   (!user.subscriptions?.active || now > currentPeriodEnd)
+│   && (REQUIRE_CC || daysLeft <= 0)
+│   │
+│   ├─ NO → 跳过 Stripe 调用，直接 goto Node V6
+│   │
+│   └─ YES → 调用 checkSubscriptionByEmail(user.email)
+│       │
+│       ├─ Node V5: Stripe 返回字段完整性检查
+│       │   (!subscription
+│       │    || !subscription.stripeSubscriptionId
+│       │    || !subscription.currentPeriodEnd
+│       │    || !subscription.currentPeriodStart
+│       │    || !subscription.quantity)
+│       │   │
+│       │   ├─ YES → return null（Stripe 侧无有效记录或字段缺失）
+│       │   │
+│       │   └─ NO → 执行 prisma.subscription.upsert(...)
+│       │              .catch((err) => console.log(err))
+│       │              （写入 active 可能是 true 也可能是 false）
+│       │
+│       └─ goto Node V6
+│
+└─ Node V6: return user ✅
+```
+
+**返回 `user`（即校验通过）的条件汇总（满足任一即可到达 Node V6）：**
+
+| 条件路径 | 场景描述 |
+|---|---|
+| V2=NO, V4=NO | 用户无本地订阅、无父订阅，但**仍在试用期内且不要求 CC** |
+| V3=YES | 用户是子账号，且 `parentSubscription.active === true` |
+| V4=NO | 用户自身本地订阅 `active=true` 且未过期，无论 Stripe 侧状态如何 |
+| V4=YES → V5=NO | 本地订阅失效/过期，但 Stripe 返回了完整字段（**即使 active=false 也通过**） |
+
+> ⚠️ **极其关键的发现**：在 V4=YES → V5=NO 的路径中，即使 Stripe 返回的 `active=false`（例如 `sub.status === "past_due"` 或 `"canceled"`），只要 `stripeSubscriptionId`、`currentPeriodStart`、`currentPeriodEnd`、`quantity` 四个字段齐全，就会执行 upsert（将 `active=false` 写回本地）然后 **仍然 return user**，订阅校验通过。这意味着**订阅已过期/已取消的用户仍能通过此校验并执行 DELETE 请求**。
+
+##### upsert 操作的细节与影响
+
+代码位置：[verifySubscription.ts#L61-L82](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/stripe/verifySubscription.ts#L61-L82)
+
+```typescript
+await prisma.subscription
+  .upsert({
+    where: { userId: user.id },
+    create: {
+      active,
+      stripeSubscriptionId,
+      currentPeriodStart: new Date(currentPeriodStart),
+      currentPeriodEnd: new Date(currentPeriodEnd),
+      quantity,
+      userId: user.id,
+    },
+    update: {
+      active,
+      stripeSubscriptionId,
+      currentPeriodStart: new Date(currentPeriodStart),
+      currentPeriodEnd: new Date(currentPeriodEnd),
+      quantity,
+    },
+  })
+  .catch((err) => console.log(err));
+```
+
+**upsert 的行为特征：**
+
+1. **匹配键**：`where: { userId: user.id }`（Subscription.userId 有 `@unique` 约束）
+2. **写入字段**：`active`、`stripeSubscriptionId`、`currentPeriodStart`、`currentPeriodEnd`、`quantity`（全部 5 个业务字段同步覆盖）
+3. **错误处理**：`.catch((err) => console.log(err))` → **错误被静默吞掉，不抛出，不影响后续 return user**
+4. **事务独立性**：此 upsert 在 verifySubscription 内部独立执行，**不在后续 deleteUserById 的 `$transaction` 中**。如果后续删除事务回滚，Subscription 的 upsert 结果不会回滚。
+
+##### inactive 订阅对 DELETE 请求及 createdById 级联的影响分析
+
+我们按不同场景分析 inactive 订阅（即 Stripe 侧 `sub.status` 非 `active/trialing`，或本地 `active=false`）如何影响 DELETE 请求的完整链路：
+
+---
+
+**场景 1：本地 subscriptions.active=false，用户仍在试用期内（daysLeft > 0）且 REQUIRE_CC=false**
+
+```
+决策路径：V1=NO → V2=NO（daysLeft>0 且 !REQUIRE_CC）→ V3=NO → V4=NO → V6=return user ✅
+```
+
+- **Stripe API 调用**：不触发（V4=NO，条件 `!user.subscriptions?.active` 虽然为 true，但 `REQUIRE_CC || daysLeft <= 0` 为 false）
+- **路由层校验结果**：通过，继续执行 DELETE
+- **deleteUserById 是否执行**：✅ 是
+- **createdById 级联是否可能触发**：✅ 是（取决于 deleteUserById 内部分支）
+- **Subscription upsert 副作用**：无
+
+---
+
+**场景 2：本地 subscriptions.active=false，试用期已过（daysLeft <= 0）或 REQUIRE_CC=true，Stripe 侧用户不存在或返回字段不全**
+
+```
+决策路径：V1=NO → V2=NO（有 subscriptions，只是 inactive）→ V3=NO
+        → V4=YES（本地 inactive + (REQUIRE_CC 或 daysLeft<=0)）
+        → 调用 checkSubscriptionByEmail
+        → V5=YES（Stripe 返回 null 或字段缺失）
+        → return null ❌
+```
+
+- **Stripe API 调用**：✅ 触发，返回 null 或字段不全
+- **路由层校验结果**：`return res.status(401).json({ response: "You are not a subscriber..." })`
+- **deleteUserById 是否执行**：❌ 否
+- **createdById 级联是否触发**：❌ 否（删除请求在路由层就被拦截）
+- **Subscription upsert 副作用**：无
+
+---
+
+**场景 3：本地 subscriptions.active=false，试用期已过或 REQUIRE_CC=true，Stripe 侧 sub.status=past_due/canceled（active=false）但字段齐全**
+
+```
+决策路径：V1=NO → V2=NO → V3=NO
+        → V4=YES
+        → 调用 checkSubscriptionByEmail
+        → V5=NO（stripeSubscriptionId/currentPeriodStart/currentPeriodEnd/quantity 都有值）
+        → prisma.subscription.upsert({ active: false, ... })  ✍️ 写入 inactive 状态
+        → V6=return user ✅
+```
+
+- **Stripe API 调用**：✅ 触发，返回 `active=false` 但字段完整
+- **路由层校验结果**：通过，继续执行 DELETE
+- **deleteUserById 是否执行**：✅ 是
+- **createdById 级联是否可能触发**：✅ 是
+- **Subscription upsert 副作用**：✅ 有 — 将 `active=false` 写回本地 Subscription 表。**即使后续删除事务失败或被拦截，此 upsert 也已独立提交**。
+
+> 🔴 **反直觉发现**：订阅已过期（past_due）或已取消（canceled）的用户，只要 Stripe 能查到历史订阅记录且字段齐全，就能通过 verifySubscription 校验并正常发起 DELETE 请求。因为 `return user` 的判断**并不检查 upsert 后 active 的值**，只检查 Stripe 返回的字段是否齐全。
+
+---
+
+**场景 4：parentSubscription.active=false（父订阅已失效），本地 subscriptions 也无效**
+
+```
+决策路径：V1=NO → V2（取决于自身订阅状态和试用期）
+        → V3=NO（parentSubscription.active=false）
+        → 后续取决于自身订阅和 Stripe 回查结果
+```
+
+- 若自身也无有效订阅且试用期已过 → 同场景 2，返回 null，DELETE 被拦截
+- 若 Stripe 侧能查到历史订阅字段 → 同场景 3，通过校验，DELETE 可执行
+
+---
+
+**场景 5：父订阅有效（parentSubscription.active=true），自身订阅无关**
+
+```
+决策路径：V1=NO → V2（不关心，因为 V3 会提前返回）
+        → V3=YES → return user ✅
+```
+
+- **Stripe API 调用**：不触发（V3 提前短路返回）
+- **路由层校验结果**：通过
+- **deleteUserById 是否执行**：✅ 是
+- **createdById 级联是否可能触发**：✅ 是
+- **Subscription upsert 副作用**：无
+
+##### inactive 订阅场景影响总表
+
+| 场景 | 本地 active | Stripe status | Stripe 字段齐全 | 路由层结果 | deleteUserById 执行 | createdById 级联 | upsert 副作用 |
+|---|---|---|---|---|---|---|---|
+| 1（试用期内） | false | 未调用 | — | ✅ 通过 | ✅ 是 | ✅ 可能 | 无 |
+| 2（Stripe 无记录） | false | — | ❌ | ❌ 401 拦截 | ❌ 否 | ❌ 否 | 无 |
+| 3（Stripe past_due） | false | past_due/canceled | ✅ | ✅ 通过 | ✅ 是 | ✅ 可能 | ✅ 写入 active=false |
+| 4（父订阅失效） | false | 取决于自身 | 取决于自身 | 取决于自身 | 取决于自身 | 取决于自身 | 取决于自身 |
+| 5（父订阅有效） | 任意 | 未调用 | — | ✅ 通过 | ✅ 是 | ✅ 可能 | 无 |
+
+**核心结论：**
+- **只有场景 2 会拦截 DELETE 请求**（Stripe 返回 null 或字段不全），createdById 级联不触发
+- **场景 3 是最隐蔽的路径**：即使订阅已过期/取消（inactive），只要 Stripe 能返回完整字段，用户就能正常删除自己，createdById 级联按正常逻辑触发
+- **Subscription upsert 是与删除事务独立的写入操作**，其结果（特别是写入 `active=false`）不受后续删除回滚影响
+
 ---
 
 ### 3.6 Node 5: DELETE 分支分发
