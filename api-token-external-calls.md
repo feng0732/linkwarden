@@ -92,10 +92,10 @@ enum TokenExpiry {
 1. 通过 `getToken({ req })` 从 Cookie/Authorization 解析 JWT
 2. 检查 `userId` (token.id) 是否存在
 3. 检查 JWT 是否已过期（`token.exp < Date.now()/1000`）
-4. **数据库撤销检查**：若 JWT 含 `jti`，以 `jti` 查询 `AccessToken` 表，若 `revoked=true` 则拒绝
+4. **数据库撤销检查**：以 `token.jti` 查询 `AccessToken` 表，若存在匹配记录且 `revoked=true` 则拒绝
 5. 返回 JWT 对象或错误字符串
 
-> **关键点**: 浏览器 Web 登录产生的 JWT 不含 `jti`（NextAuth JWT 默认不生成 jti，除非在 jwt callback 中显式添加）。对于这类 token，第 4 步的数据库撤销检查**永远不会命中**。
+> **关键点**: 所有 JWT（含浏览器 Web 登录 Cookie）均包含 `jti` 字段（NextAuth JWT 默认生成 jti，代码库在 [next-auth.d.ts](./apps/web/types/next-auth.d.ts#L16-L24) 中将 `jti: string` 声明为 JWT 的必填字段）。浏览器 JWT 无法被撤销的根本原因是：**AccessToken 表中没有对应记录**，而非 JWT 缺少 jti。
 
 **Level 2 - `verifyUser`** ([verifyUser.ts](./apps/web/lib/api/verifyUser.ts#L14-L73))：
 在 verifyToken 基础上追加：
@@ -211,21 +211,21 @@ await prisma.accessToken.update({
 
 每次 API 调用都会**实时查询数据库**检查撤销状态：
 
-- [verifyToken.ts#L24-L33](./apps/web/lib/api/verifyToken.ts#L24-L33): 以 `token.jti` 查询 `AccessToken` 表，若 `revoked=true` 返回 "Your session has expired"
+- [verifyToken.ts#L24-L33](./apps/web/lib/api/verifyToken.ts#L24-L33): 以 `token.jti` 查询 `AccessToken` 表，仅当存在匹配记录且 `revoked=true` 时返回 "Your session has expired"；若 AccessToken 表中无对应 jti 记录，则查询返回 null，撤销检查通过
 - [isAuthenticatedRequest.ts#L24-L33](./apps/web/lib/api/isAuthenticatedRequest.ts#L24-L33): 相同逻辑
 
 ### 4.3 影响范围（修正）
 
 | Token 类型 | isSession | JWT 含 jti | 写入 AccessToken | 撤销影响 |
 |-----------|-----------|------------|------------------|---------|
-| 浏览器 JWT Cookie | N/A | ❌ 不生成 | ❌ 不写入 | ❌ 完全不受撤销列表影响（设计缺口） |
+| 浏览器 JWT Cookie | N/A | ✅ 包含 jti | ❌ 不写入 | ❌ 完全不受撤销列表影响（设计缺口） |
 | API Access Token | `false` | ✅ 包含 jti | ✅ 写入 | ✅ 下次调用立即失效（401） |
 | 移动端永久会话 (`POST /api/v1/session`) | `true` | ✅ 包含 jti | ✅ 写入 | ✅ 下次调用立即失效（401） |
-| Preserved-Format Token | N/A | ❌ 独立 JWT | ❌ 不写入 | ❌ 独立 JWT，5 分钟自然过期，无撤销机制 |
+| Preserved-Format Token | N/A | ❌ 独立 JWT（无 jti） | ❌ 不写入 | ❌ 独立 JWT，5 分钟自然过期，无撤销机制 |
 
-> **关键修正**: 浏览器常规登录产生的 NextAuth JWT Cookie **不会**在 `AccessToken` 表中创建记录，且 JWT payload 中不含 `jti` 字段。因此：
-> 1. `DELETE /api/v1/tokens/[id]` 无法撤销任何浏览器会话
-> 2. 即使手动将某浏览器 JWT 的 `sub` 关联到 AccessToken，因缺少 jti 也无法被撤销检查命中
+> **关键修正**: 浏览器常规登录产生的 NextAuth JWT Cookie **不会**在 `AccessToken` 表中创建记录，这是其无法被撤销的根本原因。因此：
+> 1. `DELETE /api/v1/tokens/[id]` 无法撤销任何浏览器会话，因为该接口操作的是 AccessToken 表，而浏览器 JWT 在该表中没有对应记录
+> 2. `verifyToken` 的撤销查询是 `where: { token: token.jti, revoked: true }`（见 [verifyToken.ts#L24-L29](./apps/web/lib/api/verifyToken.ts#L24-L29)），对浏览器 JWT 而言该查询返回 `null`（无匹配记录），故撤销检查永远通过
 > 3. 浏览器会话只能通过 JWT 自身过期（30 天）或客户端 `signOut()` 清除 Cookie 来终止
 > 4. 前端登出使用 NextAuth 的 `signOut()` 函数（如 [ProfileDropdown.tsx](./apps/web/components/ProfileDropdown.tsx#L77)），仅清除客户端 Cookie，**不通知后端**删除任何会话记录
 
@@ -376,7 +376,7 @@ NextAuth 提供 `signIn` callback（[[...nextauth].ts](./apps/web/pages/api/v1/a
 
 ## 7. 安全缺口总结（基于代码事实）
 
-1. **JWT Cookie 无撤销能力**: 浏览器登录态 JWT 不持久化到 AccessToken 表，且不含 jti，无法通过撤销接口强制登出。后端无任何使浏览器会话失效的机制。
+1. **JWT Cookie 无撤销能力**: 浏览器登录态 JWT 不持久化到 AccessToken 表（AccessToken 表中没有对应记录），无法通过撤销接口强制登出。后端无任何使浏览器会话失效的机制。
 2. **登录无失败防护**: Credentials 认证无暴力破解防护（无失败计数、无 IP 锁定、无延时）
 3. **邮箱变更无限流**: `sendChangeEmailVerificationRequest` 可被无限调用
 4. **无 API Rate Limiting**: 除邮件发送外，所有 API 端点无用户级或 IP 级频率限制
