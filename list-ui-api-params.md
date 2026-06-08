@@ -394,8 +394,8 @@ const removeLinkFromInfiniteData = (oldData, linkId) => {
 
 | 模式 | nextCursor 生成代码 | 条件 |
 |--------|----------------------|------|
-| Meilisearch | `meiliResp.hits.length === limit ? offset + limit : null` | **返回条数 === limit（满一页）才有游标 |
-| Prisma fallback | `links.length === paginationTakeCount ? links[last].id : null` | **返回条数 === paginationTakeCount（满一页）才有游标 |
+| Meilisearch | `meiliResp.hits.length === limit ? offset + limit : null` | **返回条数 === limit（满一页）才有游标** |
+| Prisma fallback | `links.length === paginationTakeCount ? links[last].id : null` | **返回条数 === paginationTakeCount（满一页）才有游标** |
 
 核心规则：**只要当前页不满 PAGINATION_TAKE_COUNT，服务端就返回 `nextCursor: null`，`hasNextPage` 必为 false**。不满一页意味着数据末尾，后续再无数据。
 
@@ -403,10 +403,10 @@ const removeLinkFromInfiniteData = (oldData, linkId) => {
 
 | 场景 | 初始尾页状态 | 删除后行为 | 后果 |
 |------|--------------|-----------|------|
-| 空洞在中间页（如 page2=49 条） | page3 满 50 条，nextCursor=id150 | `fetchNextPage` 用 page3.nextCursor=id150 请求 page4 | 新页 page4 正常返回 id151..id200 的 **50 条完整数据**，但 page2 的 49 条空洞**永远不会被回补** |
-| 空洞在最后一页，删完后 lastPage 仍有数据且原本满页 | page3 原本满 50 条，nextCursor 存在 | nextCursor 不变，继续正常拉取下一页 | 同上，不回补旧空洞 |
-| **空洞在最后一页且原本就不满页**（page3 原本只有 1 条，删除后变 0 条 | page3 原本就 nextCursor=null） | page3.nextCursor 仍为 null，`hasNextPage=false` | **不会凭空出现骨架屏，不会触发继续加载——尾页不满时本来就没有下一游标，删除后也不会凭空出现 |
-| 尾页原本满页但被整体删光（page3 从 50 条→0 条） | page3 原本满 50 条，nextCursor 存在 | page3.nextCursor 保留原值，`hasNextPage=true` | 用户看到底部骨架屏 → fetchNextPage 拉到 id>page3.originalLastId 的新页 → 视觉上从"空尾页"跳到"新的完整页"，中间缺的数据丢失 |
+| 中间页空洞（如 page2=49 条） | page3 满 50 条，nextCursor=id150 | `fetchNextPage` 用 page3.nextCursor=id150 请求 page4 | 新页 page4 正常返回 id151..id200 的 **50 条完整数据**，但 page2 的 49 条空洞**永远不会被回补** |
+| 尾页满页，删完后 lastPage 仍有数据 | page3 原本满 50 条，nextCursor 存在 | nextCursor 不变，继续正常拉取下一页 | 同上，不回补旧空洞 |
+| **尾页原本就不满页**（page3 原本只有 1 条，删除后变 0 条） | page3 原本 nextCursor=null | page3.nextCursor 仍为 null，`hasNextPage=false` | **不会凭空出现骨架屏，不会触发继续加载——尾页不满时本来就没有下一游标，删除后也不会凭空出现** |
+| **尾页原本满页但被整体删光**（page3 从 50 条 → 0 条） | page3 原本满 50 条，nextCursor 存在 | page3.nextCursor 保留原值，`hasNextPage=true` | 用户看到底部骨架屏 → fetchNextPage 拉到 id>page3.originalLastId 的新页 → 视觉上从"空尾页"跳到"新的完整页"，中间缺的数据丢失 |
 | 极端：累计删除量 > 已加载总数 - 1 | 取决于最后一页原本是否满页 | 若最后一页原本满页则 nextCursor 仍然有效 | 可能出现"本地只剩 10 条显示，但 hasNextPage 仍为 true"的反直觉状态 |
 
 **`useBulkDeleteLinks` 的行为相同**——[onSuccess](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L920-L936) 同样只做 `pages.map + filter`，不 invalidate links 缓存，批量删除时分页空洞数量可能更多。
