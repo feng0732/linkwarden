@@ -20,7 +20,7 @@
 
 ### 1.1 用户与订阅的层级关系
 
-Linkwarden 的"工作区"通过 **Subscription（订阅）模型隐式实现，没有独立的 Workspace 表。
+Linkwarden 的"工作区"通过 **`Subscription`（订阅）模型**隐式实现，没有独立的 Workspace 表。
 
 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/packages/prisma/schema.prisma#L28-L75)、[schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/packages/prisma/schema.prisma#L220-L232)：
 
@@ -47,7 +47,7 @@ Subscription (owner = User A, quantity = 5)
 | `UsersAndCollections.userId` → `User.id` | 集合成员 | **CASCADE**（删 User → 清除其所有成员关系） | [20250318123928](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/packages/prisma/migrations/20250318123928_add_referential_actions_to_certain_fields/migration.sql#L38-L39) |
 | `UsersAndCollections.collectionId` → `Collection.id` | 集合侧 | **CASCADE**（删 Collection → 清除其所有成员） | [20250318123928](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/packages/prisma/migrations/20250318123928_add_referential_actions_to_certain_fields/migration.sql#L40-L41) |
 
-**注意**："订阅成员身份"（同一 Subscription）与"集合成员权限"（UsersAndCollections）是**两个独立维度**：
+**注意**："订阅成员身份"（同一 `Subscription`）与"集合成员权限"（`UsersAndCollections`）是**两个独立维度**：
 - 订阅成员只共享链接额度和座位池
 - 集合成员需单独授权，不会因为同属一个订阅就自动可见
 
@@ -60,9 +60,9 @@ Subscription (owner = User A, quantity = 5)
 | `Link.collectionId` → `Collection.id` | 链接所在集合 | **CASCADE** | 删 Collection → 其下所有 Link 被删 |
 | `Link.createdById` → `User.id` | 谁创建了这条链接（可空） | **CASCADE** | 删 User → **该用户创建的所有 Link 被删**，无论这些 Link 在谁的 Collection 中 |
 
-**重要**：Link 有两条独立的删除路径。如果 User A 在 User B 的 Collection 中创建了 Link：
-- User B 删号 → Collection 删除 → Link 通过 `collectionId` Cascade 被删
-- User A 删号 → Link 通过 `createdById` Cascade 也被删（即使 Collection 还在）
+**重要**：`Link` 有两条独立的删除路径。如果 `User A` 在 `User B` 的 `Collection` 中创建了 `Link`：
+- `User B` 删号 → `Collection` 删除 → `Link` 通过 `collectionId` Cascade 被删
+- `User A` 删号 → `Link` 通过 `createdById` Cascade 也被删（即使 `Collection` 还在）
 
 ---
 
@@ -428,7 +428,7 @@ if (!(user as User).emailVerified && !email?.verificationRequest) {
 | 已点击邀请链接（未完成 onboarding） | 已写入 | **是** | PrismaAdapter 已写入 `emailVerified` |
 | 已完成 onboarding（name+password） | 已写入 | **是** | 正常激活状态 |
 
-**结论对齐**：Seat 计数完全以 `emailVerified != null` 为准，与 name/password 无关。用户一一点击邮件链接（`emailVerified` 写入成功）即立即占用一个 seat。
+**结论对齐**：Seat 计数完全以 `emailVerified != null` 为准，与 name/password 无关。用户一旦点击邮件链接（`emailVerified` 写入成功）即立即占用一个 seat。
 
 ### 3.5 邀请过期机制
 
@@ -547,15 +547,15 @@ User (Owner) 执行 prisma.user.delete
 ```
 
 **关键结论**：
-- 没有"所有权转移"机制——Owner 删号时其所有 Collection/Link/Tag 全部销毁
-- Child users 账号保留，但订阅断开，需各自重新订阅
-- Child users 自己创建的 Collection 和资源归各自所有，不受 Owner 删除影响
+- 没有"所有权转移"机制——`Owner` 删号时其所有 `Collection`/`Link`/`Tag` 全部销毁
+- `Child users` 账号保留，但订阅断开，需各自重新订阅
+- `Child users` 自己创建的 `Collection` 和资源归各自所有，不受 `Owner` 删除影响
 
 ### 5.2 订阅 Owner 软移除 child user 时
 
 - 仅 `parentSubscriptionId = NULL`，**不触动任何业务数据**
-- Child user 的 UsersAndCollections 集合成员权限仍然有效
-- Child user 自有的 Collection、Link、Tag 不受任何影响
+- `Child user` 的 `UsersAndCollections` 集合成员权限仍然有效
+- `Child user` 自有的 `Collection`、`Link`、`Tag` 不受任何影响
 
 ---
 
@@ -657,7 +657,7 @@ User (Owner) 执行 prisma.user.delete
 | Subscription | `userId` | CASCADE | 归订阅 Owner 用户 |
 | Subscription.childUsers | 反向关联 | Subscription 删 → SET NULL | child users 账号保留 |
 
-**核心设计原则**：Subscription 仅用于 billing 授权、成员池和容量限制，**不直接拥有任何业务资源**。所有 Collection/Link/Tag 的 ownerId 都指向具体 User。
+**核心设计原则**：`Subscription` 仅用于 billing 授权、成员池和容量限制，**不直接拥有任何业务资源**。所有 `Collection`/`Link`/`Tag` 的 `ownerId` 都指向具体 `User`。
 
 ---
 
