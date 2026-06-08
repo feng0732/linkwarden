@@ -64,8 +64,9 @@ pocket     = 4  → Pocket CSV 导出
 
 - `JSON.parse(rawData)` 为 `Backup` 类型
 - 统计 `data.collections[*].links.length` 做容量预检
-- 用 `prisma.$transaction({ timeout: 30000 })` 包裹整批操作
-- 遍历 collections：创建新 collection（名称/描述/颜色保留），再逐个创建 link + tags（connectOrCreate），最后匹配 `pinnedLinks` 中的 URL 标记为 pinned
+- 形式上用 `prisma.$transaction(async () => {...}, { timeout: 30000 })` 包裹，但回调内所有操作均使用全局 `prisma` 客户端而非事务参数 `tx`，**事务实际上不生效**（详见 7.4.1）
+- 遍历 collections：创建新 collection（仅恢复 name/description/color 三个字段），再逐个创建 link + tags（connectOrCreate），最后尝试匹配 `pinnedLinks` 中的 URL 标记为 pinned
+- **不会恢复**：collection 父子层级（parentId）、RSS 订阅、icon/iconWeight/isPublic 等 collection 字段、旧 id 到新 id 的映射（详见 6.3）
 
 ### 2.3 Pocket 导入（CSV）
 
@@ -372,7 +373,110 @@ interface Backup extends Omit<User, "password" | "id"> {
 
 **注意事项：**
 - `links` 中故意省略了大体积字段：`textContent`、`preview`、`image`、`readable`、`monolith`、`pdf`（减小备份文件体积）
-- `pinnedLinks` 为独立扁平数组，Linkwarden 导入时通过匹配 `url` 与新建链接关联并设置 pinned
+- `pinnedLinks` 为独立扁平数组，包含完整的 Link 对象（含旧 id），Linkwarden 导入时尝试通过匹配 `url` 与新建链接关联并设置 pinned
+
+### 6.3 导出/导入不对称与字段丢失分析（自有格式）
+
+导出时通过深度 include 取出了完整的用户数据结构，但导入时仅恢复了其中很小一部分。以下是逐项对比：
+
+#### 6.3.1 Collection 字段丢失
+
+Collection 模型在 Prisma schema 中定义了以下字段 [schema.prisma#L126-L149](packages/prisma/schema.prisma#L126-L149)：
+
+| 字段 | 导出时包含？ | 导入时恢复？ | 备注 |
+|------|------------|------------|------|
+| `name` | ✅ 是 | ✅ 是 | `e.name?.trim().slice(0, 254)` |
+| `description` | ✅ 是 | ✅ 是 | `e.description?.trim().slice(0, 254)` |
+| `color` | ✅ 是 | ✅ 是 | `e.color?.trim().slice(0, 50)` |
+| `parentId` | ✅ 是（Backup 继承 Collection） | ❌ **否** | 父子层级完全丢失，所有 collection 均为顶级 |
+| `icon` | ✅ 是 | ❌ **否** | 自定义图标丢失 |
+| `iconWeight` | ✅ 是 | ❌ **否** | 图标粗细丢失 |
+| `isPublic` | ✅ 是 | ❌ **否** | 公开/私有状态丢失，默认 private |
+| `ownerId` | ✅ 是 | ✅ 是（重新关联当前 userId） | 但值是新的，非备份中旧值 |
+| `createdById` | ✅ 是 | ✅ 是（重新关联当前 userId） | 同上 |
+| `createdAt` | ✅ 是 | ❌ **否** | 使用数据库 `now()` |
+| `updatedAt` | ✅ 是 | ❌ **否** | 使用数据库 `now()` |
+| `rssSubscriptions` | ✅ 是（显式 include） | ❌ **否** | RSS 订阅完全丢失（见 6.3.2） |
+| `members` | ❌ 否（未 include） | ❌ 否 | 导出时就不包含 |
+| `links` | ✅ 是（显式 include） | ✅ 是 | 逐条重建 |
+
+**关于 `parentId`（父子层级丢失）的具体代码**：
+- 导入 collection 的 create 语句仅设置了 5 个字段 [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50)：
+  ```javascript
+  data: {
+    owner: { connect: { id: userId } },
+    name: e.name?.trim().slice(0, 254),
+    description: e.description?.trim().slice(0, 254),
+    color: e.color?.trim().slice(0, 50),
+    createdBy: { connect: { id: userId } },
+  }
+  ```
+- **没有** `parent: { connect: ... }` 或 `parentId: ...`
+- 即使想设置也有两个障碍：
+  1. 没有建立 **旧 collection.id → 新 collection.id** 的映射表，无法知道 parentId 对应的新 id
+  2. 导入顺序是扁平遍历 `data.collections`，父 collection 可能在子 collection 之后创建（取决于 JSON 中数组顺序）
+
+#### 6.3.2 RSS 订阅完全丢失
+
+- 导出时显式 `include: { rssSubscriptions: true }` [exportData.ts#L8-L9](apps/web/lib/api/controllers/migration/exportData.ts#L8-L9)，backup.json 中每个 collection 都带有 `rssSubscriptions` 数组
+- RSS 模型字段：`id, url, name, lastBuildDate, collectionId, ownerId, createdAt, updatedAt` [schema.prisma#L248-L258](packages/prisma/schema.prisma#L248-L258)
+- 导入控制器 `importFromLinkwarden.ts` **完全没有处理 `rssSubscriptions`** 的代码——零行
+- 结果：备份中的 RSS 订阅静默丢失，用户恢复数据后需要重新手动添加 RSS 源
+
+#### 6.3.3 pinnedLinks 导出结构与导入匹配问题
+
+**导出结构** [exportData.ts#L25](apps/web/lib/api/controllers/migration/exportData.ts#L25)：
+
+```javascript
+pinnedLinks: true   // User.pinnedLinks 关联字段
+```
+
+`pinnedLinks` 是 User 与 Link 之间的多对多关系。导出时返回的是完整的 `LinksIncludingTags[]` 扁平数组：
+
+```jsonc
+// backup.json 中的 pinnedLinks 实际结构
+"pinnedLinks": [
+  {
+    "id": 42,           // 旧数据库中的 link.id
+    "url": "https://example.com/article",
+    "name": "Article Title",
+    "collectionId": 5,  // 旧数据库中的 collection.id
+    "type": "url",
+    "description": "...",
+    "importDate": "...",
+    "createdAt": "...",
+    "updatedAt": "...",
+    "createdById": 1,
+    "tags": [ { "id": 3, "name": "tech", "ownerId": 1 } ]
+    // 注意：不包含 textContent/preview/image/readable/monolith/pdf（与 collections.links 相同的 omit）
+  }
+]
+```
+
+**导入匹配方式** [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113)：
+
+```javascript
+// 对每个新创建的 link，遍历整个 pinnedLinks 数组做 URL 字符串精确匹配
+data?.pinnedLinks.forEach(async (pinnedLink) => {
+  if (pinnedLink.url === newLink.url) {  // ❌ 只比较 URL，不利用 id/collectionId
+    await prisma.link.update({ ... });    // 设置 pinnedBy
+  }
+});
+```
+
+**导出与导入的根本性不对称**：
+
+| 维度 | 导出（拥有的信息） | 导入（实际使用的信息） |
+|------|-----------------|---------------------|
+| 唯一标识 | `pinnedLinks[i].id`（旧 link.id，全局唯一） | 完全忽略 |
+| 所属集合 | `pinnedLinks[i].collectionId`（旧 collection.id） | 完全忽略 |
+| URL | `pinnedLinks[i].url`（原始值） | ✅ 使用，但与 `newLink.url`（trim+slice 后）做精确比较 |
+| Tag/名称等 | 全部导出 | 完全忽略 |
+
+**不匹配风险场景**：
+1. 同一用户在两个不同 collection 中收藏了相同 URL，其中只有一个被 pinned → 导入时**两个新链接都会被标记为 pinned**
+2. URL 在导出后导入前被规范化（如 `link.url.trim().slice(0,2047)` 与备份中的 `pinnedLink.url` 原值有空格/长度差异）→ **完全匹配不上**，pinned 状态丢失
+3. pinnedLinks 数组中的 link.id 可以与 `collections[*].links[*].id` 精确配对 → 但代码没有建立 旧 id → 新 id 的映射表，浪费了精确关联的机会
 
 ---
 
@@ -417,44 +521,58 @@ interface Backup extends Omit<User, "password" | "id"> {
 
 ### 7.4 事务失败后成功返回与置顶关系入库不一致（深度分析）
 
-#### 7.4.1 事务策略差异总览
+#### 7.4.1 事务策略与 `tx` 客户端缺失问题（核心修正）
 
-| 格式 | 是否包裹事务 | 超时 | catch 行为 | 最终返回 |
-|------|------------|------|-----------|---------|
-| HTML | **否** | - | 无 | 逐条创建，若中途异常抛到顶层 |
-| [Linkwarden](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
-| [Pocket](apps/web/lib/api/controllers/migration/importFromPocket.ts#L105) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
-| [Wallabag](apps/web/lib/api/controllers/migration/importFromWallabag.ts#L123) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
-| [Omnivore](apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L113-L116) | 是 | 30s | `console.error + throw err` 重抛 | 失败时 500 |
+**Prisma 交互式事务的正确用法**：`prisma.$transaction(async (tx) => { tx.model.create(...) })`，必须使用回调参数 `tx` 执行操作，才能纳入同一数据库事务。
 
-#### 7.4.2 路径一：事务整体回滚但返回 200（假阳性）
+**所有 4 个使用了 `$transaction` 的导入器（Linkwarden/Pocket/Wallabag/Omnivore）都犯了同一个错误**：回调签名为 `async () => {...}`（**无 `tx` 参数**），内部全部使用全局 `prisma` 客户端执行语句。
+
+后果：
+- 每一条 `prisma.collection.create` / `prisma.link.create` / `prisma.link.update` 都在**各自独立的自动提交事务**中执行
+- 回调抛异常时，**此前已成功执行的语句不会回滚**（因为已经各自提交）
+- `{ timeout: 30000 }` 只限制回调函数本身的执行时长，不提供任何原子性保证
+- 因此"全部成功或全部回滚"是**假象**——实际行为是"逐条写入、中途失败留下半成品"
+
+| 格式 | 是否调用 $transaction | 内部使用 tx？ | 实际原子性 | catch 行为 | 最终返回 |
+|------|---------------------|-------------|-----------|-----------|---------|
+| HTML | **否** | - | 无 | 无 | 逐条创建，中途异常抛到顶层 |
+| [Linkwarden](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L27-L29) | 是 | **否，用全局 prisma** | **无（伪事务）** | `console.log(err)` 吞掉 | **始终 200** |
+| [Pocket](apps/web/lib/api/controllers/migration/importFromPocket.ts) | 是 | **否，用全局 prisma** | **无（伪事务）** | `console.log(err)` 吞掉 | **始终 200** |
+| [Wallabag](apps/web/lib/api/controllers/migration/importFromWallabag.ts) | 是 | **否，用全局 prisma** | **无（伪事务）** | `console.log(err)` 吞掉 | **始终 200** |
+| [Omnivore](apps/web/lib/api/controllers/migration/importFromOmnivore.ts) | 是 | **否，用全局 prisma** | **无（伪事务）** | `console.error + throw err` 重抛 | 失败时 500 |
+
+> **修正认知**：HTML 导入与 Linkwarden/Pocket/Wallabag/Omnivore 导入的实际数据一致性行为**没有区别**——都是非事务性的逐条写入。唯一区别是后 4 者有一个无效的 `$transaction` 外壳和吞异常的 `.catch()`。
+
+#### 7.4.2 路径一：异常被 catch 吞掉仍返回 200（假阳性）
 
 以 [importFromLinkwarden.ts#L119-L121](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119-L121) 为例：
 
 ```javascript
 await prisma
   .$transaction(async () => {
-    // ... 创建 collections、links、tags ...
+    // ... 使用全局 prisma 逐条创建 collections、links、tags ...
+    // 注意：即使某条抛异常，之前已执行的语句也不会回滚
   }, { timeout: 30000 })
   .catch((err) => console.log(err));   // ⚠️ catch 仅打印，不向上传递
 
-return { response: "Success.", status: 200 };  // ⚠️ 无论事务成功失败都执行
+return { response: "Success.", status: 200 };  // ⚠️ 无论是否异常都执行
 ```
 
-**可能触发事务回滚的原因：**
-- 30 秒超时（`timeout: 30000`）
+**可能触发异常的原因：**
+- 30 秒超时（`timeout: 30000`，仅限制回调时长）
 - 数据库唯一约束冲突（如前述 Linkwarden tag where/create 不一致导致）
 - 数据库连接中断
 - Prisma 客户端错误
+- `createFolder` 文件系统操作失败
 
 **后果：**
-- 所有 collection/link/tag 操作全部回滚（数据库无任何写入）
+- 已成功执行的 create/update **不会回滚**（伪事务），数据库中留下部分已导入的数据
 - 但控制器返回 `status: 200`，前端 `toast.success("Imported the Bookmarks!")`
-- 2 秒后页面刷新，用户看不到任何新数据，但收到了成功提示
+- 2 秒后页面刷新，用户看到部分数据但可能以为是全部导入成功
 
 Pocket 和 Wallabag 导入器存在完全相同的问题。
 
-#### 7.4.3 路径二：Linkwarden pinnedLinks 异步更新未等待
+#### 7.4.3 路径二：Linkwarden pinnedLinks 异步更新未等待 + 脱离伪事务
 
 **代码位置：** [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113)
 
@@ -462,43 +580,58 @@ Pocket 和 Wallabag 导入器存在完全相同的问题。
 // Import pinnedLinks
 data?.pinnedLinks.forEach(async (pinnedLink) => {    // ⚠️ forEach + async 回调
   if (pinnedLink.url === newLink.url) {
-    await prisma.link.update({                        // ⚠️ 内部有 await
+    await prisma.link.update({                        // ⚠️ 全局 prisma 客户端
       where: { id: newLink.id },
       data: { pinnedBy: { connect: { id: userId } } },
     });
   }
 });
-// ⚠️ 没有 await Promise.all(...)，forEach 立即返回，不等回调完成
+// ⚠️ 没有 await Promise.all(...)，forEach 立即返回
 ```
 
 **问题详解：**
 
-`Array.prototype.forEach` 是同步函数，传入 `async` 回调时：
-1. 每个 `async (pinnedLink) => {...}` 回调会返回一个 Promise
-2. `forEach` 不收集这些 Promise，也不会 `await` 它们
-3. forEach 调用结束后，代码继续往下执行（进入下一个 link 的循环或结束事务回调）
-4. 这些 `prisma.link.update` 操作在后台"悬空"执行
+1. **forEach + async = 悬空 Promise**：
+   - `Array.prototype.forEach` 是同步函数，传入 `async` 回调时不收集 Promise 也不 `await`
+   - 每个 `prisma.link.update` 在后台独立执行，事务回调在它们完成前就已返回
 
-**导致的不一致路径：**
+2. **与伪事务的交互**：
+   - 由于事务回调内本身使用的就是全局 `prisma`（伪事务，每条语句自动提交），link.create 和 link.update 都是独立提交
+   - 但因为 forEach 没有 await，**update 的执行顺序完全不确定**：可能在下一个 link.create 之后、可能在整个事务回调返回之后
+   - 即使回调整体抛异常，已提交的 create 和 update 都不会回滚
+
+3. **导致的不一致路径**：
 
 | 场景 | 结果 |
 |------|------|
-| 事务回调在 pinnedLinks update 完成前返回并提交 | link 已入库，但 pinnedBy 关系可能**未设置**（update 还没执行或执行中） |
-| 事务回调结束后，update 才真正执行 | 由于 update 使用的是事务外的 `prisma` 全局客户端，可能成功（link 已提交），也可能因事务上下文丢失而失败 |
-| 部分 update 成功、部分失败 | pinnedLinks 状态部分入库，与备份的 pinnedLinks 列表不一致 |
-| update 失败但已无 try/catch | 产生未处理 Promise rejection（UnhandledPromiseRejection） |
-
-**与事务的交互问题：**
-
-这段代码位于 `prisma.$transaction(async () => {...})` 回调内部，但所有 Prisma 操作（包括 create 和 update）使用的是**全局 `prisma` 客户端**而非事务的 `tx` 参数。在 Prisma 交互式事务中，只有使用回调参数 `tx` 的操作才被事务管理。这意味着：
-- pinnedLinks 的 `prisma.link.update` 可能不在事务原子性保护内
-- 即使后续其他操作导致事务回滚，已执行的 update 可能不会回滚（但 link.id 已不存在，会失败）
+| 回调返回时 pinnedLinks update 还没执行完 | link 已入库，pinnedBy 关系稍后写入或丢失 |
+| 部分 update 成功、部分失败 | pinnedLinks 状态与备份列表不一致 |
+| update 失败但无 try/catch 包裹 | 产生未处理 Promise rejection（UnhandledPromiseRejection） |
+| URL 匹配失败（见路径三） | pinned 状态完全丢失 |
 
 #### 7.4.4 路径三：pinnedLinks URL 匹配不一致
 
-pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 link.url 在创建时经过了 `trim().slice(0, 2047)` 处理 [importFromLinkwarden.ts#L66](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66)。
+pinnedLinks 通过 URL 精确字符串匹配（`pinnedLink.url === newLink.url`），但 link.url 在创建时经过了 `trim().slice(0, 2047)` 处理 [importFromLinkwarden.ts#L66](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66)，而匹配时的 `pinnedLink.url` 是备份文件中的原始值。
 
-如果备份中 `pinnedLinks[i].url` 含有前后空格或长度超过 2047，而对应 link 创建时被规范化了，则 `===` 比较失败，pinned 状态不会被设置——即使 URL 本质相同。
+如果备份中 `pinnedLinks[i].url` 含有前后空格或长度超过 2047 被截断，而对应 link 创建时被规范化了，则 `===` 比较失败，pinned 状态不会被设置——即使 URL 本质相同。
+
+#### 7.4.5 路径四：旧 id → 新 id 映射缺失导致 pinnedLinks 无法精确关联
+
+导出 backup.json 时，`pinnedLinks` 数组中每个元素包含完整的 Link 字段（包括**旧数据库中的 id**）：
+```json
+"pinnedLinks": [
+  { "id": 42, "url": "https://example.com", "name": "...", "collectionId": 5, ... }
+]
+```
+
+理论上可以用 `pinnedLinks[*].id`（旧 link id）与 `collections[*].links[*].id`（旧 link id）做精确匹配，建立 **旧 id → 新 id** 映射表，再用新 id 设置 pinnedBy。
+
+但当前实现：
+- 导入时完全忽略备份中的所有旧 id（collection.id、link.id、tag.id 全部丢弃，由数据库 autoincrement 重新生成）
+- 没有建立任何 旧 id → 新 id 的映射
+- 只能退而求其次用 URL 做模糊匹配（可能重复、可能被规范化而不匹配）
+
+这是导出结构与导入逻辑的根本性不对称。
 
 ### 7.5 容量校验细节
 
@@ -537,10 +670,15 @@ pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 
 
 | # | 问题 | 位置 | 影响 |
 |---|------|------|------|
-| 1 | Linkwarden 导入 where 中 tag 只 `slice` 不 `trim`，create 中 `trim().slice()` | [importFromLinkwarden.ts#L85 vs L90](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L85-L90) | 带空格 tag 名触发唯一约束冲突 → 事务回滚 + 假 200 |
-| 2 | Linkwarden/Pocket/Wallabag 事务 catch 吞异常，始终返回 200 | [importFromLinkwarden.ts#L119](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) 等 | 事务整体回滚但前端显示成功（假阳性） |
-| 3 | Linkwarden pinnedLinks 使用 `forEach(async)`，无 await | [importFromLinkwarden.ts#L102-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L102-L113) | pinned 状态可能部分/全部丢失，或产生未处理 Promise 拒绝 |
-| 4 | pinnedLinks URL 精确匹配，未与 link 创建时的 `trim().slice()` 对齐 | [importFromLinkwarden.ts#L66 vs L103](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66-L103) | URL 含空格/超长时 pinned 状态无法匹配 |
-| 5 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
-| 6 | HTML 导入不使用事务，其他格式使用事务 | 各控制器 | HTML 导入中途异常会留下部分已入库的数据，其他格式全回滚 |
-| 7 | 所有导入器均未做 URL 去重（与手动 postLink 的 `preventDuplicateLinks` 不一致） | 各控制器 | 重复导入或 URL 已存在时产生重复链接 |
+| 1 | `$transaction` 回调未使用 `tx` 参数，所有语句用全局 `prisma` 执行，**伪事务** | Linkwarden/Pocket/Wallabag/Omnivore 4 个控制器 | 每条语句独立自动提交，中途异常不回滚，留下半成品数据 |
+| 2 | Linkwarden 导入 where 中 tag 只 `slice` 不 `trim`，create 中 `trim().slice()` | [importFromLinkwarden.ts#L85 vs L90](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L85-L90) | 带空格 tag 名触发唯一约束冲突 → 异常被吞 + 假 200 + 部分数据已入库 |
+| 3 | Linkwarden/Pocket/Wallabag 事务 catch 吞异常，始终返回 200 | [importFromLinkwarden.ts#L119](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) 等 | 发生异常但前端显示成功（假阳性），用户误判导入完成 |
+| 4 | Linkwarden pinnedLinks 使用 `forEach(async)`，无 await | [importFromLinkwarden.ts#L102-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L102-L113) | pinned 状态可能部分/全部丢失，或产生未处理 Promise 拒绝 |
+| 5 | pinnedLinks URL 精确匹配，未与 link 创建时的 `trim().slice()` 对齐 | [importFromLinkwarden.ts#L66 vs L103](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66-L103) | URL 含空格/超长时 pinned 状态无法匹配 |
+| 6 | 缺少旧 id → 新 id 映射表，pinnedLinks 可精确关联却退化为 URL 模糊匹配 | [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113) | 同 URL 跨 collection 时 pinned 状态错误扩散；导出的 id/collectionId 完全浪费 |
+| 7 | Linkwarden 自有格式导入不恢复 collection `parentId`，父子层级丢失 | [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50) | 所有 collection 平铺为顶级，嵌套结构不可逆丢失 |
+| 8 | 导出 include 了 `rssSubscriptions`，但导入完全不处理 | [exportData.ts#L8-L9](apps/web/lib/api/controllers/migration/exportData.ts#L8-L9) vs 整个 [importFromLinkwarden.ts](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts) | 所有 RSS 订阅静默丢失 |
+| 9 | Collection 字段部分丢失（icon/iconWeight/isPublic/createdAt/updatedAt） | [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50) | 自定义图标、公开状态、原始创建时间等不可逆丢失 |
+| 10 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
+| 11 | HTML 导入不使用事务，其他格式使用伪事务 | 各控制器 | HTML 导入中途异常抛到顶层（但也不回滚），其他 4 种异常被吞返回 200 |
+| 12 | 所有导入器均未做 URL 去重（与手动 postLink 的 `preventDuplicateLinks` 不一致） | 各控制器 | 重复导入或 URL 已存在时产生重复链接 |
