@@ -120,7 +120,73 @@ if (canPinPermission && data.pinnedBy && data.pinnedBy[0]) {
 
 使用 Prisma 的 `connect` / `disconnect` 操作多对多关系，**不会影响其他用户的置顶状态**。
 
-### 2. 前端置顶交互
+### 2. 置顶操作的权限分支详解
+
+置顶操作在 [updateLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts) 中有**两条独立的执行路径**，针对不同身份的用户：
+
+#### 路径一：纯置顶操作（协作成员专用快速路径）
+
+**触发条件**（第41行）：
+```typescript
+if (canPinPermission && data.pinnedBy && data.pinnedBy[0])
+```
+
+- `canPinPermission`：用户是集合成员（任何角色，包括 viewer）
+- 请求体中只修改 `pinnedBy` 字段，且 `pinnedBy[0]` 有值
+
+**权限判断**（第36-38行）：
+```typescript
+const canPinPermission = collectionIsAccessible?.members.some(
+  (e: UsersAndCollections) => e.userId === userId
+);
+```
+即：只要在 `members` 列表中存在即可，**不需要 `canUpdate=true`**。这意味着 **viewer 角色也能置顶**。
+
+**此路径的限制**：
+- 只更新 `pinnedBy` 字段，其他字段（name, url, collection, tags 等）一律不更新
+- 执行完后直接 return，跳过后续的完整权限校验
+
+#### 路径二：完整更新操作（所有者 + admin 角色）
+
+当用户不仅修改置顶，还修改其他字段（如名称、URL、集合、标签等）时，进入此路径。
+
+**权限判断**（第72-74行 + 第97-101行）：
+```typescript
+const memberHasAccess = collectionIsAccessible?.members.some(
+  (e: UsersAndCollections) => e.userId === userId && e.canUpdate
+);
+
+// 非所有者且无更新权限则不能编辑
+if (collectionIsAccessible?.ownerId !== userId && !memberHasAccess)
+  return { response: "Collection is not accessible.", status: 401 };
+```
+
+即：需要是**所有者**或成员中 `canUpdate=true`（admin 角色）。
+
+**额外限制**（第88-96行）：
+- 非所有者不能将链接移动到其他集合
+- 非所有者不能将链接从当前集合移走
+
+**此路径也会顺带处理置顶**（第177-181行）：
+```typescript
+pinnedBy: data?.pinnedBy
+  ? data.pinnedBy[0]?.id === userId
+    ? { connect: { id: userId } }
+    : { disconnect: { id: userId } }
+  : undefined,
+```
+
+#### 权限矩阵汇总
+
+| 用户身份 | 纯置顶（仅改pinnedBy） | 完整更新（改其他字段） | 移动链接到其他集合 |
+|---------|----------------------|---------------------|-----------------|
+| 集合所有者 (owner) | ✅ 通过路径二 | ✅ 通过路径二 | ✅ |
+| 协作成员 admin (canUpdate=true) | ✅ 通过路径一或二 | ✅ 通过路径二 | ❌ |
+| 协作成员 contributor (canCreate=true) | ✅ 通过路径一 | ❌ | ❌ |
+| 协作成员 viewer (全false) | ✅ 通过路径一 | ❌ | ❌ |
+| 非成员 | ❌ 401 | ❌ 401 | ❌ |
+
+### 3. 前端置顶交互
 
 见 [pinLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/client/pinLink.ts)
 
@@ -136,11 +202,18 @@ const pinLink = async (link: LinkIncludingShortenedCollectionAndTags) => {
 };
 ```
 
+前端判断置顶状态的工具函数见 [links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/packages/router/links.tsx#L266-L268)：
+```typescript
+const isLinkPinned = (link?: LinkIncludingShortenedCollectionAndTags) => {
+  return Boolean(link?.pinnedBy && link.pinnedBy.length > 0);
+};
+```
+
 UI 组件见 [LinkPin.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkPin.tsx)，在卡片右上角显示图钉图标：
 - 未置顶：`bi-pin`（空心图标）
 - 已置顶：`bi-pin-fill`（实心图标）
 
-### 3. 仅显示置顶链接
+### 4. 仅显示置顶链接
 
 见 [pinned.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/pages/links/pinned.tsx)
 
@@ -156,6 +229,16 @@ const { links, data } = useLinks({
 ```typescript
 const pinnedCondition =
   query.pinnedOnly && userId ? { pinnedBy: { some: { id: userId } } } : {};
+```
+
+Meilisearch 搜索中对应的置顶过滤见 [searchQueryBuilder.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/searchQueryBuilder.ts#L148-L158)：
+```typescript
+case "pinned":
+  if (value === "true") {
+    filters.push(
+      isNegative ? `NOT pinnedBy = ${userId}` : `pinnedBy = ${userId}`
+    );
+  }
 ```
 
 ---
@@ -294,7 +377,10 @@ const docs = links.map((link) => ({
   collectionOwnerId: link.collection.ownerId,
   collectionMemberIds: link.collection.members.map((m) => m.userId),
   collectionIsPublic: link.collection.isPublic,
-  // ...
+  collectionName: link.collection.name,
+  tags: link.tags.map((t) => t.name),
+  pinnedBy: link.pinnedBy.map((p) => p.id),  // 存储所有置顶用户的ID数组
+  creationTimestamp: Date.parse(link.createdAt.toISOString()) / 1000,
 }));
 ```
 
@@ -333,21 +419,33 @@ searchConditions.push({
 ```typescript
 export default async function getPermission({ userId, collectionId, linkId }) {
   if (linkId) {
-    return await prisma.collection.findFirst({
-      where: { links: { some: { id: linkId } } },
+    const check = await prisma.collection.findFirst({
+      where: {
+        links: {
+          some: {
+            id: linkId,
+          },
+        },
+      },
       include: { members: true },
     });
+
+    return check;
   } else if (collectionId) {
-    return await prisma.collection.findFirst({
+    const check = await prisma.collection.findFirst({
       where: {
         id: collectionId,
         OR: [{ ownerId: userId }, { members: { some: { userId } } }],
       },
       include: { members: true },
     });
+
+    return check;
   }
 }
 ```
+
+**注意**：当用 `linkId` 查询时，`getPermission` **不做权限过滤**，只要链接存在就返回所属 collection（含 members）。实际的权限拒绝逻辑在各业务 controller 中完成。
 
 ### 4. 操作权限细分
 
@@ -367,7 +465,7 @@ if (collectionIsAccessible?.ownerId !== userId && !memberHasAccess)
   return { response: "Collection is not accessible.", status: 401 };
 ```
 
-**特殊情况**：置顶操作不需要 `canUpdate` 权限，只要是集合成员就可以置顶（见上文置顶机制部分）。
+**特殊情况**：置顶操作不需要 `canUpdate` 权限，只要是集合成员就可以置顶（见上文置顶机制部分的权限矩阵）。
 
 ### 5. 子集合权限继承
 
@@ -399,9 +497,243 @@ if (collectionIsAccessible?.ownerId !== userId && !memberHasAccess)
 | `tag:` | 按标签搜索 | `tag:重要` |
 | `!`前缀 | 否定条件 | `!tag:已读` |
 
+这些修饰符在 Meilisearch 路径中全部生效。在 PostgreSQL fallback 路径中，**高级语法不会被解析**，只对 name/url/description/tags 做简单的 `contains` 模糊匹配。
+
 ---
 
-## 六、整体工作流架构图
+## 六、搜索引擎路径 vs 普通查询路径详解
+
+Linkwarden 存在**三条独立的链接查询路径**，分别服务于不同场景。
+
+### 1. 三条路径概览
+
+| 路径 | API 端点 | Controller | 身份认证 | 使用场景 |
+|------|---------|------------|---------|---------|
+| 路径 A：搜索（推荐） | `GET /api/v1/search` | [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts) | ✅ 需要登录 | 前端所有常规列表查询（useLinks hook 调用） |
+| 路径 B：旧版链接（废弃） | `GET /api/v1/links` | [getLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/links/getLinks.ts) | ✅ 需要登录 | 保留兼容，代码中已标记 DEPRECATED |
+| 路径 C：公开集合 | `GET /api/v1/public/collections/links` | [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts)（带 `publicOnly=true`） | ❌ 无需登录 | 公开分享的集合页面 |
+
+前端 `useLinks` hook 统一调用路径 A，见 [links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/packages/router/links.tsx#L75-L81)：
+```typescript
+const url =
+  (auth?.instance ? auth?.instance : "") +
+  "/api/v1/search?cursor=" +
+  params.pageParam + ...
+```
+
+### 2. 路径 A（/api/v1/search）的双引擎分支
+
+在 `searchLinks` controller 内部，根据是否启用 Meilisearch 和是否有关键词搜索，又分为两个分支：
+
+#### 分支 A-1：Meilisearch 搜索引擎路径
+
+**触发条件**（第54行）：
+```typescript
+if (meiliClient && query.searchQueryString)
+```
+即：Meilisearch 客户端可用 **且** 用户输入了搜索关键词。
+
+**执行流程**：
+```
+1. 解析搜索关键词中的高级语法（parseSearchTokens）
+   ↓
+2. 构建 Meilisearch 查询串和过滤器（buildMeiliQuery, buildMeiliFilters）
+   - 权限过滤器：(collectionOwnerId = userId) OR (collectionMemberIds = userId)
+   - 置顶过滤器：pinnedBy = userId（如果 pinned:true）
+   - 其他：url/name/collection/tag/before/after 等
+   ↓
+3. 调用 Meilisearch 搜索，仅取回匹配的 link.id 列表（attributesToRetrieve: ["id"]）
+   ↓
+4. 用 id 列表回查 PostgreSQL 获取完整数据：
+   prisma.link.findMany({ where: { id: { in: meiliIds } }, ... })
+   - 再次做权限校验（双保险）
+   - include: tags, collection, pinnedBy（仅当前用户）
+   ↓
+5. 排序：PostgreSQL orderBy（注意：Meilisearch 的排序结果会被二次排序覆盖）
+   ↓
+6. 返回结果 + nextCursor（offset + limit 模式）
+```
+
+**Meilisearch 索引配置**见 [linkIndexing.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/worker/workers/linkIndexing.ts#L23-L37)：
+```typescript
+updateFilterableAttributes([
+  "collectionOwnerId", "collectionMemberIds", "collectionName",
+  "tags", "pinnedBy", "url", "type", "name", "description",
+  "collectionIsPublic", "creationTimestamp",
+])
+```
+
+**索引时存储的置顶数据**（第140行）：
+```typescript
+pinnedBy: link.pinnedBy.map((p) => p.id),  // 存储所有置顶用户的ID数组
+```
+Meilisearch 中 `pinnedBy` 字段包含**所有**置顶了该链接的用户 ID，搜索时用 `pinnedBy = ${userId}` 过滤当前用户的置顶。
+
+#### 分支 A-2：PostgreSQL 直接查询（Fallback）
+
+**触发条件**：Meilisearch 不可用，或没有搜索关键词。
+
+**执行流程**：
+```
+1. 构建 PostgreSQL where 条件
+   - 权限过滤：collection.ownerId = userId OR collection.members.some(userId)
+   - 关键词搜索：对 name/url/description/tags 做 LIKE contains 模糊匹配
+     （注意：不解析高级搜索语法，只是简单 contains）
+   - pinnedOnly: pinnedBy.some(id = userId)
+   - tagId/collectionId 过滤
+   ↓
+2. Prisma 直接查询：prisma.link.findMany({ where, include, orderBy })
+   - include: tags, collection, pinnedBy（仅当前用户）
+   - 分页：cursor-based（take + skip + cursor）
+   ↓
+3. 返回结果 + nextCursor（基于最后一条记录的 id）
+```
+
+### 3. 路径 B（/api/v1/links 旧版）的差异
+
+见 [getLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/links/getLinks.ts)
+
+- **只走 PostgreSQL**，无 Meilisearch 分支
+- **标签搜索有额外的权限过滤**：对 tag 的可见性单独做了 ownerId/members 判断
+- **分页**：cursor-based，与 A-2 相同
+- **返回格式**：`{ response: links }`，而路径 A 是 `{ data: { links, nextCursor } }`
+- **已标记废弃**：当 `DISABLE_DEPRECATED_ROUTES=true` 时直接返回 400
+
+### 4. 路径 C（公开集合）的差异
+
+见 [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/pages/api/v1/public/collections/links/index.ts)
+
+- **无用户身份**：不调用 `verifyUser`，直接传入 `publicOnly: true`
+- **权限过滤器不同**：
+  - PostgreSQL：`collection: { id: query.collectionId, isPublic: true }`
+  - Meilisearch：`["collectionIsPublic = true"]`
+- **不返回 pinnedBy**：因为没有 userId，`include.pinnedBy` 为 `undefined`
+- **单条公开链接查询**见 [getLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/public/links/linkId/getLinkById.ts)，完全不包含 `pinnedBy` 字段
+
+### 5. 两条路径的详细对比表
+
+| 对比维度 | Meilisearch 路径 (A-1) | PostgreSQL 路径 (A-2, B) |
+|---------|----------------------|-------------------------|
+| 触发条件 | meiliClient 可用 + 有关键词 | 其他情况 |
+| 搜索能力 | 全文搜索 + 相关性排序 + 所有高级语法 | 简单 LIKE contains，**不支持高级语法** |
+| 置顶过滤 | `pinnedBy = ${userId}`（Meilisearch 过滤） | `pinnedBy: { some: { id: userId } }`（Prisma） |
+| 权限过滤 | `collectionOwnerId=X OR collectionMemberIds=X`（预索引字段） | 联表查询 collection.ownerId 和 members |
+| 排序 | 1. Meilisearch sort 参数<br>2. **但 PostgreSQL orderBy 会覆盖** | 直接 PostgreSQL `ORDER BY` |
+| 分页 | offset/limit 模式，`nextCursor = offset + limit` | cursor 模式，`nextCursor = lastItem.id` |
+| 查询次数 | 2 次（Meilisearch + PostgreSQL 回查） | 1 次 |
+| 标签搜索权限 | 无额外过滤（Meilisearch 只存 tag 名称） | 对 tag.ownerId 额外做权限检查 |
+| 结果一致性 | 可能短暂不一致（索引有延迟） | 实时一致 |
+
+---
+
+## 七、返回数据结构与用户隔离
+
+### 1. pinnedBy 字段的用户级过滤
+
+这是用户隔离的最关键机制。**所有返回链接的接口都会对 `pinnedBy` 做 where 过滤**，确保只返回当前请求用户的置顶状态。
+
+#### 列表查询（searchLinks.ts）
+
+见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L132-L137) 和 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L234-L239)：
+
+```typescript
+include: {
+  tags: true,
+  collection: true,
+  pinnedBy: userId
+    ? {
+        where: { id: userId },   // ← Prisma 层过滤
+        select: { id: true },
+      }
+    : undefined,
+},
+```
+
+#### 单条查询（getLinkById.ts）
+
+见 [getLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/links/linkId/getLinkById.ts#L30-L43)：
+
+```typescript
+include: {
+  tags: true,
+  collection: true,
+  pinnedBy: {
+    where: { id: userId },
+    select: { id: true },
+  },
+},
+
+// 额外的二次保险（冗余过滤）
+if (link?.pinnedBy && link.pinnedBy.length > 0) {
+  link.pinnedBy = link.pinnedBy.filter((p) => p.id === userId);
+}
+```
+
+单条查询做了**双重过滤**：Prisma where + JS filter，确保不会泄露其他用户的置顶信息。
+
+#### 更新操作的返回（updateLinkById.ts）
+
+见 [updateLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L53-L61) 和 [updateLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L183-L192)：
+
+```typescript
+include: {
+  collection: true,
+  // 或 tags: true, collection: true
+  pinnedBy: isCollectionOwner
+    ? {
+        where: { id: userId },
+        select: { id: true },
+      }
+    : undefined,   // ← 非所有者不返回 pinnedBy 字段！
+},
+```
+
+**重要发现**：更新操作返回时，**只有集合所有者才会返回 `pinnedBy` 字段**，协作成员的更新响应中 `pinnedBy` 为 `undefined`。这是一个额外的隔离措施。
+
+### 2. 不同接口返回的 pinnedBy 对比
+
+| 接口 | 身份 | pinnedBy 返回内容 |
+|------|------|------------------|
+| 搜索列表 `/api/v1/search` | 已登录用户 | `[{ id: userId }]`（已置顶）或 `[]`（未置顶） |
+| 单条链接 `/api/v1/links/:id` | 已登录用户 | `[{ id: userId }]` 或 `[]`（双重过滤） |
+| 更新链接 `PUT /api/v1/links/:id` | 集合所有者 | `[{ id: userId }]` 或 `[]` |
+| 更新链接 `PUT /api/v1/links/:id` | 协作成员（任何角色） | `undefined`（字段不存在） |
+| 公开集合列表 `/api/v1/public/collections/links` | 未登录 | `undefined`（字段不存在） |
+| 公开单条链接 `/api/v1/public/links/:id` | 未登录 | `undefined`（字段不存在） |
+
+### 3. 对前端用户隔离的影响
+
+前端判断置顶状态见 [links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/packages/router/links.tsx#L266-L268)：
+```typescript
+const isLinkPinned = (link) => {
+  return Boolean(link?.pinnedBy && link.pinnedBy.length > 0);
+};
+```
+
+这个判断对三种情况都安全：
+- 已置顶 → `pinnedBy = [{ id: 123 }]` → `length > 0` → `true` ✅
+- 未置顶 → `pinnedBy = []` → `length = 0` → `false` ✅
+- 无权限/公开 → `pinnedBy = undefined` → 可选链返回 `false` ✅
+
+前端置顶计数（Dashboard 页面）见 [links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/packages/router/links.tsx#L239-L244)：
+```typescript
+const numberOfPinnedLinks = removedLink?.pinnedBy?.length
+  ? Math.max(0, (oldData.numberOfPinnedLinks ?? 0) - 1)
+  : oldData.numberOfPinnedLinks;
+```
+
+### 4. 返回数据中 collection.members 的隔离
+
+虽然查询权限时使用 `include: { members: true }`（见 [getPermission.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/getPermission.ts#L23-L24)），但**返回给前端的链接数据不包含 members 列表**。
+
+前端 Link 类型 `LinkIncludingShortenedCollectionAndTags`（见 [global.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/packages/types/global.ts)）中，collection 只包含：
+- `id`, `name`, `ownerId`, `parentId`, `isPublic`, `color`, `icon`
+
+而不包含 `members`，所以前端无法直接查看协作者列表。查看成员需要调用专门的 collection 详情接口。
+
+---
+
+## 八、整体工作流架构图
 
 ```
 用户 (User)
@@ -415,7 +747,7 @@ if (collectionIsAccessible?.ownerId !== userId && !memberHasAccess)
   │
   └── 加入的协作集合 (UsersAndCollections.userId)
         ├── 可查看所有链接
-        ├── 可独立置顶链接（不影响他人）
+        ├── 可独立置顶链接（不影响他人，甚至 viewer 也能置顶）
         └── 根据 canCreate/canUpdate/canDelete 执行操作
 ```
 
@@ -423,42 +755,57 @@ if (collectionIsAccessible?.ownerId !== userId && !memberHasAccess)
 
 ```
 前端请求 (sort, pinnedOnly, collectionId, searchQueryString)
-        │
-        ▼
+  │  useLinks hook → GET /api/v1/search
+  ▼
 API 路由验证用户身份 (verifyUser)
-        │
-        ▼
-权限过滤 (强制条件)：
-  ├── collection.ownerId = userId
-  └── OR collection.members 包含 userId
-        │
-        ▼
-应用查询条件：
-  ├── pinnedOnly → pinnedBy.some(id = userId)
-  ├── collectionId → collection.id = ?
-  ├── tagId → tags.some(id = ?)
-  └── searchQueryString → 全文搜索 + 高级语法
-        │
-        ▼
-排序 (orderBy):
-  ├── id desc/asc (日期)
-  └── name asc/desc (名称)
-        │
-        ▼
-返回结果时过滤 pinnedBy：
-  pinnedBy.where = { id: userId } ← 只返回当前用户的置顶状态
+  │
+  ▼
+┌─ 有搜索词 且 Meilisearch 可用? ─┐
+│        Yes                        │        No
+▼                                   ▼
+Meilisearch 搜索路径           PostgreSQL 直接查询
+  │  解析高级语法                  │  LIKE contains 模糊匹配
+  │  权限过滤（预索引字段）         │  联表权限过滤
+  │  取匹配 id 列表                 │  直接 include tags/collection
+  ▼                                   │
+PostgreSQL 回查完整数据 ◄────────────┘
+  │  include.pinnedBy.where = { id: userId } ← 只返回当前用户置顶
+  │  orderBy 排序
+  ▼
+返回：{ data: { links: [...], nextCursor } }
+```
+
+### 置顶操作流程
+
+```
+前端点击图钉图标 (LinkPin.tsx)
+  │  pinLink() → useUpdateLink() → PUT /api/v1/links/:id
+  ▼
+后端 updateLinkById
+  │
+  ├─ 1. 先检查是否为"纯置顶"请求（canPinPermission && data.pinnedBy[0]）
+  │     │  只要是集合成员即可（viewer 也可以）
+  │     │  只更新 pinnedBy 字段，connect/disconnect 当前用户
+  │     └─ 快速返回（不做后续权限校验）
+  │
+  └─ 2. 否则走完整更新路径
+        │  需要 owner 或 canUpdate=true（admin）
+        │  可更新 name/url/tags/collection 等
+        │  同时也可更新 pinnedBy
+        └─ 非所有者不能移动链接到其他集合
 ```
 
 ---
 
-## 七、关键发现与问题总结
+## 九、关键发现与问题总结
 
 ### ✅ 用户隔离做得好的部分
 
-1. **置顶完全用户隔离**：通过多对多关系 `pinnedBy` 实现，每个用户独立管理
-2. **查询权限强制过滤**：所有链接查询都加入了集合所有权/成员检查
-3. **操作权限细分**：canCreate/canUpdate/canDelete 三级权限
-4. **Meilisearch 索引预存权限**：搜索时快速过滤，避免关联查询
+1. **置顶完全用户隔离**：通过多对多关系 `pinnedBy` 实现，每个用户独立管理；返回数据时用 `where: { id: userId }` 严格过滤
+2. **查询权限强制过滤**：所有链接查询都加入了集合所有权/成员检查，包括 Meilisearch 路径的预索引过滤
+3. **操作权限细分**：canCreate/canUpdate/canDelete 三级权限；置顶操作有独立的快速路径
+4. **Meilisearch 索引预存权限**：搜索时快速过滤，避免关联查询；同时 PostgreSQL 回查做了双保险
+5. **返回数据脱敏**：非所有者的更新响应不返回 pinnedBy；公开接口完全不返回 pinnedBy
 
 ### ⚠️ 用户隔离不明显/可能混淆的地方
 
@@ -467,6 +814,9 @@ API 路由验证用户身份 (verifyUser)
 3. **置顶状态只返回当前用户**：`pinnedBy` 数组中只有当前用户 ID，协作者之间看不到彼此的置顶（这是设计，但用户可能想知道"谁置顶了这个"）
 4. **没有阅读历史记录**：无法追踪用户是否打开/阅读过某个链接，也无法基于此排序
 5. **排序方式有限**：只有 4 种基础排序，没有"推荐"、"最近阅读"、"最常访问"等
+6. **Meilisearch 路径排序问题**：Meilisearch 返回的排序结果被 PostgreSQL 的 orderBy 二次排序覆盖（见 searchLinks.ts 第139行），可能导致搜索相关性失效
+7. **Meilisearch 索引的置顶延迟**：索引 worker 是异步的，置顶/取消置顶后立即搜索可能得到旧结果
+8. **两条路径搜索能力不对等**：PostgreSQL fallback 不支持高级搜索语法，但前端搜索框不提示这一点
 
 ### 🔧 潜在改进方向
 
@@ -475,3 +825,5 @@ API 路由验证用户身份 (verifyUser)
 3. 区分"收藏"（Favorite）和"置顶"（Pin）两种语义
 4. 增加基于阅读行为的推荐排序算法
 5. 让集合所有者可以查看成员的置顶/收藏情况（协作场景）
+6. 修复 Meilisearch 路径排序被 PostgreSQL 覆盖的问题，保证搜索相关性
+7. 在置顶/取消置顶后立即触发 Meilisearch 索引更新，或在应用层做补偿
