@@ -163,7 +163,67 @@ tags: {
 }
 ```
 
-### 4.2 各格式 tag 来源差异
+### 4.2 Tag 名称的 trim/slice 操作顺序（深度分析）
+
+**各导入器 where 与 create 的操作顺序对比：**
+
+| 导入器 | where 条件（查找已有 tag） | create 时（新建 tag） | 顺序一致？ |
+|--------|--------------------------|---------------------|-----------|
+| [HTML](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L216) | `tag.trim()` — L241 | `tag.trim()` — L246 | ✅ 一致 |
+| [Linkwarden](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L82-L97) | `tag.name?.slice(0, 49)` — L85 **（只 slice，不 trim）** | `tag.name?.trim().slice(0, 49)` — L90 | ❌ **不一致** |
+| [Pocket](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L79-L91) | `tag?.slice(0, 50).trim()` — L83 | `tag?.slice(0, 50).trim()` — L88 | ✅ 一致 |
+| [Wallabag](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromWallabag.ts#L99-L114) | `tag?.trim().slice(0, 49)` — L102 | `tag?.trim().slice(0, 49)` — L107 | ✅ 一致 |
+| [Omnivore](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L89-L104) | `label?.trim().slice(0, 49)` — L92 | `label?.trim().slice(0, 49)` — L97 | ✅ 一致 |
+| [postLink](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/links/postLink.ts#L120-L137) | `tag.name.trim()` — L124 | `tag.name.trim()` — L129 | ✅ 一致（无 slice） |
+
+**补充：HTML 导入有预处理步骤** [importFromHTMLFile.ts#L216](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L216)：
+
+```javascript
+tags = tags?.map((tag) => tag.trim().slice(0, 49));  // 预处理：先 trim 再 slice
+```
+
+然后 where/create 中再执行 `tag.trim()`（不再 slice），实际效果等价于 `trim().slice(0,49).trim()`。
+
+**不一致的风险分析 — Linkwarden 导入器：**
+
+在 [importFromLinkwarden.ts#L82-L97](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L82-L97)：
+
+```javascript
+tags: {
+  connectOrCreate: link.tags.map((tag) => ({
+    where: {
+      name_ownerId: {
+        name: tag.name?.slice(0, 49),           // ❌ 只 slice，不 trim
+        ownerId: userId,
+      },
+    },
+    create: {
+      name: tag.name?.trim().slice(0, 49),      // ✅ 先 trim 再 slice
+      owner: { connect: { id: userId } },
+    },
+  })),
+}
+```
+
+问题路径：
+1. 备份文件中 tag 名为 `" tech "`（前后有空格，长度 6）
+2. `where` 查找：`slice(0,49)` 后仍为 `" tech "`（因为 6 < 49），**查找的是带空格的 " tech "**
+3. 若数据库中已有标准化 tag `"tech"`（trim 后），where 条件匹配失败
+4. 触发 create 分支：`trim().slice(0,49)` → `"tech"`
+5. 由于 `name_ownerId` 唯一约束，尝试创建已存在的 `"tech"`，**抛出唯一约束冲突错误**
+6. 整个事务回滚 → 所有 collection/link/tag 都不入库，但由于 catch 吞异常，前端仍收到 200 成功
+
+**Pocket 导入器的顺序注意：**
+
+在 [importFromPocket.ts#L79-L91](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L79-L91)：
+
+```javascript
+name: tag?.slice(0, 50).trim()  // 先 slice 再 trim
+```
+
+先 slice 再 trim 的潜在问题：如果原 tag 是 `"  verylongname...(超过50字符)...  "`，先 slice 到 50 可能把末尾空格切掉，然后 trim 后长度可能更短，且如果第 50 个字符刚好是空格的一部分，结果与先 trim 再 slice 可能不同。
+
+**各格式 tag 来源差异：**
 
 | 格式 | Tag 原始字段 | 分割方式 | 长度限制 |
 |------|-------------|---------|---------|
@@ -172,8 +232,6 @@ tags: {
 | Pocket | CSV `tags` 列 | 竖线 `\|` | 50 字符（slice 0,50） |
 | Wallabag | `tags` 数组 | 已为数组 | 49 字符 |
 | Omnivore | `labels` 数组 | 已为数组 | 49 字符 |
-
-所有 tag 名称统一执行 `trim()` 后再截断。
 
 ---
 
@@ -216,7 +274,7 @@ try { new URL(url.trim()); } catch (e) { return/continue; }
 | collection.color | 50 |
 | link.url | 2047 |
 | link.name | 254 |
-| link.description | 254（HTML/Wallabag 的 textContent 为 2047） |
+| link.description | 254（Wallabag 的 textContent 为 2047） |
 | tag.name | 49~50 |
 
 超长字段统一 `.slice()` 静默截断，不抛错。
@@ -352,26 +410,97 @@ interface Backup extends Omit<User, "password" | "id"> {
 
 ### 7.3 后端部分失败（单条记录级）
 
-**这是当前实现的关键特性：部分失败不影响整体导入，也不向客户端报告。**
-
 **单条静默跳过的场景：**
 1. URL 解析失败（`new URL()` throw）→ `continue` / `return`，不记录任何日志
 2. 字段超长 → 静默 `.slice()` 截断
 3. 空 tag 名称 → 仍会被创建（空字符串）
 
-**事务策略差异：**
+### 7.4 事务失败后成功返回与置顶关系入库不一致（深度分析）
 
-| 格式 | 是否包裹事务 | 超时 | 行为 |
-|------|------------|------|------|
-| HTML | **否** | - | 逐条创建，某条失败不影响已成功的，但后续可能中断（取决于失败位置） |
-| Linkwarden | 是 | 30s | 全部成功或全部回滚；`.catch(err => console.log(err))` 吞异常后仍返回 200 |
-| Pocket | 是 | 30s | 同上 |
-| Wallabag | 是 | 30s | 同上 |
-| Omnivore | 是 | 30s | `.catch(err => { console.error; throw err })` 会抛出，导致返回 500 |
+#### 7.4.1 事务策略差异总览
 
-> **关键点**：Linkwarden/Pocket/Wallabag 三个控制器在 `$transaction` 的 `.catch` 中只 `console.log(err)`，然后函数继续返回 `{ response: "Success.", status: 200 }`。这意味着即使事务整体回滚、一条都没导入，前端也会收到 "成功" 的假阳性反馈。只有 Omnivore 会 re-throw 让外层返回 500 错误。
+| 格式 | 是否包裹事务 | 超时 | catch 行为 | 最终返回 |
+|------|------------|------|-----------|---------|
+| HTML | **否** | - | 无 | 逐条创建，若中途异常抛到顶层 |
+| [Linkwarden](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
+| [Pocket](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L105) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
+| [Wallabag](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromWallabag.ts#L123) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
+| [Omnivore](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L113-L116) | 是 | 30s | `console.error + throw err` 重抛 | 失败时 500 |
 
-### 7.4 容量校验细节
+#### 7.4.2 路径一：事务整体回滚但返回 200（假阳性）
+
+以 [importFromLinkwarden.ts#L119-L121](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119-L121) 为例：
+
+```javascript
+await prisma
+  .$transaction(async () => {
+    // ... 创建 collections、links、tags ...
+  }, { timeout: 30000 })
+  .catch((err) => console.log(err));   // ⚠️ catch 仅打印，不向上传递
+
+return { response: "Success.", status: 200 };  // ⚠️ 无论事务成功失败都执行
+```
+
+**可能触发事务回滚的原因：**
+- 30 秒超时（`timeout: 30000`）
+- 数据库唯一约束冲突（如前述 Linkwarden tag where/create 不一致导致）
+- 数据库连接中断
+- Prisma 客户端错误
+
+**后果：**
+- 所有 collection/link/tag 操作全部回滚（数据库无任何写入）
+- 但控制器返回 `status: 200`，前端 `toast.success("Imported the Bookmarks!")`
+- 2 秒后页面刷新，用户看不到任何新数据，但收到了成功提示
+
+Pocket 和 Wallabag 导入器存在完全相同的问题。
+
+#### 7.4.3 路径二：Linkwarden pinnedLinks 异步更新未等待
+
+**代码位置：** [importFromLinkwarden.ts#L101-L113](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113)
+
+```javascript
+// Import pinnedLinks
+data?.pinnedLinks.forEach(async (pinnedLink) => {    // ⚠️ forEach + async 回调
+  if (pinnedLink.url === newLink.url) {
+    await prisma.link.update({                        // ⚠️ 内部有 await
+      where: { id: newLink.id },
+      data: { pinnedBy: { connect: { id: userId } } },
+    });
+  }
+});
+// ⚠️ 没有 await Promise.all(...)，forEach 立即返回，不等回调完成
+```
+
+**问题详解：**
+
+`Array.prototype.forEach` 是同步函数，传入 `async` 回调时：
+1. 每个 `async (pinnedLink) => {...}` 回调会返回一个 Promise
+2. `forEach` 不收集这些 Promise，也不会 `await` 它们
+3. forEach 调用结束后，代码继续往下执行（进入下一个 link 的循环或结束事务回调）
+4. 这些 `prisma.link.update` 操作在后台"悬空"执行
+
+**导致的不一致路径：**
+
+| 场景 | 结果 |
+|------|------|
+| 事务回调在 pinnedLinks update 完成前返回并提交 | link 已入库，但 pinnedBy 关系可能**未设置**（update 还没执行或执行中） |
+| 事务回调结束后，update 才真正执行 | 由于 update 使用的是事务外的 `prisma` 全局客户端，可能成功（link 已提交），也可能因事务上下文丢失而失败 |
+| 部分 update 成功、部分失败 | pinnedLinks 状态部分入库，与备份的 pinnedLinks 列表不一致 |
+| update 失败但已无 try/catch | 产生未处理 Promise rejection（UnhandledPromiseRejection） |
+
+**与事务的交互问题：**
+
+这段代码位于 `prisma.$transaction(async () => {...})` 回调内部，但所有 Prisma 操作（包括 create 和 update）使用的是**全局 `prisma` 客户端**而非事务的 `tx` 参数。在 Prisma 交互式事务中，只有使用回调参数 `tx` 的操作才被事务管理。这意味着：
+- pinnedLinks 的 `prisma.link.update` 可能不在事务原子性保护内
+- 即使后续其他操作导致事务回滚，已执行的 update 可能不会回滚（但 link.id 已不存在，会失败）
+
+#### 7.4.4 路径三：pinnedLinks URL 匹配不一致
+
+pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 link.url 在创建时经过了 `trim().slice(0, 2047)` 处理 [importFromLinkwarden.ts#L66](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66)。
+
+如果备份中 `pinnedLinks[i].url` 含有前后空格或长度超过 2047，而对应 link 创建时被规范化了，则 `===` 比较失败，pinned 状态不会被设置——即使 URL 本质相同。
+
+### 7.5 容量校验细节
 
 **函数：** [hasPassedLimit(userId, numberOfImports)](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/packages/lib/verifyCapacity.ts#L8-L109)
 
@@ -401,3 +530,17 @@ interface Backup extends Omit<User, "password" | "id"> {
 6. 无效 URL 静默跳过，仅有效 URL 入库
 
 另有一段按 importDate 排序 ID 的测试被注释掉（`sortBookmarksTreeByEffectiveDate` 整个函数也被注释），当前未启用。
+
+---
+
+## 9. 关键不一致点汇总
+
+| # | 问题 | 位置 | 影响 |
+|---|------|------|------|
+| 1 | Linkwarden 导入 where 中 tag 只 `slice` 不 `trim`，create 中 `trim().slice()` | [importFromLinkwarden.ts#L85 vs L90](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L85-L90) | 带空格 tag 名触发唯一约束冲突 → 事务回滚 + 假 200 |
+| 2 | Linkwarden/Pocket/Wallabag 事务 catch 吞异常，始终返回 200 | [importFromLinkwarden.ts#L119](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) 等 | 事务整体回滚但前端显示成功（假阳性） |
+| 3 | Linkwarden pinnedLinks 使用 `forEach(async)`，无 await | [importFromLinkwarden.ts#L102-L113](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L102-L113) | pinned 状态可能部分/全部丢失，或产生未处理 Promise 拒绝 |
+| 4 | pinnedLinks URL 精确匹配，未与 link 创建时的 `trim().slice()` 对齐 | [importFromLinkwarden.ts#L66 vs L103](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66-L103) | URL 含空格/超长时 pinned 状态无法匹配 |
+| 5 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
+| 6 | HTML 导入不使用事务，其他格式使用事务 | 各控制器 | HTML 导入中途异常会留下部分已入库的数据，其他格式全回滚 |
+| 7 | 所有导入器均未做 URL 去重（与手动 postLink 的 `preventDuplicateLinks` 不一致） | 各控制器 | 重复导入或 URL 已存在时产生重复链接 |
