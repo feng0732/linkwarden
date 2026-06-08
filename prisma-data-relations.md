@@ -155,13 +155,340 @@ User (1) ─── owner (Cascade) ──< Collection (N)
 
 ---
 
-## 3. deleteUserById 代码级分支逻辑深度分析
+## 3. 路由层前置校验链深度分析（进入 deleteUserById 之前）
+
+路由层代码位置: [pages/api/v1/users/[id]/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts)
+
+DELETE 请求在进入 `deleteUserById` 控制器函数之前，需依次通过 **6 个前置校验节点**，任一节点失败都不会触发删除事务，更不会触发 createdById 级联。
+
+### 3.1 完整前置校验链流程图
+
+```
+DELETE /api/v1/users/{id}
+│
+├─ Node 1: queryId 解析（L14-L18）
+│   queryId = Number(req.query.id)
+│   └─ !queryId（非数字或 0） → return 400 "Invalid request."
+│       └─ ❌ 不触发 createdById 级联
+│
+├─ Node 2: verifyToken（L12, L20-L23）
+│   const token = await verifyToken({ req })
+│   └─ typeof token === "string"（校验失败返回错误消息）
+│       → return 401 { response: token }
+│       └─ ❌ 不触发 createdById 级联
+│
+├─ Node 3: 查询当前用户 & 设置管理员标志（L25-L33）
+│   const user = await prisma.user.findUnique({ where: { id: token.id } })
+│   isServerAdmin = user?.id === Number(process.env.NEXT_PUBLIC_ADMIN || 1)
+│   userId = token.id
+│   └─ （无返回分支，但 user 为 null 时 isServerAdmin=false）
+│
+├─ Node 4: verifySubscription 订阅校验（L43-L65）
+│   条件: 仅当 process.env.STRIPE_SECRET_KEY 配置时执行
+│   │
+│   ├─ 查询当前用户的 subscriptions + parentSubscription
+│   │   └─ user 不存在 → return 404 "User not found."
+│   │       └─ ❌ 不触发 createdById 级联
+│   │
+│   └─ verifySubscription(user)
+│       └─ 返回 null（无有效订阅、试用期已过且无 CC）
+│           → return 401 "You are not a subscriber..."
+│           └─ ❌ 不触发 createdById 级联
+│
+├─ Node 5: DELETE 方法路由分发（L79-L93）
+│   │
+│   ├─ Node 5a: Demo 模式禁用（L80-L84）
+│   │   NEXT_PUBLIC_DEMO === "true"
+│   │   → return 400 "This action is disabled..."
+│   │   └─ ❌ 不触发 createdById 级联
+│   │
+│   └─ Node 5b: 调用 deleteUserById（L86-L91）
+│       const updated = await deleteUserById(userId, req.body, isServerAdmin, queryId)
+│       └─ ✅ 进入控制器，才有可能触发 createdById 级联
+```
+
+> ⚠️ **与 GET/PUT 的关键差异**：GET（L35-L37）和 PUT（L67-L69）在路由层都有 `if (userId !== queryId && !isServerAdmin) return 401` 这一层权限拦截，但 **DELETE 分支在路由层完全没有这段检查**。该检查完全下沉到 `deleteUserById` 函数内部（L39-L105）执行。这意味着非管理员尝试删除别人的请求在路由层不会被提前拒绝，会进入控制器内部再被拦截。
+
+---
+
+### 3.2 Node 1: queryId 解析
+
+代码位置: [index.ts#L14-L18](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L14-L18)
+
+```typescript
+const queryId = Number(req.query.id);
+if (!queryId) {
+  return res.status(400).json({ response: "Invalid request." });
+}
+```
+
+**逻辑解析**:
+- `req.query.id` 来自 URL 路径 `/api/v1/users/{id}`，类型为 string | string[] | undefined
+- `Number()` 转换后，若结果为 0 或 NaN（空字符串、非数字字符串、undefined），`!queryId` 为 true
+- `queryId` 后续会被用于：
+  - 传入 `deleteUserById`，作为删除目标（`prisma.user.delete({ where: { id: queryId } })`）
+  - 查询目标用户拥有的 Collection/Link 做外部资源清理
+  - createdById CASCADE 实际删除的是 `Link.createdById === queryId` 的链接
+
+**对 createdById 级联的影响**: 失败时直接 return 400，**不执行任何数据库写入，createdById 级联完全不触发**。
+
+---
+
+### 3.3 Node 2: verifyToken 认证校验
+
+代码位置: [index.ts#L12](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L12) + [verifyToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/verifyToken.ts)
+
+```typescript
+export default async function verifyToken({
+  req,
+}: Props): Promise<JWT | string> {
+  const token = await getToken({ req });   // NextAuth JWT 解码
+  const userId = token?.id;
+
+  // Checkpoint 2a: 未登录
+  if (!userId) {
+    return "You must be logged in.";
+  }
+
+  // Checkpoint 2b: 会话过期
+  if (token.exp < Date.now() / 1000) {
+    return "Your session has expired, please log in again.";
+  }
+
+  // Checkpoint 2c: Token 被撤销（登出 / 强制下线）
+  const revoked = await prisma.accessToken.findFirst({
+    where: { token: token.jti, revoked: true },
+  });
+  if (revoked) {
+    return "Your session has expired, please log in again.";
+  }
+
+  return token;  // 返回 JWT 对象（含 id, iat, exp, jti）
+}
+```
+
+**三层校验详解**:
+
+| 校验点 | 条件 | 错误消息 | 说明 |
+|-------|------|---------|------|
+| 2a | `!token?.id` | "You must be logged in." | Cookie 中无有效 NextAuth Session |
+| 2b | `token.exp < Date.now()/1000` | "Your session has expired..." | JWT 自然过期（通常 7 天） |
+| 2c | AccessToken 表中 `jti` 对应记录 `revoked=true` | "Your session has expired..." | 用户主动登出或管理员强制下线，jti 被写库标记吊销 |
+
+**JWT 字段说明**（参考 [next-auth.d.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/types/next-auth.d.ts#L17-L23)）:
+- `id: number` — 用户 ID，成为后续的 `userId`
+- `iat: number` — 签发时间戳
+- `exp: number` — 过期时间戳
+- `jti: string` — JWT 唯一标识，用于撤销机制，对应 AccessToken.token 字段
+
+**对 createdById 级联的影响**: 返回 string 表示失败，路由层 return 401。**无任何数据库写操作，createdById 级联不触发**。特别注意 Checkpoint 2c 会执行一次 AccessToken 读查询，但只是读，不写入。
+
+---
+
+### 3.4 Node 3: 当前用户查询与管理员判定
+
+代码位置: [index.ts#L25-L33](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L25-L33)
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: token?.id },  // 用 token 中的用户 ID 查数据库
+});
+
+const isServerAdmin = user?.id === Number(process.env.NEXT_PUBLIC_ADMIN || 1);
+
+const userId = token.id;
+```
+
+**管理员判定逻辑**:
+- 比较 `user.id` 与环境变量 `NEXT_PUBLIC_ADMIN`（默认值 `1`）
+- 如果 `user` 为 null（token 有效但用户已被删），`isServerAdmin` 为 false
+- 注意：**此处在删除用户之前就读取了数据库**，如果目标用户和当前用户是同一人，此时用户记录仍完整存在
+
+**对后续流程的影响**:
+- `userId` 传入 `deleteUserById` 用于身份校验（密码比对、判断删自己/删别人）
+- `isServerAdmin` 传入 `deleteUserById`，决定是否跳过所有权限校验
+
+**对 createdById 级联的影响**: 纯只读操作，不触发任何级联。
+
+---
+
+### 3.5 Node 4: verifySubscription 订阅校验
+
+代码位置: [index.ts#L43-L65](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L43-L65) + [verifySubscription.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/stripe/verifySubscription.ts)
+
+```typescript
+if (STRIPE_SECRET_KEY) {
+  const user = await prisma.user.findUnique({
+    where: { id: token.id },
+    include: { subscriptions: true, parentSubscription: true },
+  });
+
+  if (user) {
+    const subscribedUser = await verifySubscription(user);
+    if (!subscribedUser) {
+      return res.status(401).json({
+        response: "You are not a subscriber...",
+      });
+    }
+  } else {
+    return res.status(404).json({ response: "User not found." });
+  }
+}
+```
+
+> ⚠️ 注意：只有配置了 `process.env.STRIPE_SECRET_KEY` 才会执行此校验。未配置 Stripe 的自部署实例直接跳过。
+
+#### verifySubscription 内部逻辑
+
+```typescript
+export default async function verifySubscription(user) {
+  if (!user) return null;
+
+  const TRIAL_PERIOD_DAYS = process.env.NEXT_PUBLIC_TRIAL_PERIOD_DAYS || 14;
+  const REQUIRE_CC = process.env.NEXT_PUBLIC_REQUIRE_CC === "true";
+
+  const trialEndTime = new Date(user.createdAt).getTime() 
+    + (1 + Number(TRIAL_PERIOD_DAYS)) * 86400000;
+  const daysLeft = Math.floor((trialEndTime - Date.now()) / 86400000);
+
+  // Checkpoint 4a: 无订阅、无父订阅、试用期已过（或要求 CC）
+  if (!user.subscriptions && !user.parentSubscription 
+      && (REQUIRE_CC || daysLeft <= 0)) {
+    return null;
+  }
+
+  // Checkpoint 4b: 父订阅有效 → 直接通过（子账号）
+  if (user.parentSubscription?.active) {
+    return user;
+  }
+
+  // Checkpoint 4c: 自身订阅过期，但可能 Stripe 侧已更新
+  if ((!user.subscriptions?.active 
+       || new Date() > user.subscriptions.currentPeriodEnd)
+      && (REQUIRE_CC || daysLeft <= 0)) {
+    // 调用 Stripe API 按邮箱重新查询最新订阅状态
+    const subscription = await checkSubscriptionByEmail(user.email);
+
+    if (!subscription || !subscription.stripeSubscriptionId ...) {
+      return null;  // Checkpoint 4d: Stripe 侧也没有效订阅
+    }
+
+    // 将 Stripe 最新状态同步回本地数据库（upsert）
+    const { active, stripeSubscriptionId, currentPeriodStart, 
+            currentPeriodEnd, quantity } = subscription;
+    await prisma.subscription
+      .upsert({ where: { userId: user.id }, create: {...}, update: {...} })
+      .catch((err) => console.log(err));
+  }
+
+  return user;
+}
+```
+
+#### checkSubscriptionByEmail 逻辑
+
+代码位置: [checkSubscriptionByEmail.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/stripe/checkSubscriptionByEmail.ts)
+
+```typescript
+export default async function checkSubscriptionByEmail(email: string) {
+  if (!STRIPE_SECRET_KEY) return null;
+
+  const stripe = stripeSDK();
+  const customers = await stripe.customers.list({
+    email: email.toLowerCase(),
+    expand: ["data.subscriptions.data.items"],
+  });
+
+  const sub = customers.data[0]?.subscriptions?.data?.[0];
+  const item = sub?.items.data[0];
+  if (!sub || !item) return null;
+
+  return {
+    active: sub.status === "active" || sub.status === "trialing",
+    stripeSubscriptionId: sub.id,
+    currentPeriodStart: item.current_period_start * 1000,
+    currentPeriodEnd: item.current_period_end * 1000,
+    quantity: item.quantity ?? 1,
+  };
+}
+```
+
+**订阅校验通过条件汇总**（满足任一即可）:
+1. 未配置 `STRIPE_SECRET_KEY`（自部署免费模式）
+2. 用户处于试用期内（`daysLeft > 0`）且不强制要求绑卡
+3. 用户有 `parentSubscription`（子账号，父订阅有效）
+4. 用户自身 `subscriptions.active === true` 且 `currentPeriodEnd > now`
+5. 本地订阅过期，但 Stripe API 查询显示有有效订阅（会自动同步回本地）
+
+**对 createdById 级联的影响**:
+- 返回 null（无有效订阅）→ 路由层 return 401，**无数据库写操作，createdById 级联不触发**
+- 特殊副作用：verifySubscription 可能对 Subscription 表执行 `upsert`（同步 Stripe 状态），这是一个写入操作，但只是修改订阅记录，**与 User 及 createdById 级联无关**
+- 注意：这是**进入删除事务之前唯一可能产生副作用的节点**（Subscription upsert），但其错误被 `.catch` 吞掉，不影响后续删除流程
+
+---
+
+### 3.6 Node 5: DELETE 分支分发
+
+代码位置: [index.ts#L79-L93](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L79-L93)
+
+```typescript
+} else if (req.method === "DELETE") {
+  if (process.env.NEXT_PUBLIC_DEMO === "true")
+    return res.status(400).json({
+      response: "This action is disabled because this is a read-only demo of Linkwarden.",
+    });
+
+  const updated = await deleteUserById(userId, req.body, isServerAdmin, queryId);
+  return res.status(updated.status).json({ response: updated.response });
+}
+```
+
+#### Node 5a: Demo 模式禁用
+
+```typescript
+if (process.env.NEXT_PUBLIC_DEMO === "true")
+  return res.status(400).json({ response: "This action is disabled..." });
+```
+
+- 环境变量 `NEXT_PUBLIC_DEMO` 设为 "true" 时（官方 Demo 站），所有 DELETE 请求被硬拦截
+- **对 createdById 级联的影响**: 直接 return 400，**完全不触发**
+
+#### Node 5b: 调用 deleteUserById
+
+```typescript
+const updated = await deleteUserById(userId, req.body, isServerAdmin, queryId);
+```
+
+参数传入控制器：
+- `userId` = 当前登录用户 ID（来自 token）
+- `req.body` = `{ password, cancellation_details? }`
+- `isServerAdmin` = 路由层计算的管理员标志
+- `queryId` = URL 中的目标用户 ID
+
+只有到达此处，才有可能触发删除事务和 createdById 级联。具体内部逻辑见第 4 节。
+
+---
+
+### 3.7 前置校验链各节点对 createdById 级联触发的汇总
+
+| 节点 | 校验内容 | 失败状态码 | 失败时 createdById 级联是否触发 | 失败时是否有任何 DB 写入 |
+|------|---------|-----------|-------------------------------|------------------------|
+| 1. queryId 解析 | URL 参数合法性 | 400 | ❌ 否 | ❌ 否 |
+| 2. verifyToken | 登录状态、会话过期、token 撤销 | 401 | ❌ 否 | ❌ 否（仅读 AccessToken） |
+| 3. 用户查询 + 管理员判定 | 读取用户记录 | —（无失败分支） | 不适用 | ❌ 否（只读） |
+| 4. verifySubscription | 订阅有效性 | 401 / 404 | ❌ 否 | ⚠️ 可能写 Subscription 表（与 createdById 无关） |
+| 5a. Demo 模式 | 是否为演示站点 | 400 | ❌ 否 | ❌ 否 |
+| 5b. 进入 deleteUserById | — | — | ✅ 由内部逻辑决定 | ✅ 是 |
+
+---
+
+## 4. deleteUserById 代码级分支逻辑深度分析
 
 代码位置: [deleteUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts)
 
 调用入口: [pages/api/v1/users/[id]/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L86-L91)
 
-### 3.1 函数签名与参数含义
+### 4.1 函数签名与参数含义
 
 ```typescript
 export default async function deleteUserById(
@@ -192,7 +519,7 @@ export type DeleteUserBody = {
 };
 ```
 
-### 3.2 queryId 与 userId 的使用差异对照
+### 4.2 queryId 与 userId 的使用差异对照
 
 | 代码位置 | 使用变量 | 用途 |
 |---------|---------|------|
@@ -212,7 +539,7 @@ export type DeleteUserBody = {
 - `userId` = 「我是谁」（操作者身份）—— 用于权限校验、密码比对、订阅归属判断
 - `queryId` = 「操作谁」（目标对象）—— 用于数据查询、文件删除、Stripe 操作、最终删除数据库记录
 
-### 3.3 完整决策树（管理员 vs 非管理员路径）
+### 4.3 完整决策树（管理员 vs 非管理员路径）
 
 ```
 deleteUserById(userId, body, isServerAdmin, queryId)
@@ -266,7 +593,7 @@ deleteUserById(userId, body, isServerAdmin, queryId)
     仅 isServerAdmin=true 或 Branch 2A（用户删自己且密码正确）能到达此处
 ```
 
-### 3.4 子账号移除时的提前返回（Branch 2B）
+### 4.4 子账号移除时的提前返回（Branch 2B）
 
 代码位置: [deleteUserById.ts#L60-L103](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L60-L103)
 
@@ -299,7 +626,7 @@ return { response: "Account removed from subscription.", status: 200 };
 - 子账号后续登录时会因为没有有效订阅而被拦截（参考路由层 [index.ts#L43-L65](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/pages/api/v1/users/[id]/index.ts#L43-L65) 的 `verifySubscription` 检查）
 - **不进入 Step 3 的删除事务**，因此不会触发任何 createdById 级联
 
-### 3.5 删除事务内部逻辑（Step 3）
+### 4.5 删除事务内部逻辑（Step 3）
 
 代码位置: [deleteUserById.ts#L107-L205](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L107-L205)
 
@@ -342,7 +669,7 @@ $transaction(async (prisma) => {
   │
   └─ 3.5 最终删除用户（L198-L201）
       prisma.user.delete({ where: { id: queryId } })
-      └─ 触发数据库级联删除，详见第 4 节分析
+      └─ 触发数据库级联删除，详见第 5 节分析
 
 }).catch((err) => console.log(err))
    ⚠️ 整个事务的任何错误都被吞掉（只 log，不抛出）
@@ -352,9 +679,9 @@ return 200 "User account and all related data deleted successfully."
 
 ---
 
-## 4. createdById 在删除时的实际影响与事务报错分析
+## 5. createdById 在删除时的实际影响与事务报错分析
 
-### 4.1 删除 User 的完整级联路径
+### 5.1 删除 User 的完整级联路径
 
 #### 数据库级联效果
 
@@ -375,7 +702,7 @@ return 200 "User account and all related data deleted successfully."
 | Account.userId | Cascade | OAuth 账户被删除 |
 | _LinkToTag / _PinnedLinks | Cascade | 中间表关联自动清理 |
 
-### 4.2 事务报错对 createdById 级联判断的影响
+### 5.2 事务报错对 createdById 级联判断的影响
 
 事务中有**两层独立的错误捕获**，影响各不相同：
 
@@ -422,7 +749,7 @@ await prisma.$transaction(
 | 头像文件 | 已被删除 | 用户头像显示破裂，但数据库中用户记录仍存在 |
 | 数据库 | 事务回滚，User/Collection/Link/Tag **全部保留** | 数据完整性未受损，但与外部资源脱节 |
 
-### 4.3 应用层清理 vs 数据库级联的覆盖缺口
+### 5.3 应用层清理 vs 数据库级联的覆盖缺口
 
 在 [deleteUserById.ts#L111-L118](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L111-L118)：
 
@@ -443,7 +770,7 @@ await meiliClient?.index("links").deleteDocuments(linkIds);
 2. **归档文件残留**：这些 Link 的归档文件（archives/{collectionId}/{linkId}.*）不会被删除，磁盘残留
 3. **与子账号移除路径的叠加**：子账号提前返回路径完全不触发数据库删除，因此也不会有 createdById CASCADE 问题，但该路径本身只做 `parentSubscription.disconnect`
 
-### 4.4 删除 Collection / Link / Tag 时 createdById 的影响
+### 5.4 删除 Collection / Link / Tag 时 createdById 的影响
 
 #### 删除 Collection
 代码位置: [deleteCollectionById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts)
@@ -463,11 +790,11 @@ await meiliClient?.index("links").deleteDocuments(linkIds);
 
 ---
 
-## 5. 迁移演进过程
+## 6. 迁移演进过程
 
 迁移目录: [packages/prisma/migrations/](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/packages/prisma/migrations/)
 
-### 5.1 初始版本（20230719_init）
+### 6.1 初始版本（20230719_init）
 迁移文件: [20230719181459_init/migration.sql](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/packages/prisma/migrations/20230719181459_init/migration.sql)
 
 **初始外键级联策略**:
@@ -489,7 +816,7 @@ await meiliClient?.index("links").deleteDocuments(linkIds);
 
 ---
 
-### 5.2 唯一约束的移除
+### 6.2 唯一约束的移除
 
 #### 收藏夹名唯一约束移除（20240218）
 迁移文件: [20240218080348_allow_duplicate_collection_names/migration.sql](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/packages/prisma/migrations/20240218080348_allow_duplicate_collection_names/migration.sql)
@@ -508,7 +835,7 @@ DROP INDEX "AccessToken_name_userId_key";
 
 ---
 
-### 5.3 子收藏夹功能引入（20240125）
+### 6.3 子收藏夹功能引入（20240125）
 迁移文件: [20240125124457_added_subcollection_relations/migration.sql](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/packages/prisma/migrations/20240125124457_added_subcollection_relations/migration.sql)
 
 ```sql
@@ -520,7 +847,7 @@ ALTER TABLE "Collection" ADD CONSTRAINT ... FOREIGN KEY ("parentId")
 
 ---
 
-### 5.4 createdById 字段完整迁移时间线
+### 6.4 createdById 字段完整迁移时间线
 
 这是 Collection.createdById 与 Link.createdById 行为产生**分歧**的关键演化过程：
 
@@ -591,7 +918,7 @@ ALTER TABLE "Link" ADD CONSTRAINT "Link_createdById_fkey"
 
 ---
 
-### 5.5 全局级联策略变更（20250318）
+### 6.5 全局级联策略变更（20250318）
 
 这是最关键的迁移系列，将大部分 `RESTRICT` / `SET NULL` 改为 `CASCADE`，但 **Collection.createdById 被遗漏**。
 
@@ -618,7 +945,7 @@ ALTER TABLE "Link" ADD CONSTRAINT "Link_createdById_fkey"
 
 ---
 
-### 5.6 多对多连接表主键化（20250627 upgrade_to_v6）
+### 6.6 多对多连接表主键化（20250627 upgrade_to_v6）
 迁移文件: [20250627132552_upgrade_to_v6/migration.sql](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/packages/prisma/migrations/20250627132552_upgrade_to_v6/migration.sql)
 
 ```sql
@@ -631,9 +958,9 @@ DROP INDEX "_PinnedLinks_AB_unique";
 
 ---
 
-## 6. 业务逻辑中的补充清理（非数据库级联）
+## 7. 业务逻辑中的补充清理（非数据库级联）
 
-### 6.1 删除收藏夹 [deleteCollectionById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts)
+### 7.1 删除收藏夹 [deleteCollectionById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/collections/collectionId/deleteCollectionById.ts)
 
 ```
 事务内执行:
@@ -646,7 +973,7 @@ DROP INDEX "_PinnedLinks_AB_unique";
 └─ 删除该 Collection（触发数据库级联：删除 Link → 删除 Highlight、解除 Tag 关联等）
 ```
 
-### 6.2 删除标签 [deleteTagById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/tags/tagId/deleteTagById.ts)
+### 7.2 删除标签 [deleteTagById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/tags/tagId/deleteTagById.ts)
 
 ```
 ├─ 权限校验（ownerId === userId）
@@ -654,7 +981,7 @@ DROP INDEX "_PinnedLinks_AB_unique";
 └─ 将受影响 Link 的 indexVersion 置 null（触发 Meilisearch 重新索引）
 ```
 
-### 6.3 删除链接 [deleteLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/links/linkId/deleteLinkById.ts)
+### 7.3 删除链接 [deleteLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/links/linkId/deleteLinkById.ts)
 
 ```
 ├─ 权限校验（所有者或有 canDelete 权限的成员）
@@ -665,9 +992,9 @@ DROP INDEX "_PinnedLinks_AB_unique";
 
 ---
 
-## 7. 唯一约束分析
+## 8. 唯一约束分析
 
-### 7.1 当前存在的唯一约束
+### 8.1 当前存在的唯一约束
 
 | 模型 | 约束字段 | 说明 |
 |------|---------|------|
@@ -687,7 +1014,7 @@ DROP INDEX "_PinnedLinks_AB_unique";
 | _LinkToTag | `(A, B)` | 复合主键 |
 | _PinnedLinks | `(A, B)` | 复合主键 |
 
-### 7.2 关键业务依赖的唯一约束
+### 8.2 关键业务依赖的唯一约束
 
 **Tag(name, ownerId)** — 在 [createOrUpdateTags.ts](file:///d:/fz/0601/solo-dogfeeding/code/94-linkwarden/apps/web/lib/api/controllers/tags/createOrUpdateTags.ts#L12-L18) 中使用 `upsert`:
 
@@ -702,9 +1029,9 @@ prisma.tag.upsert({
 
 ---
 
-## 8. 回滚风险分析（校正版）
+## 9. 回滚风险分析（校正版）
 
-### 8.1 高风险迁移（不可逆或可能丢失数据）
+### 9.1 高风险迁移（不可逆或可能丢失数据）
 
 | 迁移 | 风险等级 | 原因 |
 |------|---------|------|
@@ -715,18 +1042,18 @@ prisma.tag.upsert({
 | **20240218 移除 Collection 唯一约束** | ⚠️ 中 | 一旦用户创建了同名收藏夹，再恢复唯一约束会因数据冲突失败，需先手动清理重名数据。 |
 | **20250627 多对多表主键化** | ⚠️ 中 | 如果连接表中存在重复行（尽管有唯一索引不太可能），加主键会失败。回退需删主键再建唯一索引。 |
 
-### 8.2 Link.createdById CASCADE 的回滚专项分析
+### 9.2 Link.createdById CASCADE 的回滚专项分析
 
 **当前状态**: Link.createdById 是 ON DELETE CASCADE
 
 **回滚方案（假设要改回 SET NULL）**:
 1. 数据库层面：`ALTER TABLE "Link" DROP CONSTRAINT ...; ALTER TABLE "Link" ADD CONSTRAINT ... ON DELETE SET NULL;`
 2. 但此时已经因 CASCADE 被删除的 Link **无法恢复**
-3. 而且，应用层 deleteUserById.ts 的清理逻辑也不完整（见 4.3 节），即使回滚级联策略，也需要同时修复清理代码
+3. 而且，应用层 deleteUserById.ts 的清理逻辑也不完整（见 5.3 节），即使回滚级联策略，也需要同时修复清理代码
 
 **更安全的方向**: 保持 SET NULL，删除用户时只清空 Link.createdById，保留链接数据（因为链接的真正归属是通过 Collection.ownerId 决定的，而非 createdById）。
 
-### 8.3 事务报错相关风险
+### 9.3 事务报错相关风险
 
 由于 deleteUserById 中事务外副作用（Meilisearch、文件系统）先于数据库删除执行，且整个事务的 `.catch` 只 log 不抛出，即使事务完全回滚，函数仍然返回 200 "deleted successfully"，这意味着：
 
@@ -734,7 +1061,7 @@ prisma.tag.upsert({
 2. **静默不一致**：没有告警、没有重试、没有补偿逻辑，只能靠用户手动发现
 3. **createdById 级联判断失真**：调用方以为 createdById 已清理，实际数据库未动
 
-### 8.4 唯一约束回滚冲突模式
+### 9.4 唯一约束回滚冲突模式
 
 典型场景（Tag 为例，目前仍保留唯一约束）:
 1. 用户创建标签 "work"
@@ -744,7 +1071,7 @@ prisma.tag.upsert({
 
 **Collection 已实际发生此模式**: 20240218 已永久移除唯一约束，且代码逻辑不再依赖。
 
-### 8.5 Prisma 迁移本身的回滚限制
+### 9.5 Prisma 迁移本身的回滚限制
 
 Prisma Migrate **不提供自动回滚机制**。每个 `migration.sql` 仅包含正向变更。回滚方案:
 - 依赖数据库备份（PITR，时间点恢复）
@@ -753,7 +1080,7 @@ Prisma Migrate **不提供自动回滚机制**。每个 `migration.sql` 仅包�
 
 ---
 
-## 9. 历史数据兼容性总结
+## 10. 历史数据兼容性总结
 
 | 变更 | 对历史数据的处理 | 兼容性 |
 |------|----------------|--------|
@@ -769,9 +1096,9 @@ Prisma Migrate **不提供自动回滚机制**。每个 `migration.sql` 仅包�
 
 ---
 
-## 10. 关键发现与建议总结
+## 11. 关键发现与建议总结
 
-### 10.1 已确认的代码行为
+### 11.1 已确认的代码行为
 
 1. **Collection.createdById 与 Link.createdById 行为不一致**
    - Collection.createdById → SET NULL（schema.prisma 未显式指定，Prisma 对 nullable 外键默认为 SetNull，与最后一次迁移 20241030 一致）
@@ -796,7 +1123,7 @@ Prisma Migrate **不提供自动回滚机制**。每个 `migration.sql` 仅包�
    - 整个事务的 `.catch` 只 log 不抛出，函数始终返回 200
    - 一旦事务中间报错回滚，Meilisearch 和文件已删，但数据库保留，前端被误导
 
-### 10.2 建议
+### 11.2 建议
 
 1. **统一 createdById 的级联策略**：考虑将 Link.createdById 也改为 SET NULL，与 Collection.createdById 保持一致。链接的归属应由 Collection.ownerId 决定，而不是创建者。删除用户不应导致他人收藏夹中的数据丢失。
 
@@ -819,7 +1146,7 @@ Prisma Migrate **不提供自动回滚机制**。每个 `migration.sql` 仅包�
 
 ---
 
-## 11. 关键代码文件索引
+## 12. 关键代码文件索引
 
 | 文件 | 说明 |
 |------|------|
