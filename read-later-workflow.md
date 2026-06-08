@@ -794,6 +794,234 @@ nextCursor:
 
 ---
 
+### 8. 筛选条件的 AND/OR 组合逻辑深度分析
+
+这是整个查询设计中**最容易产生语义混淆**的部分。`collectionId`、`tagId`、`pinnedOnly` 和搜索条件之间并非全是 AND 关系——`tagId` 和 `pinnedOnly` + 搜索条件被放在了一个 **OR 分支**中，且空条件 `{}` 在 Prisma OR 中的特殊语义会导致某些筛选条件被静默忽略。
+
+---
+
+#### 8.1 PostgreSQL Fallback 路径的 where 结构
+
+见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L196-L227)
+
+```typescript
+where: {
+  AND: [
+    // 第一组：权限过滤（AND 关系）
+    ...(userId
+      ? [{ collection: { OR: [{ ownerId: userId }, { members: { some: { userId } } }] }]
+      : []),
+
+    // 第二组：collectionId 过滤（AND 关系）
+    ...collectionCondition,   // 如果有 query.collectionId，就是一个 { collection: { id } } 对象
+
+    // 第三组：tagId OR (pinnedOnly AND/OR 搜索条件) —— 这里是 OR！
+    {
+      OR: [
+        ...tagCondition,      // 如果有 query.tagId，就是 [{ tags: { some: { id } } }]
+
+        {
+          // 嵌套层：pinnedCondition 和 searchConditions 的关系
+          // 有搜索词 → OR；无搜索词 → AND
+          [query.searchQueryString ? "OR" : "AND"]: [
+            pinnedCondition,   // 有 pinnedOnly=true → { pinnedBy: { some: { id: userId } } }
+                               // 无 pinnedOnly → {} （空对象！）
+            ...searchConditions, // name/url/description/tags.name 的 contains 条件
+          ],
+        },
+      ],
+    },
+  ],
+}
+```
+
+**整体结构可视化**：
+```
+AND
+├── 权限过滤
+├── collectionId（如果有）
+└── OR
+    ├── tagId（如果有）
+    └── (有搜索词 ? OR : AND)
+        ├── pinnedOnly（如果有，否则 {}）
+        ├── name 包含关键词（如果有）
+        ├── url 包含关键词（如果有）
+        ├── description 包含关键词（如果有）
+        └── tags.name 包含关键词（如果有）
+```
+
+---
+
+#### 8.2 Meilisearch 路径回查阶段的 where 结构
+
+见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L96-L125)
+
+```typescript
+where: {
+  id: { in: meiliIds },   // 限定在 Meilisearch 返回的 ID 中
+  AND: [
+    // 第一组：权限过滤（AND）
+    ...(userId ? [...] : []),
+
+    // 第二组：collectionId（AND）
+    ...collectionCondition,
+
+    // 第三组：tagId OR pinnedOnly —— 注意：这里没有搜索条件！
+    // 搜索词已经在 Meilisearch 阶段处理了
+    {
+      OR: [
+        ...tagCondition,
+        {
+          ...pinnedCondition,   // 展开后要么是 { pinnedBy: ... }，要么是 {}
+        },
+      ],
+    },
+  ],
+}
+```
+
+**整体结构可视化**：
+```
+AND
+├── id IN (meiliIds)
+├── 权限过滤
+├── collectionId（如果有）
+└── OR
+    ├── tagId（如果有）
+    └── pinnedOnly（如果有，否则 {}）
+```
+
+---
+
+#### 8.3 空对象 `{}` 在 Prisma OR 中的语义
+
+这是最关键的隐含规则：
+
+> 在 Prisma 的 where 条件中，空对象 `{}` 放在 OR 数组中时，**整个 OR 表达式恒为真**（相当于 `true OR anything = true`）。
+>
+> 因为 `{}` 表示"无条件"——所有记录都满足。
+
+这个语义直接导致了以下问题。
+
+---
+
+#### 8.4 各种参数组合的实际语义详解
+
+下表列出了常见参数组合下，代码实际执行的筛选语义 vs 用户通常期望的语义。
+
+| # | 参数组合 | 代码实际语义 | 用户通常期望的语义 | 是否匹配 |
+|---|---------|------------|-----------------|---------|
+| 1 | **仅 collectionId** | `AND(权限, collectionId=X)` → ✅ 只看集合 X 的链接 | 同左 | ✅ 匹配 |
+| 2 | **仅 tagId** | `AND(权限, OR(tagId=Y, {}))` → `AND(权限, true)` → **tagId 被完全忽略！** | 只看标签 Y 的链接 | ❌ 严重不匹配 |
+| 3 | **仅 pinnedOnly=true** | `AND(权限, OR([], { pinnedBy }))` → `AND(权限, pinnedOnly)` → ✅ 只看置顶 | 同左 | ✅ 匹配 |
+| 4 | **仅搜索词** | `AND(权限, OR([], OR({}, name, url, desc, tag)))` → `AND(权限, true)` → **搜索被完全忽略！** | 匹配关键词的链接 | ❌ 严重不匹配 |
+| 5 | **collectionId + tagId** | `AND(权限, collectionId, OR(tagId, {}))` → **tagId 被忽略**，只按集合过滤 | 集合 X 中标签 Y 的链接 | ❌ 不匹配 |
+| 6 | **collectionId + pinnedOnly** | `AND(权限, collectionId, OR([], pinnedOnly))` → ✅ 集合 X 中的置顶 | 同左 | ✅ 匹配 |
+| 7 | **collectionId + 搜索词** | `AND(权限, collectionId, OR([], OR({}, name, ...)))` → **搜索被忽略** | 集合 X 中匹配关键词的 | ❌ 不匹配 |
+| 8 | **tagId + pinnedOnly（无搜索词）** | `AND(权限, OR(tagId, AND(pinnedOnly)))` → `OR(tagId, pinnedOnly)` → **有标签 Y OR 被置顶** | 有标签 Y **AND** 被置顶 | ❌ 语义变为 OR |
+| 9 | **tagId + 搜索词** | `AND(权限, OR(tagId, OR({}, name, ...)))` → **两者都被忽略** | 有标签 Y **AND** 匹配关键词 | ❌ 严重不匹配 |
+| 10 | **pinnedOnly + 搜索词** | `AND(权限, OR([], OR(pinnedOnly, name, ...)))` → `OR(pinnedOnly, 搜索匹配)` → **置顶 OR 匹配搜索** | 在置顶中搜索（AND 关系） | ❌ 语义变为 OR |
+| 11 | **tagId + pinnedOnly + 搜索词** | `AND(权限, OR(tagId, OR(pinnedOnly, name, ...)))` → **tagId OR pinnedOnly OR 搜索** | tagId **AND** pinnedOnly **AND** 搜索 | ❌ 完全不同 |
+| 12 | **三者 + collectionId** | `AND(权限, collectionId, OR(tagId, OR(pinnedOnly, ...)))` → 在集合 X 中：tagId OR pinnedOnly OR 搜索 | 在集合 X 中：三者 AND | ❌ 完全不同 |
+
+---
+
+#### 8.5 问题案例详细分析
+
+##### 案例 A：仅指定 tagId（#2）
+
+代码：
+```typescript
+// tagCondition = [{ tags: { some: { id: 123 } } }]
+// pinnedCondition = {}（因为没有 pinnedOnly）
+// searchConditions = []（没有搜索词）
+
+OR: [
+  { tags: { some: { id: 123 } } },
+  { AND: [{}] }   // → 等价于 true
+]
+```
+
+结果：`OR(有标签123, true)` = `true`，tagId 条件完全失效。
+
+---
+
+##### 案例 B：tagId + pinnedOnly（无搜索词，#8）
+
+代码：
+```typescript
+OR: [
+  { tags: { some: { id: 123 } } },
+  { AND: [{ pinnedBy: { some: { id: 99 } } }] }
+]
+```
+
+结果：`OR(有标签123, 被用户99置顶)`
+
+**语义偏差**：用户在标签页点击"只看置顶"，期望的是"标签123的链接中，被我置顶的那些"（AND）。但实际返回的是"标签123的所有链接 + 被我置顶的所有链接（无论什么标签）"（OR）。
+
+---
+
+##### 案例 C：pinnedOnly + 搜索词（#10）
+
+代码（PostgreSQL fallback）：
+```typescript
+OR: [
+  // tagCondition 是空数组 → 无元素
+  {
+    OR: [
+      { pinnedBy: { some: { id: 99 } } },
+      { name: { contains: "react" } },
+      { url: { contains: "react" } },
+      // ...
+    ],
+  }
+]
+```
+
+结果：`OR(被置顶, name含react, url含react, ...)`
+
+**语义偏差**：用户在置顶页面搜索"react"，期望的是"我置顶的链接中包含react的"（AND）。但实际返回的是"所有我置顶的链接 + 所有含react的链接（无论是否置顶）"（OR）。
+
+---
+
+##### 案例 D：仅搜索词（#4，仅 PostgreSQL fallback 路径）
+
+代码：
+```typescript
+OR: [
+  // tagCondition 空
+  {
+    OR: [
+      {},   // pinnedCondition = {}
+      { name: { contains: "react" } },
+      // ...
+    ]
+  }
+]
+```
+
+结果：`OR({}, name含react, ...)` = `true`，搜索条件完全失效。
+
+**注意**：这个案例在 Meilisearch 路径不会发生，因为搜索词在 Meilisearch 阶段已经被过滤了，回查阶段没有 searchConditions。
+
+---
+
+#### 8.6 两条路径的组合逻辑差异总结
+
+| 维度 | Meilisearch 路径（回查阶段） | PostgreSQL Fallback 路径 |
+|------|--------------------------|------------------------|
+| 搜索条件位置 | Meilisearch 阶段处理，回查阶段不出现 | 与 pinnedCondition 嵌套在一起 |
+| tagId 和 pinnedOnly 的关系 | OR | OR（但搜索词会影响嵌套层的 AND/OR） |
+| **仅 tagId 的结果** | ❌ tagId 被 `{}` 吞掉（OR 中含空对象） | ❌ 同上 |
+| **仅搜索词的结果** | ✅ 正常（Meilisearch 阶段处理） | ❌ 搜索被 `{}` 吞掉 |
+| **pinnedOnly + 搜索词** | ⚠️ 回查阶段：`OR([], pinnedOnly)` → 只看 pinnedOnly<br>搜索匹配在 Meilisearch 阶段已过滤，**实际效果是 AND**（巧合正确） | ❌ `OR(pinnedOnly, 搜索匹配)` 语义变成 OR |
+| **tagId + pinnedOnly** | ❌ OR（应是 AND） | ❌ OR（应是 AND） |
+
+**最讽刺的一点**：Meilisearch 路径的两阶段筛选意外地让"pinnedOnly + 搜索词"获得了正确的 AND 语义——因为搜索词在 Meilisearch 阶段就已经过滤了，回查阶段只剩 pinnedOnly。但这是设计巧合，不是有意为之。
+
+---
+
 ## 七、返回数据结构与用户隔离
 
 ### 1. pinnedBy 字段的用户级过滤
@@ -1019,6 +1247,16 @@ PostgreSQL 回查完整数据 ◄───────────────�
     - 搜索框输入 `pinned:true`（高级语法）→ Meilisearch 阶段过滤，分页正常
     - API 参数 `pinnedOnly=true`（如置顶页面）→ 仅 PostgreSQL 回查阶段过滤，分页异常
     - `tag:` 高级语法（按标签名） vs `tagId` 参数（按标签 ID）同理
+12. **⚠️⚠️ 筛选条件 AND/OR 组合逻辑严重错误（最高优先级）**：
+    - `tagId` 和 `pinnedOnly` + 搜索条件被放在 **OR 分支**中，而非用户期望的 AND
+    - 空对象 `{}` 在 Prisma OR 中恒为真，导致单独使用 `tagId`、单独使用搜索词（fallback 路径）时筛选条件被**完全静默忽略**
+    - 12 种常见参数组合中，仅 3 种（仅 collectionId、仅 pinnedOnly、collectionId+pinnedOnly）语义正确，其余 9 种均有偏差
+    - 典型错误：
+      - 仅指定 tagId → 条件完全失效，返回所有链接
+      - 标签页勾选"只看置顶" → 返回"该标签的链接 OR 置顶链接"（期望 AND）
+      - 置顶页面搜索 → 返回"置顶链接 OR 匹配搜索词的链接"（期望 AND，fallback 路径）
+      - 仅搜索词（fallback 路径）→ 搜索完全失效，返回所有链接
+    - 详见第六章第 8 节的完整分析表和案例拆解
 
 ### 🔧 潜在改进方向
 
@@ -1034,3 +1272,17 @@ PostgreSQL 回查完整数据 ◄───────────────�
    - 方案 B：将 `nextCursor` 改为基于最终 `links.length` 判断；或当二次过滤后数量不足时，循环查询 Meilisearch 下一批 ID 直到凑够 limit 条或无更多结果
    - 方案 C：统一 `pinned:` 高级语法和 `pinnedOnly` 参数的处理路径，避免行为不一致
 9. 统一标签和集合的两种过滤入口（按 ID vs 按名称），消除用户体验差异
+10. **修复筛选条件 AND/OR 组合逻辑（最高优先级）**：
+    - **核心修复**：将 `tagCondition`、`pinnedCondition`、`searchConditions` 全部移到 AND 数组顶层，所有条件默认为 AND 关系；只有 searchConditions 内部的 name/url/description/tags 匹配保持 OR
+    - **避免空对象 `{}`**：当 `pinnedOnly=false` 时，不要在 OR 中放入 `{}`，而是直接不展开 pinnedCondition；或者改用条件判断 `if (query.pinnedOnly) tagCondition.push(...)`
+    - 修复后正确的 where 结构应为：
+      ```
+      AND [
+        权限过滤,
+        collectionCondition,        // AND
+        tagCondition,               // AND（如果有）
+        pinnedCondition,            // AND（如果有）
+        OR [name, url, desc, tags], // 搜索词各字段之间 OR（如果有）
+      ]
+      ```
+    - 同时需要同步修改旧版 getLinks.ts 中的相同逻辑
