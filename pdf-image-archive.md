@@ -164,21 +164,68 @@ format → suffix 的映射在 `apps/web/lib/shared/getSuffixFromFormat.ts`。
 
 ---
 
-## 五、preview / unavailable 的回写关系与前端三态渲染
+## 五、preview 状态机深度分析
 
-### 5.1 "unavailable" 写入的五种触发路径
+preview 字段存在 **三态**：`null`（队列中/待生成）、路径字符串（成功）、`"unavailable"`（失败或不支持）。不同入链路径的回写规则存在精细差异，尤其是 `generatePreview` 的异常分支与超限分支、`allBroken` 对 preview 的特殊处理。
 
-归档字段的最终值不是成功路径就是 `"unavailable"`，`null` 只是**过渡态**，最终都会被收敛。
+### 5.1 generatePreview：异常与超限的不对称回写
 
-| 触发路径 | 代码位置 | 写入字段 |
+`packages/lib/generatePreview.ts` 内部分三条退出路径，只有其中一条会主动写 DB：
+
+| 退出路径 | 触发条件 | DB 行为 | 返回值 | preview 最终状态依赖 |
+|---|---|---|---|---|
+| **入参不合法** | `buffer`/`collectionId`/`linkId` 任一为 falsy（L10、L54） | 不写 DB | `false` | 若在 worker 流程 → finally 收敛为 `"unavailable"`；若在 API 上传流程 → **永久 `null`** |
+| **超限（Buffer size exceeded）** | 压缩后 Jimp Buffer > `PREVIEW_MAX_BUFFER`（默认 10MB，L22-L34） | **显式写 `preview: "unavailable"`** | `false` | 已落定为 `"unavailable"` |
+| **成功** | 写入文件并写路径（L36-L48） | 写 `preview: 路径字符串` | `true` | 已落定为路径 |
+| **异常（catch 块）** | `Jimp.read` 解码失败、`getBufferAsync` 抛错等（L49-L51） | **不写 DB**，只打 `console.error` | `false` | 若在 worker 流程 → finally 收敛为 `"unavailable"`；若在 API 上传流程 → **永久 `null`** |
+
+关键差异：**超限是唯一主动回写 "unavailable" 的失败路径**；解码异常等只吞掉错误、留 null 给上层收敛。这意味着如果手动上传图片时 Jimp 解码失败，preview 会永久停留在 null，前端一直显示 loading spinner（因为 API 上传无 finally 兜底）。
+
+### 5.2 handleArchivePreview（HTML 页面归档）：og:image 主路径与 Playwright fallback 的级联
+
+`apps/worker/lib/preservationScheme/handleArchivePreview.ts` 的执行是一个两级瀑布流：
+
+```
+尝试 og:image 路径
+     │
+     ├─ og:image 不存在 → 直接进入 fallback
+     │
+     ├─ og:image URL 不安全（SSRF 拦截 UnsafeUrlError）→ 错误被吞，previewGenerated=false → 进入 fallback
+     │
+     ├─ og:image 其他异常（网络错误等）→ 向上抛出，走 archiveHandler catch → finally 收敛
+     │
+     └─ og:image 成功加载 → 调用 generatePreview(buffer, ...)
+             │
+             ├─ generatePreview 成功 → previewGenerated=true → ✅ 跳过 fallback
+             │
+             ├─ generatePreview 超限 → DB 已写 "unavailable"，previewGenerated=false
+             │     └─ 进入 fallback（条件：!previewGenerated && !link.preview?.startsWith("archive")
+             │           "unavailable" 确实不以 "archive" 开头 ⇒ 会覆盖写新的截图
+             │
+             └─ generatePreview 异常（catch）→ DB 仍为 null，previewGenerated=false
+                   └─ 进入 fallback ⇒ 会覆盖写新的截图
+
+fallback 路径（Playwright 直接截图）
+     │
+     ├─ screenshot Buffer > PREVIEW_MAX_BUFFER（L63-L67）→ 只打 console.log，不写文件不写 DB
+     │     └─ preview 留 null → finally 收敛为 "unavailable"
+     │
+     └─ screenshot 成功 → createFile + 写 preview 路径 ⇒ 最终成功
+```
+
+关键细节（L42、L59）：两个分支都有前置守卫 `!link.preview?.startsWith("archive")`——如果 preview 已经是有效路径（如其他 handler 已写入），则跳过。但 `"unavailable"` **不**以 "archive" 开头，所以 og:image 超限写了 "unavailable" 后，fallback 仍会执行并可能**覆盖**为成功路径。
+
+### 5.3 手动上传图片 vs PDF：显式不对称
+
+`apps/web/pages/api/v1/archives/[linkId].ts` POST 分支 L241-L279：
+
+| 上传类型 | preview 处理 | 潜在风险 |
 |---|---|---|
-| 创建 Link 时 URL 不安全（SSRF 拦截） | `apps/web/lib/api/controllers/links/postLink.ts` L138-L148 | `readable/image/monolith/pdf/preview` 全部一次性写 `"unavailable"`，`lastPreserved` 写当前时间 |
-| `archiveHandler` 入口判定 skipPreservation（全局开关 / 非 http(s) URL / SSRF 校验失败） | `apps/worker/lib/archiveHandler.ts` L44-L61 | 同上，全部写 `"unavailable"` |
-| `generatePreview` 缩略图生成超限或失败 | `packages/lib/generatePreview.ts` L22-L34 | 仅 `preview` 写 `"unavailable"` |
-| 用户手动上传 PDF | `apps/web/pages/api/v1/archives/[linkId].ts` L262-L266 | `preview` 写 `"unavailable"`（PDF 无预览） |
-| `archiveHandler` finally 块统一收敛 | `apps/worker/lib/archiveHandler.ts` L213-L224 | 所有仍为 `null` 的归档字段写 `"unavailable"` |
+| **图片（isImage=true）** | L247-L251 调用 `generatePreview(fileBuffer, ...)`，由其内部决定写路径/"unavailable"/留 null；L265 `preview: undefined`（不做二次写） | generatePreview 异常 catch 分支不写 DB，且上传 API **无 finally 兜底**，preview 永久为 null |
+| **PDF（isPDF=true）** | L265 `preview: "unavailable"`，无论 PDF 是否带封面图一律强制 unavailable | 不支持 PDF 封面提取 |
+| **HTML（isHTML=true）** | preview 无处理（undefined），保持原值 | — |
 
-### 5.2 finally 收敛逻辑（核心回写）
+### 5.4 worker finally：通用收敛兜底
 
 ```typescript
 // apps/worker/lib/archiveHandler.ts L213-L224
@@ -186,22 +233,79 @@ await prisma.link.update({
   where: { id: link.id },
   data: {
     lastPreserved: new Date().toISOString(),
+    preview:    !finalLink.preview    ? "unavailable" : undefined,
     readable:   !finalLink.readable   ? "unavailable" : undefined,
     image:      !finalLink.image      ? "unavailable" : undefined,
     monolith:   !finalLink.monolith   ? "unavailable" : undefined,
     pdf:        !finalLink.pdf        ? "unavailable" : undefined,
-    preview:    !finalLink.preview    ? "unavailable" : undefined,
     indexVersion: null,
   },
 });
 ```
 
-关键语义：
-- `undefined` 表示不修改该字段（让之前 handler 写入的成功路径保留）
-- `!finalLink.xxx` 为 true（即仍为 null 或空字符串）时写入 `"unavailable"`
-- **preview 与其他格式平级收敛**：如果 `handleArchivePreview` 没有成功写入路径，preview 也会被标记为 unavailable
+- `undefined` 表示不修改（保留已写入的路径或 "unavailable"）
+- `!finalLink.preview` 为 true（仍为 null 或空字符串）时写入 `"unavailable"`
+- **覆盖所有 worker 归档路径**：原生 image/pdf、HTML 页面、Monolith、Readability 统一在此收口
 
-### 5.3 前端对三态的渲染
+此外还有两处**提前写 unavailable**（不进入 try 块就直接返回）：
+- 创建 Link 时 URL 不安全（SSRF）：`apps/web/lib/api/controllers/links/postLink.ts` L138-L148 一次性写全字段 unavailable
+- archiveHandler 入口 skipPreservation（全局禁用 / 非 http(s) / SSRF）：`apps/worker/lib/archiveHandler.ts` L44-L61
+
+### 5.5 allBroken 重跑：preview 是"二等公民"
+
+`apps/web/pages/api/v1/worker/preservation.tsx` 中 allBroken 对 preview 的处理存在三层不对称：
+
+**1. 查询阶段（L77-L83）**：preview = "unavailable" **会**让链接被纳入 `brokenArchives` 结果集
+```
+OR: [
+  { image: "unavailable" }, { pdf: "unavailable" },
+  { readable: "unavailable" }, { monolith: "unavailable" },
+  { preview: "unavailable" }   ← preview 参与筛选
+]
+```
+
+**2. needsReprocessing 判定（L127-L132）**：preview **完全不参与**
+```typescript
+const needsReprocessing =
+  (link.image === "unavailable" && shouldArchive.archiveAsScreenshot) ||
+  (link.monolith === "unavailable" && shouldArchive.archiveAsMonolith) ||
+  (link.pdf === "unavailable" && shouldArchive.archiveAsPDF) ||
+  (link.readable === "unavailable" && shouldArchive.archiveAsReadable);
+// preview 没有对应 shouldArchive 开关，不参与判定
+```
+
+**3. update 数据（L135-L159）**：preview 字段**完全缺席**，不会被重置为 null
+
+综合效果：
+- **只有 preview 坏了、其他格式都好**：链接被查询出来，但 `needsReprocessing=false` → 不重置 lastPreserved → worker **不会**重跑，preview 永远 unavailable
+- **至少有一个主格式（image/pdf/readable/monolith）也坏了**：needsReprocessing=true → lastPreserved=null → worker 重跑 → `handleArchivePreview` 会再次尝试生成 preview（但 preview 本身不会被重置为 null，前置守卫 `!link.preview?.startsWith("archive")` 会判断 "unavailable" 确实不以 "archive" 开头 → 允许重新生成并覆盖）
+
+### 5.6 preview 完整状态转移图
+
+```
+          创建 Link（URL 安全）
+                │
+                ▼
+           [ null ] ◄────────────── PUT /archive（重跑）/ allAndRePreserve / 修改 URL
+                │                        /
+                │                       /
+     ┌──────────┼──────────────────────/───────────────┐
+     │          │                                     │
+     ▼          ▼                                     ▼
+generatePreview  handleArchivePreview            手动上传图片
+  超限分支     og:image 超限/成功/fallback           generatePreview
+  写"unavailable"  各自写路径或"unavailable"          超限→"unavailable"
+                │                                     异常→永久 null
+                ▼                                     │
+         [ 路径字符串 ] ◄─────────────────────────────┘
+                │
+                │ skipPreservation / 创建URL不安全 / finally 收敛
+                │ / 手动上传 PDF / allBroken 不重置 preview
+                ▼
+         [ "unavailable" ]
+```
+
+### 5.7 前端对三态的渲染
 
 判定函数 `formatAvailable` 位于 `packages/lib/formatStats.ts`：
 
@@ -214,12 +318,21 @@ export function formatAvailable(link, format) {
 前端组件 `apps/web/components/Preservation/PreservationContent.tsx` L256-L277 的分支逻辑：
 
 ```
-formatAvailable(link, type) === true   → 渲染真实内容（iframe/img 等）
-link[type] === "unavailable"           → 渲染 404 "Format not available" 占位
-其他（即 null）                         → 渲染 BeatLoader "preservation_in_queue"
+formatAvailable(link, "preview") === true   → 渲染真实内容（<img>）
+link.preview === "unavailable"               → 渲染 404 "Format not available" 占位
+其他（即 null）                               → 渲染 BeatLoader "preservation_in_queue"
 ```
 
-跳转时的兜底：`packages/lib/getFormatBasedOnPreference.ts` 中如果目标偏好格式值为 null 或 `"unavailable"`，返回 null，前端自动回退到原始 URL。
+跳转兜底：`packages/lib/getFormatBasedOnPreference.ts` 中如果目标格式值为 null 或 `"unavailable"`，返回 null，前端回退到原始 URL。
+
+### 5.8 现有缺陷汇总
+
+| 缺陷 | 影响 | 触发场景 |
+|---|---|---|
+| 手动上传图片 generatePreview 异常不写 DB | preview 永久 null，前端一直 loading | 上传的图片 Jimp 无法解码（损坏/格式不支持） |
+| allBroken 不处理 preview 单独失败 | preview 永远 unavailable，除非手动单链接重跑 | 缩略图生成挂了但截图/PDF 都好 |
+| og:image 超限后 fallback 可能做无用功 | generatePreview 已写 "unavailable"，fallback 仍再截图一次 | og:image 是超大图且压缩后仍超限 |
+| finally 收敛无法区分失败原因 | 用户看不到是"解码失败"还是"文件超限"还是"网络错误" | 所有 worker 失败路径 |
 
 ---
 
@@ -273,12 +386,15 @@ link[type] === "unavailable"           → 渲染 404 "Format not available" 占
 - `image/pdf/readable/monolith/preview → null`、`lastPreserved → null`、`indexVersion → null`
 
 #### action = `allBroken`（精细重跑失败项）
-筛选条件：任意归档字段等于 `"unavailable"` 的链接。
+筛选条件：任意归档字段等于 `"unavailable"` 的链接（含 `preview`）。
 
-处理逻辑（只重置**用户确实需要且已失败**的字段）：
+处理逻辑：
 1. 聚合用户级或 Tag 级的 `archivalSettings`（与 archiveHandler 中一致的算法）
-2. 判定 `needsReprocessing`：只有当 `shouldArchive.xxx === true` 且 `link.xxx === "unavailable"` 时才重置为 null
-3. `lastPreserved → null`、`indexVersion → null`
+2. 判定 `needsReprocessing`：只看 4 个主格式 `shouldArchive.xxx === true` 且 `link.xxx === "unavailable"`，**preview 不参与判定**
+3. 若 `needsReprocessing=true`：重置对应主格式为 null、`lastPreserved → null`、`indexVersion → null`；**preview 字段完全不碰**
+4. 若 `needsReprocessing=false`（如只有 preview = "unavailable"）：**什么都不做**，链接不会被重跑
+
+preview 的间接重跑路径：只有当某个主格式（image/pdf/readable/monolith）同时失败触发 needsReprocessing=true 时，`lastPreserved` 才会被置 null → worker 重跑 → `handleArchivePreview` 的前置守卫 `!link.preview?.startsWith("archive")` 对 `"unavailable"` 返回 true → 允许重新生成并覆盖 preview。如果只有 preview 坏了，必须走单链接手动重跑（PUT /api/v1/links/[id]/archive）。
 
 示例：用户只开启了 PDF 归档而截图失败（可能只是未开启），那么 `allBroken` 不会误重置截图字段。
 
@@ -293,13 +409,16 @@ link[type] === "unavailable"           → 渲染 404 "Format not available" 占
 | 单链接手动重跑（PUT /archive） | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ false | ✅ 全部格式 |
 | 批量删除归档（DELETE /links/archive） | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | — | ✅ 全部格式 |
 | 管理员 allAndRePreserve | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | — | ✅ 全部格式 |
-| 管理员 allBroken | ⚠️ 条件 | ⚠️ 条件 | ⚠️ 条件 | ⚠️ 条件 | ❌ 保留 | ✅ null | ✅ null | — | ❌ |
+| 管理员 allBroken | ⚠️ 条件A | ⚠️ 条件A | ⚠️ 条件A | ⚠️ 条件A | ⚠️ 条件B | ⚠️ 条件C | ⚠️ 条件C | — | ❌ |
 | 修改链接 URL（updateLinkById） | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | ✅ null | — | ✅ 全部格式 |
 | 归档 finally 失败收敛 | ❌ → unavailable | ❌ → unavailable | ❌ → unavailable | ❌ → unavailable | ❌ → unavailable | ✅ 写入时间 | ✅ null | — | ❌ |
 | 创建链接时 URL 不安全 | ❌ → unavailable | ❌ → unavailable | ❌ → unavailable | ❌ → unavailable | ❌ → unavailable | ✅ 写入时间 | ✅ null | — | ❌ |
 | 移动链接到其他 collection | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌（改用 moveFiles）|
 
-⚠️ 条件 = 只有该格式在用户/Tag 配置中被启用且当前值为 "unavailable" 时才重置为 null。
+**条件说明：**
+- **条件A**：只有该格式在用户/Tag 配置中被启用（`shouldArchive.xxx === true`）且当前值为 `"unavailable"` 时才重置为 null。
+- **条件B（preview 特有）**：update 数据中 preview 字段**完全缺席**，不会被直接重置。但如果条件C为 true（lastPreserved 被置 null），worker 重跑时 `handleArchivePreview` 的前置守卫 `!link.preview?.startsWith("archive")` 对 `"unavailable"` 返回 true，允许再次生成 preview 并覆盖原值。
+- **条件C**：`needsReprocessing` 为 true 时才重置为 null（即至少有一个主格式满足条件A）。若**仅 preview = "unavailable"** 而其他主格式都正常，needsReprocessing=false，lastPreserved 不动，worker 不会重跑，preview 永久停留在 unavailable。
 
 修改 URL 的重置逻辑位于 `apps/web/lib/api/controllers/links/linkId/updateLinkById.ts` L133-L163；移动 collection 的文件搬迁位于同文件 L195-L197（调用 `moveFiles`，`packages/filesystem/manageFiles.ts`）。
 
