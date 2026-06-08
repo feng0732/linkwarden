@@ -410,24 +410,28 @@ new QueryClient({
 | `useUpdateUser` | [user.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/user.tsx#L57-L84) | ✅ 直接设置 `["user"]` 缓存 | ❌ **未实现** | ✅ `setQueryData(["user"])` 用服务端数据覆盖 | 无失败回滚，出错后 UI 停留在乐观数据 |
 | `useUpdateUserPreference` | [user.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/user.tsx#L86-L126) | ✅ 直接设置 `["user"]` 缓存 | ❌ **未实现** | ✅ `setQueryData(["user"])` + 设置 `data-theme` DOM | 同 `useUpdateUser`，无失败回滚 |
 | `useUpdateDashboardLayout` | [dashboardData.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/dashboardData.tsx#L37-L83) | ✅ 保存 `previousData` 快照并设置 `["user"]` | ✅ `setQueryData(["user"], context.previousData)` | ✅ `invalidateQueries(["user", "dashboardData"])` | **唯一完整实现三段式** 的用户设置 Mutation |
-| `useAddToken` | [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx#L22-L47) | ❌ **未实现** | ❌ **未实现** | ✅ `setQueryData(["tokens"])` 追加新令牌 | 纯被动更新，无乐观 |
-| `useRevokeToken` | [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx#L49-L69) | ❌ **未实现** | ❌ **未实现** | ✅ `setQueryData(["tokens"])` 过滤已撤销 | 纯被动更新，无乐观 |
-| `useUpsertTags` (归档标签) | [tags.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tags.tsx#L322-L345) | ❌ **未实现** | ❌ **未实现** | ✅ `invalidateQueries(["tags", "dashboardData"])` | 等待服务端响应后刷新 |
-| `useUpdateCollection` | [collections.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/collections.tsx#L141-L178) | ❌ 代码被注释禁用 | ❌ **未实现** | ✅ `setQueryData(["collections"])` 替换 | onMutate 有代码但整段注释掉 |
+| `useAddToken` | [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx#L22-L47) | ❌ **未实现** | ❌ **未实现** | ✅ `setQueryData(["tokens"])` 追加新令牌 | 纯被动更新，请求成功前列表不变 |
+| `useRevokeToken` | [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx#L49-L69) | ❌ **未实现** | ❌ **未实现** | ✅ `setQueryData(["tokens"])` 过滤已撤销 | 无乐观删除，请求失败时令牌始终留在列表中，无需"还原" |
+| `useUpsertTags` (归档标签，偏好设置关联) | [tags.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tags.tsx#L322-L345) | ❌ **未实现** | ❌ **未实现** | ✅ `invalidateQueries(["tags", "dashboardData"])` | 等待服务端响应后才刷新 UI |
 
-#### 风险点总结：
+#### 风险点总结（聚焦用户设置与通知偏好相关缓存）：
 
-1. **`useUpdateUser` / `useUpdateUserPreference` 无失败回滚**：
-   - 如果 API 请求失败，React Query 缓存中的数据仍停留在乐观写入的状态
-   - 用户看到的 UI 与数据库实际状态不一致
-   - 必须刷新页面才能恢复正确数据
+1. **`useUpdateUser` / `useUpdateUserPreference` 无失败回滚（影响：本地化语言、归档偏好、AI 设置、链接跳转设置、主题、可读性设置）**：
+   - 请求发出前已通过 `onMutate` 将新值乐观写入 `["user"]` 缓存
+   - 如果 API 请求失败（网络错误、权限校验失败等），**没有 `onError` 回调将缓存恢复为请求前的数据**
+   - 用户看到的 UI 与数据库实际持久化状态不一致，必须手动刷新页面才能恢复正确数据
 
-2. **`useUpsertTags` 无乐观更新**：
-   - 用户在偏好设置页面修改归档标签规则后，需等待网络请求完成才会反映到 UI
-   - 响应慢时用户可能重复点击保存
+2. **`useUpsertTags` 无乐观更新（影响：偏好设置中的归档标签规则）**：
+   - 用户在偏好设置页面修改各标签的归档规则后，需等待网络请求完成才会反映到 UI
+   - 网络响应慢时用户可能误以为点击无效而重复点击保存
 
-3. **令牌操作 `useAddToken` / `useRevokeToken` 无乐观 + 无回滚**：
-   - 撤销令牌后如果请求失败，列表不会自动还原
+3. **通知偏好 `acceptPromotionalEmails` 无修改路径（缓存层不存在更新风险，但存在功能缺口）**：
+   - 见 4.2 节，该字段注册后无法通过任何官方途径修改，其缓存值始终等于注册时写入数据库的值
+   - 不存在缓存与数据库不一致的风险，但存在用户无法退订促销邮件的合规风险
+
+4. **公告通知（localStorage 层）无缓存一致性风险**：
+   - 公告系统完全基于 localStorage 本地读写，不涉及服务端用户设置同步
+   - `getLatestVersion` 仅做读操作，不存在写失败导致的缓存不一致问题
 
 #### 乐观更新标准三段式（以 `useUpdateDashboardLayout` 为范本）：
 
