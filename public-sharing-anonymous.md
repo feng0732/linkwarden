@@ -161,7 +161,43 @@ include: {
 include: { tags: true, collection: true, pinnedBy: { select: { id: true } }
 ```
 
-### 5.2 公开 User 字段裁剪
+### 5.1.1 公开 Link 返回的 collection 对象元数据详解
+
+当使用 Prisma `include: { collection: true }` 时，**仅返回 Collection 模型的标量字段（scalar fields），关联字段（relations）不会自动加载**。根据 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/packages/prisma/schema.prisma#L126-L149)，完整暴露字段如下：
+
+| Collection 字段 | 是否暴露 | 类型 | 安全影响 |
+|-----------------|---------|------|---------|
+| `id` | ✅ | Int | 可用于遍历其他 API |
+| `name` | ✅ | String | 正常元数据 |
+| `description` | ✅ | String | 正常元数据 |
+| `icon` | ✅ | String? | 正常元数据 |
+| `iconWeight` | ✅ | String? | 正常元数据 |
+| `color` | ✅ | String | 正常元数据（默认 #0ea5e9） |
+| `parentId` | ✅ | Int? | **可用于发现父 Collection，借此探测 Collection 层级结构和未公开的父级 ID** |
+| `isPublic` | ✅ | Boolean | **直接暴露该 Collection 的公开状态，可被用于探测私有 Collection 是否被标记为公开** |
+| `ownerId` | ✅ | Int | **严重：暴露 Collection 所有者的用户 ID，可进一步调用 `/api/v1/public/users/{ownerId}` 获取用户信息，形成用户信息关联泄露链** |
+| `createdById` | ✅ | Int? | 暴露创建者用户 ID（可能与 ownerId 不同） |
+| `createdAt` | ✅ | DateTime | 时间元数据 |
+| `updatedAt` | ✅ | DateTime | 时间元数据 |
+
+**不返回的关联字段**（Prisma `include: true` 不自动加载 relations）：
+- `owner`（User 对象）—— 但 `ownerId` 已暴露，可通过公开用户 API 间接获取
+- `members`（UsersAndCollections[]）—— 但单独的 getPublicCollection API 会返回成员信息
+- `links`、`subCollections`、`rssSubscriptions`、`DashboardSection`
+
+**信息关联攻击链**：
+```
+匿名请求 /api/v1/public/links/{linkId}
+    → 获取 collection.ownerId = 42
+    → 请求 /api/v1/public/users/42
+        → 获取该用户的 username、name、头像、归档偏好设置
+    → 请求 /api/v1/public/collections/links?collectionId=42（可能存在其他公开 Collection）
+        → 枚举该用户的所有公开内容
+```
+
+### 5.2 公开 User 字段裁剪与按 email 查找的安全影响
+
+#### 5.2.1 字段白名单裁剪
 
 位于 [getPublicUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/public/users/getPublicUser.ts#L26-L36)
 
@@ -178,6 +214,62 @@ include: { tags: true, collection: true, pinnedBy: { select: { id: true } }
 // 未列出的：
 // email, emailVerified, password
 ```
+
+显式白名单裁剪了以下 User 模型敏感字段（完整模型见 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/packages/prisma/schema.prisma#L28-L75)）：
+
+| 被裁剪的敏感字段 | 用途 |
+|-----------------|------|
+| `email` | 用户邮箱（✅ 未在响应中返回） |
+| `emailVerified` | 邮箱验证时间 |
+| `unverifiedNewEmail` | 待验证的新邮箱 |
+| `password` | 密码哈希（✅ 解构删除） |
+| `locale` | 地区设置 |
+| `parentSubscriptionId` | 订阅关联 |
+| `collectionOrder` | 用户 Collection 排序偏好 |
+| `linksRouteTo` | 链接跳转偏好设置 |
+| `aiTaggingMethod` / `aiPredefinedTags` / `aiTagExistingLinks` | AI 标签设置 |
+| `theme` / `readableFontFamily` 等 | 界面与可读性设置 |
+| `preventDuplicateLinks` | 防重复链接设置 |
+| `archiveAsReadable` / `archiveAsWaybackMachine` | 仅返回了 3 个 archiveAs* 字段，其余被裁剪 |
+| `isPrivate` | 用户是否私有（**此状态未在 API 中体现，私有用户的公开 Collection 仍可被访问**） |
+| `referredBy` / `acceptPromotionalEmails` 等 | 营销相关 |
+
+#### 5.2.2 按 email 查找的用户枚举漏洞
+
+位于 [/api/v1/public/users/[id].ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/pages/api/v1/public/users/[id].ts#L5-L13) 和 [getPublicUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/public/users/getPublicUser.ts#L3-L22)
+
+路由层的 ID 判定逻辑：
+```typescript
+// 只要 lookupId 不全是数字，就认为是 username/email 而非数字 ID
+const isId = lookupId.split("").every((e) => Number.isInteger(parseInt(e)));
+```
+
+数据库查询条件（当 `isId === false` 时）：
+```typescript
+OR: [
+  { username: targetId as string },
+  { email: targetId as string },   // ⚠️ 允许按 email 精确匹配查找
+]
+```
+
+**攻击方式：用户枚举（User Enumeration）**
+
+攻击者可以通过 HTTP 响应状态码差异判断某个 email 是否在系统中注册：
+
+| 请求 | 场景 | 响应 |
+|------|------|------|
+| `GET /api/v1/public/users/user@example.com` | 该 email 已注册 | `200 OK` + 返回用户白名单信息 |
+| `GET /api/v1/public/users/notexist@example.com` | 该 email 未注册 | `404 Not Found` + `{ response: "User not found." }` |
+
+**风险分析**：
+
+1. **钓鱼攻击辅助**：攻击者可先批量验证某组织的员工邮箱是否注册了 Linkwarden，然后对确认存在的账户定向发送钓鱼邮件
+2. **密码爆破前置侦察**：确认账户存在后，可针对该 username/email 进行后续的撞库或暴力破解
+3. **信息收集**：即使响应不包含 email，确认某个 email 对应账户的存在本身即是信息泄露
+4. **无速率限制**：该接口未实现任何速率限制或验证码，攻击者可使用字典大规模自动化枚举
+5. **响应时间差异也可能成为旁路信号**：数据库命中与未命中的响应时间差异可用于绕过状态码统一化措施（当前代码未统一状态码）
+
+**注意**：虽然查询条件是 `OR: [{ username }, { email }]`，响应中不会直接返回 email 字段，但攻击者可通过"我用 email A 请求，返回了用户 B 的 username 和 name"这一事实反推 email A ↔ 用户 B 的对应关系，构成间接邮箱泄露。
 
 ### 5.3 公开 Collection 字段裁剪
 
@@ -220,6 +312,92 @@ members: {
 | `updatedAt` | ✅ | ✅ | ✅ | |
 | `pinnedBy` | ❌ | ❌ | ✅（仅当前用户） | |
 | `icon`/`color` 等 | ✅ | ✅ | ✅ | |
+
+### 5.5 textContent 裁剪差异的安全边界
+
+#### 5.5.1 textContent 的来源与内容
+
+textContent 字段由 Worker 在归档 Readability 流程中填充，见 [handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts#L20-L58)
+
+```typescript
+const article = new Readability(dom.window.document).parse();
+const articleText = article?.textContent
+  ?.replace(/ +(?= )/g, "")         // 去除连续多空格
+  .replace(/(\r\n|\n|\r)/gm, " ") // 去除换行符，全部转为空格
+  .slice(0, TEXT_CONTENT_LIMIT ? TEXT_CONTENT_LIMIT : undefined);
+// 存储到数据库 Link.textContent
+// 同时 JSON.stringify(article) 写入文件系统 archives/{collectionId}/{linkId}_readability.json
+```
+
+**textContent 存储内容**：
+- 使用 `@mozilla/readability` 提取的网页**纯文本正文**
+- 经过清洗（去多余空格、换行符、可选长度限制 `TEXT_CONTENT_LIMIT
+- 可能包含：新闻全文、博客文章正文、产品描述、用户评论等网页可见文本
+
+**textContent 与 readable 字段的区别**：
+
+| 维度 | `textContent` | `readable` |
+|------|--------------|-----------|
+| 存储位置 | Postgres Link 表字段 | 文件系统 JSON 文件 |
+| 存储路径 | N/A（直接读库 | `archives/{collectionId}/{linkId}_readability.json |
+| 内容格式 | 纯文本字符串 | JSON（含 HTML 内容、标题、作者、元数据） |
+| 获取方式 | `/api/v1/public/links/{id}` API 直接返回 | `/api/v1/archives/{linkId}?format=readability` 接口单独获取 |
+| HTTP 缓存 | API 默认 API 响应（依赖 API 端缓存 | `max-age=31536000, immutable |
+| 列表 API | ❌ 已裁剪 | ✅ 返回文件路径（可进一步获取 |
+| 单 Link API | ⚠️ 未裁剪 | ✅ 返回文件路径（可进一步获取 |
+
+#### 5.5.2 裁剪不一致造成的安全边界差异
+
+两个端点的权限相同，但返回粒度差异造成了**安全边界不一致：
+
+```
+攻击者视角：
+  ┌───────────────────────────────────────────────────────┐
+  │  GET /api/v1/public/collections/links           │
+  │   (分页列表  ← textContent: true（已裁剪
+  │  │
+  │  │   看不到网页正文，但能看到 readable 字段：
+  │  │   readable: "archives/42/123_readability.json"
+  │  │
+  │  │   + 换一个端点
+  │  ▼
+  │  GET /api/v1/public/links/123
+  │   (单 Link ← textContent: "完整网页正文内容..."（未裁剪
+  │  └───────────────────────────────────────────────────────┘
+```
+
+**安全影响分析**：
+
+1. **防御深度不同**：
+   - 列表 API（searchLinks）出于性能考虑裁剪 textContent（大量 textContent 体积可能较大
+   - 单 Link API 未做同样处理，两个端点安全策略不统
+
+2. **绕过方式：**
+   - 攻击者只需遍历所有 linkId（例如从 1 开始递增），逐个请求单 Link API，即可获取所有公开 Link 的 textContent
+   - 列表裁剪形同虚设，列表看不到但详情页可以看到
+
+3. **textContent 可能包含的敏感内容：
+   - 付费墙后的文章正文（用户原本是通过 Readability 提取时可能提取到完整正文
+   - 内部知识库页面内容
+   - 含个人身份信息（PII）：姓名、邮箱、电话等
+   - 版权受保护的文本内容
+
+4. **与 readable 文件的双重获取**：
+   - 即使 textContent 被裁剪，攻击者仍可通过 readable 字段的文件路径通过 `/api/v1/archives/{linkId}?format=readability` 获取**富文本（含 HTML 的完整 Readability JSON 输出，包含比 textContent 更完整的内容（含 HTML 标记、标题、作者、站点名、excerpt、dir、lang 等元数据
+
+#### 5.5.3 textContent 的用途
+
+textContent 在系统中的用途（非展示用途，仅作为 Worker AI 打标签（autoTagLink），在 [autoTagLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/worker/lib/autoTagLink.ts#L76-L78)：
+
+```typescript
+const description =
+  (link.metaDescription ? link.metaDescription + "..." : undefined) ||
+  (link.textContent ? link.textContent?.slice(0, 500) + "..." : undefined;
+```
+
+textContent 并未在任何前端界面渲染中展示使用，因此将其从**完全裁掉，没有任何功能损失**。
+
+**结论**：单 Link API 中暴露 textContent 属于**过度数据暴露**，无业务必要且与列表 API 安全策略不一致。
 
 ---
 
@@ -400,27 +578,31 @@ archives/preview/${collectionId}/${linkId}.jpeg
 
 ### 9.1 已正确实现的安全措施
 
-1. ✅ 公开 Collection 的判定统一基于 `collection.isPublic` 数据库层面过滤，
-2. ✅ User 信息采用白名单裁剪，不暴露 email/password
+1. ✅ 公开 Collection 的判定统一基于 `collection.isPublic` 数据库层面过滤
+2. ✅ User 信息采用白名单裁剪，不直接返回 email/password/emailVerified
 3. ✅ Collection members 仅暴露 username/name/image
-4. ✅ Access Token 撤销每次查 DB，立
+4. ✅ Access Token 撤销每次查 DB，立即生效
 5. ✅ Preserved 短期 Token 5 分钟 TTL，no-store 缓存
 6. ✅ Monolith 在启用 USER_CONTENT_DOMAIN 时强制走短期 Token
 7. ✅ searchLinks 列表 API 裁剪 textContent
+8. ✅ Highlights（高亮）接口需要 verifyUser 认证，公开路由无法访问
+9. ✅ `private` Cache-Control 防止 CDN/代理缓存归档文件
 
 ### 9.2 潜在风险点
 
-| 风险 | 位置 | 影响 |
-|------|------|------|
-| 归档文件浏览器缓存 1 年 immutable | `/api/v1/archives/[linkId].ts
-| 撤销公开后 1 年内浏览器仍可访问已缓存文件
-|
-| 单 Link API 未裁剪 textContent | `public/links/linkId/getLinkById.ts` | 匿名用户可获取网页正文提取文本
-| 无下载速率/次数限制 | 所有 `/api/v1/archives/*` | 匿名用户可无限制下载
-| 前端 React Query 缓存不随 isPublic 变更自动失效 | `packages/router/*` | 关闭公开后前端仍显示旧数据直到刷新
-| Meilisearch 索引异步更新 | worker 索引延迟
-| 搜索结果中仍可搜到刚关闭公开的 Links（分钟级窗口
-|
+| 风险 | 位置 | 影响 | 严重等级 |
+|------|------|------|---------|
+| 归档文件浏览器缓存 1 年 immutable | `/api/v1/archives/[linkId].ts` | 撤销公开后 1 年内浏览器仍可访问已缓存文件 | **高** |
+| 公开用户 API 支持按 email 查找导致用户枚举 | `/api/v1/public/users/[id].ts`、`getPublicUser.ts` | 可无速率限制地枚举系统用户邮箱，用于钓鱼/撞库前置侦察 | **高** |
+| 公开 Link 返回 collection.ownerId 造成信息关联泄露链 | `public/links/linkId/getLinkById.ts`、`searchLinks.ts` | 暴露 Collection 所有者用户 ID，可进一步查询公开用户信息并枚举该用户所有公开内容 | **中** |
+| 单 Link API 未裁剪 textContent | `public/links/linkId/getLinkById.ts` | 匿名用户可获取网页正文提取文本（含潜在 PII/版权内容），且与列表 API 策略不一致 | **中** |
+| 公开 Link 返回 collection.parentId 可探测层级结构 | 同上 | 可用于发现父 Collection ID 及未公开的层级结构 | **低** |
+| 公开 Link 返回 collection.isPublic 可探测公开状态 | 同上 | 可直接确认 Collection 是否为公开状态 | **低** |
+| 无下载速率/次数限制 | 所有 `/api/v1/archives/*` | 匿名用户可无限制下载，潜在带宽滥用 | **中** |
+| 前端 React Query 缓存不随 isPublic 变更自动失效 | `packages/router/*` | 关闭公开后前端仍显示旧数据直到刷新 | **低** |
+| Meilisearch 索引异步更新 | worker 索引延迟 | 搜索结果中仍可搜到刚关闭公开的 Links（分钟级窗口） | **低** |
+| User.isPrivate 字段未被公开用户 API 校验 | `getPublicUser.ts` | 标记为私有的用户其公开 Collection 仍可被访问，isPrivate 形同虚设 | **低** |
+| textContent 裁剪与 readable 文件路径暴露形成双重获取 | `searchLinks.ts` vs `getLinkById.ts` vs `/api/v1/archives` | 即使 textContent 被裁剪，仍可通过 readable 字段获取更完整的富文本内容 | **中** |
 
 ### 9.3 架构图示
 
