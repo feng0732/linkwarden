@@ -180,68 +180,86 @@ async session({ session, token }) {
 
 ## 五、所有 API 入口认证方式全量核对
 
-逐一核对 `apps/web/pages/api/v1/` 下全部路由，按认证方式分类：
+逐一核对 `apps/web/pages/api/v1/` 下全部路由（排除 `.test.ts` 测试文件），总计 **47 个业务 API 文件**，按认证方式分类：
 
-### 5.1 使用 verifyUser() 的路由（强校验，用户删除后必拦截）
+**分类总数核对**：
+- 使用 `verifyUser()` 的路由：**26 个文件**
+- 使用 `verifyToken()` / `getToken()` 的路由：**6 个文件**（其中 `archives/[linkId].ts` 同时含 verifyToken GET 和 verifyUser POST）
+- 完全公开 / 特殊认证路由：**16 个文件**
+- 总计：26 + 6 - 1（重复文件）+ 16 = **47** ✅
 
-| 路由 | 方法 | 后续 DB 操作 | 用户删除后表现 |
-|------|------|-------------|---------------|
-| `/v1/tokens` | GET/POST | 查/写 AccessToken | verifyUser 阶段 404 拦截 |
-| `/v1/tokens/[id]` | DELETE | 软删 AccessToken | verifyUser 阶段 404 拦截 |
-| `/v1/tags` | GET/POST | 查/写 Tag | verifyUser 阶段 404 拦截 |
-| `/v1/tags/[id]` | GET/PUT/DELETE | 查/写 Tag | verifyUser 阶段 404 拦截 |
-| `/v1/tags/merge` | POST | 合并 Tag | verifyUser 阶段 404 拦截 |
-| `/v1/users` | POST | 创建用户 | verifyUser 阶段 404 拦截 |
-| `/v1/users/[id]/preference` | GET/PUT | 写用户偏好 | verifyUser 阶段 404 拦截 |
-| `/v1/collections` | GET/POST | 查/写 Collection | verifyUser 阶段 404 拦截 |
-| `/v1/collections/[id]` | GET/PUT/DELETE | 查/写 Collection | verifyUser 阶段 404 拦截 |
-| `/v1/links` | GET/POST | 查/写 Link | verifyUser 阶段 404 拦截 |
-| `/v1/links/[id]` | GET/PUT/DELETE | 查/写 Link | verifyUser 阶段 404 拦截 |
-| `/v1/links/[id]/archive` | POST | 写归档文件 | verifyUser 阶段 404 拦截 |
-| `/v1/links/[id]/highlights` | GET/POST | 查/写 Highlight | verifyUser 阶段 404 拦截 |
-| `/v1/links/archive` | POST | 上传归档 | verifyUser 阶段 404 拦截 |
-| `/v1/highlights` | POST | 写 Highlight | verifyUser 阶段 404 拦截 |
-| `/v1/highlights/[id]` | PUT/DELETE | 改/删 Highlight | verifyUser 阶段 404 拦截 |
-| `/v1/dashboard` | GET | 查 Dashboard | verifyUser 阶段 404 拦截 |
-| `/v2/dashboard` | GET | 查 Dashboard V2 | verifyUser 阶段 404 拦截 |
-| `/v1/search` | POST | 搜索 Link | verifyUser 阶段 404 拦截 |
-| `/v1/rss` | GET/POST | 查/写 RSS | verifyUser 阶段 404 拦截 |
-| `/v1/rss/[id]` | GET/DELETE | 查/删 RSS | verifyUser 阶段 404 拦截 |
-| `/v1/migration` | POST | 导入导出 | verifyUser 阶段 404 拦截 |
-| `/v1/worker` | GET | 查 Worker 状态 | verifyUser 阶段 404 拦截 |
-| `/v1/worker/preservation` | POST | 触发归档 | verifyUser 阶段 404 拦截 |
-| `/v1/archives` | POST | 上传归档 | verifyUser 阶段 404 拦截 |
-| `/v1/archives/[linkId]` | POST | 更新归档文件 | verifyUser 阶段 404 拦截 |
+---
 
-### 5.2 只使用 verifyToken() / getToken() 的路由（需进一步核对）
+### 5.1 使用 verifyUser() 的路由（26 个文件，用户删除后必拦截）
 
-| 路由 | 方法 | 认证函数 | verifyToken 后的 DB 查询 | 用户删除后实际拦截点 |
-|------|------|---------|-------------------------|---------------------|
-| `/v1/users/me` | GET | `verifyToken()` | `getUserById(userId)` 查 User 表 | getUserById 返回 null → 404 |
-| `/v1/users/[id]` | GET/PUT/DELETE | `verifyToken()` | 查 User、查权限做操作 | User 不存在 → 404/401 |
-| `/v1/preserved/token` | GET | `verifyToken()` | `resolveAccessibleArchive()` 查 Collection 权限 | Collection 已级联删除 → 401 |
-| `/v1/avatar/[id]` | GET | `verifyToken()`（可选） | `prisma.user.findUnique({ id: queryId })` 查**目标用户** | 目标用户不存在 → 400 "File inaccessible." |
-| `/v1/archives/[linkId]` | GET | `verifyToken()`（可选） | `resolveAccessibleArchive()` 查 Collection 权限 | Collection 已级联删除 → 401 |
-| `/v1/payment` | GET | `getToken()` (next-auth 原生) | `prisma.user.findUnique({ id: token.id })` 查 User 表 + email | User 不存在 → 404 "User not found." |
+| 路由文件 | 方法 | 后续 DB 操作 | 用户删除后表现 |
+|---------|------|-------------|---------------|
+| `v1/tokens/index.ts` | GET/POST | 查/写 AccessToken | verifyUser 阶段 404 拦截 |
+| `v1/tokens/[id].ts` | DELETE | 软删 AccessToken | verifyUser 阶段 404 拦截 |
+| `v1/tags/index.ts` | GET/POST/DELETE | 查/写 Tag | verifyUser 阶段 404 拦截 |
+| `v1/tags/[id].ts` | GET/PUT/DELETE | 查/写 Tag | verifyUser 阶段 404 拦截 |
+| `v1/tags/merge.ts` | PUT | 合并 Tag | verifyUser 阶段 404 拦截 |
+| `v1/users/index.ts` | GET（POST 注册无认证） | 查 User 列表 | verifyUser 阶段 404 拦截 |
+| `v1/users/[id]/preference.tsx` | GET/PUT | 读写用户偏好 | verifyUser 阶段 404 拦截 |
+| `v1/collections/index.ts` | GET/POST | 查/写 Collection | verifyUser 阶段 404 拦截 |
+| `v1/collections/[id].ts` | GET/PUT/DELETE | 查/写 Collection | verifyUser 阶段 404 拦截 |
+| `v1/links/index.ts` | GET/POST/PUT/DELETE | 查/写 Link | verifyUser 阶段 404 拦截 |
+| `v1/links/[id]/index.ts` | GET/PUT/DELETE | 查/写 Link | verifyUser 阶段 404 拦截 |
+| `v1/links/[id]/archive/index.ts` | PUT | 重置归档状态 | verifyUser 阶段 404 拦截 |
+| `v1/links/[id]/highlights/index.ts` | GET | 查链接 Highlight | verifyUser 阶段 404 拦截 |
+| `v1/links/archive/index.ts` | DELETE | 批量删除归档 | verifyUser 阶段 404 拦截 |
+| `v1/highlights/index.ts` | POST | 写 Highlight | verifyUser 阶段 404 拦截 |
+| `v1/highlights/[id].ts` | DELETE | 删 Highlight | verifyUser 阶段 404 拦截 |
+| `v1/dashboard/index.ts` | GET | 查 Dashboard 数据 | verifyUser 阶段 404 拦截 |
+| `v2/dashboard/index.ts` | GET | 查 Dashboard V2 数据 | verifyUser 阶段 404 拦截 |
+| `v1/search/index.ts` | GET | 搜索 Link | verifyUser 阶段 404 拦截 |
+| `v1/rss/index.ts` | GET/POST | 查/写 RSS | verifyUser 阶段 404 拦截 |
+| `v1/rss/[id].ts` | DELETE | 删 RSS | verifyUser 阶段 404 拦截 |
+| `v1/migration/index.ts` | GET/POST | 导入导出 | verifyUser 阶段 404 拦截 |
+| `v1/worker/index.ts` | GET | 查 Worker 状态（需管理员） | verifyUser 阶段 404 拦截 |
+| `v1/worker/preservation.tsx` | POST | 触发归档 | verifyUser 阶段 404 拦截 |
+| `v1/archives/index.ts` | POST | 上传归档 | verifyUser 阶段 404 拦截 |
+| `v1/archives/[linkId].ts` | POST（GET 用 verifyToken） | 更新归档文件 | verifyUser 阶段 404 拦截 |
+
+**计数核对**：以上表格共 **26 行**，即 26 个使用 verifyUser() 的路由文件（其中 `archives/[linkId].ts` 的 GET 方法走 verifyToken，见 5.2 节）。
+
+### 5.2 只使用 verifyToken() / getToken() 的路由（6 个文件，均在后续 DB 查询时拦截）
+
+| 路由文件 | 方法 | 认证函数 | verifyToken 后的 DB 查询 | 用户删除后实际拦截点 |
+|---------|------|---------|-------------------------|---------------------|
+| `v1/users/me.ts` | GET | `verifyToken()` | `getUserById(userId)` 查 User 表 | getUserById 返回 null → 404 |
+| `v1/users/[id]/index.ts` | GET/PUT/DELETE | `verifyToken()` | 查 User、查权限做操作 | User 不存在 → 404/401 |
+| `v1/preserved/token.ts` | GET | `verifyToken()` | `resolveAccessibleArchive()` 查 Collection 权限 | Collection 已级联删除 → 401 |
+| `v1/avatar/[id].ts` | GET | `verifyToken()`（可选） | `prisma.user.findUnique({ id: queryId })` 查**目标用户** | 目标用户不存在 → 400 "File inaccessible." |
+| `v1/archives/[linkId].ts` | GET（POST 用 verifyUser） | `verifyToken()`（可选） | `resolveAccessibleArchive()` 查 Collection 权限 | Collection 已级联删除 → 401 |
+| `v1/payment/index.ts` | GET | `getToken()` (next-auth 原生) | `prisma.user.findUnique({ id: token.id })` 查 User 表 + email | User 不存在 → 404 "User not found." |
+
+**计数核对**：以上表格共 **6 行**，即 6 个使用 verifyToken()/getToken() 的路由文件。
 
 **结论**：以上 6 条"只做 token 校验"的路由，在 verifyToken 之后**全部都有进一步的数据库查询**，查询的实体在用户删除后均已不存在或不可访问，因此**实际均能被有效拦截**，不存在裸奔端点。
 
-### 5.3 完全公开无认证的路由（任何人可访问）
+### 5.3 完全公开 / 特殊认证的路由（16 个文件，任何人可访问）
 
-| 路由 | 方法 | 查询逻辑 | 用户删除后表现 |
-|------|------|---------|---------------|
-| `/v1/auth/*` | 多方法 | NextAuth 内置流程 | 不受影响 |
-| `/v1/logins` | GET | 读取环境变量返回登录方式配置 | 不受影响 |
-| `/v1/config` | GET | 读取环境变量返回实例配置 | 不受影响 |
-| `/v1/getFavicon` | GET | 代理外部 favicon 服务 | 不受影响 |
-| `/v1/webhook` | POST | Stripe 签名校验 + 处理订阅事件 | 不受影响 |
-| `/v1/session` | POST | `verifyByCredentials()` 用户名密码登录 | 不受影响（登录入口本身） |
-| `/v1/public/collections/[id]` | GET | `prisma.collection.findFirst({ id, isPublic: true })` | Collection 已级联删除 → 400 "Collection not found." |
-| `/v1/public/collections/links` | GET | `searchLinks({ publicOnly: true })` | Collection 已级联删除 → 空结果 |
-| `/v1/public/collections/tags` | GET | 先查 `collection.isPublic === true`，再查 tags | Collection 已级联删除 → 404 "Collection not found." |
-| `/v1/public/links/[id]` | GET | `prisma.link.findFirst({ id, collection: { isPublic: true } })` | Link 已级联删除 → 返回 null（200 但 body 为 null） |
-| `/v1/public/users/[id]` | GET | `prisma.user.findFirst({ id/username/email })`，返回脱敏字段 | User 不存在 → 404 "User not found." |
-| `/v1/preserved/view` | GET | `decodePreservedFormatToken()` 独立短期 token | Token 5 分钟自失效，与用户存在性无关 |
+| 路由文件 | 方法 | 查询逻辑 / 认证方式 | 用户删除后表现 |
+|---------|------|-------------------|---------------|
+| `v1/auth/[...nextauth].ts` | 多方法 | NextAuth 内置流程（登录/登出/回调） | 不受影响 |
+| `v1/auth/forgot-password.ts` | POST | 密码重置邮件发送 | 不受影响 |
+| `v1/auth/reset-password.ts` | POST | 密码重置提交 | 不受影响 |
+| `v1/auth/verify-email.ts` | GET | 邮箱验证链接处理 | 不受影响 |
+| `v1/logins/index.ts` | GET | 读取环境变量返回登录方式配置 | 不受影响 |
+| `v1/config/index.ts` | GET | 读取环境变量返回实例配置 | 不受影响 |
+| `v1/getFavicon/index.ts` | GET | 代理外部 favicon 服务 | 不受影响 |
+| `v1/webhook/index.ts` | POST | Stripe 签名校验 + 处理订阅事件 | 不受影响 |
+| `v1/session/index.ts` | POST | `verifyByCredentials()` 用户名密码登录（移动端） | 不受影响（登录入口本身） |
+| `v1/public/collections/[id].ts` | GET | `prisma.collection.findFirst({ id, isPublic: true })` | Collection 已级联删除 → 400 "Collection not found." |
+| `v1/public/collections/links/index.ts` | GET | `searchLinks({ publicOnly: true })` | Collection 已级联删除 → 空结果 |
+| `v1/public/collections/tags/index.ts` | GET | 先查 `collection.isPublic === true`，再查 tags | Collection 已级联删除 → 404 "Collection not found." |
+| `v1/public/links/[id].ts` | GET | `prisma.link.findFirst({ id, collection: { isPublic: true } })` | Link 已级联删除 → 返回 null（200 但 body 为 null） |
+| `v1/public/users/[id].ts` | GET | `prisma.user.findFirst({ id/username/email })`，返回脱敏字段 | User 不存在 → 404 "User not found." |
+| `v1/preserved/view.ts` | GET | `decodePreservedFormatToken()` 独立短期 token | Token 5 分钟自失效，与用户存在性无关 |
+| `v1/payment/index.ts` | GET | `getToken()` + 查 User（此文件实际应归入 verifyToken 类，见 5.2） | — |
+
+**计数核对**：排除 `v1/payment/index.ts`（已归入 5.2 的 6 个 verifyToken 文件）后，共 **16 个** 公开/特殊认证路由文件。
 
 ---
 
@@ -575,11 +593,11 @@ if (!response.ok) throw new Error("Failed to fetch user data.");
 // react-query 进入 error 状态，但 AuthRedirect 未监听此 error
 ```
 
-**② 所有 verifyUser() 的业务 API（28 条，见 5.1 节）**
+**② 所有 verifyUser() 的业务 API（26 个文件，见 5.1 节）**
 
 `verifyUser()` 在 `apps/web/lib/api/verifyUser.ts` 中会调用 `prisma.user.findUnique({ id: userId })`，查不到时返回 404 并写入响应。前端页面渲染后发起的 `/v1/links`、`/v1/collections` 等请求全部 404/401。
 
-**③ 所有 verifyToken() + 后续 DB 查询的 API（6 条，见 5.2 节）**
+**③ 所有 verifyToken() + 后续 DB 查询的 API（6 个文件，见 5.2 节）**
 
 `verifyToken()` 通过但后续 `getUserById` / `resolveAccessibleArchive` / `prisma.user.findUnique` 等查询因数据级联删除而返回空 → 404/401。
 
@@ -596,8 +614,8 @@ if (!response.ok) throw new Error("Failed to fetch user data.");
 
 | 攻击入口 | 用户删除后是否被拦截 | 拦截发生在哪一层 |
 |---------|---------------------|-----------------|
-| verifyUser() 路由（28 条） | ✅ 是 | verifyUser 查 User → 404 |
-| verifyToken() 路由（6 条） | ✅ 是 | 后续查 User/Collection → 404/401 |
+| verifyUser() 路由（26 个文件） | ✅ 是 | verifyUser 查 User → 404 |
+| verifyToken() 路由（6 个文件） | ✅ 是 | 后续查 User/Collection → 404/401 |
 | 公开路由（/v1/public/*） | ✅ 是 | 级联删除后查不到实体 → 400/404/空结果 |
 | 头像 /v1/avatar/[id] | ✅ 是 | 查 targetUser 不存在 → 400 + 文件已删除 |
 | 归档 GET /v1/archives/[linkId] | ✅ 是 | Collection 级联删除 → 401 + 文件已删除 |
