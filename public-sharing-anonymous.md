@@ -373,17 +373,22 @@ const tags = await prisma.tag.findMany({
   where: {
     AND: [
       ...(searchCondition ? [searchCondition] : []),
-      { links: { some: { collectionId } } },  // 仅返回该 Collection 下使用过的 Tag
+      { links: { some: { collectionId } } },  // ⚠️ 仅筛选"哪些 Tag 会被返回"（至少有一个 Link 在该 collectionId 下）
     ],
   },
   include: {
-    _count: { select: { links: true } },  // Tag 在该 Collection 中的链接数量
+    _count: { select: { links: true } },  // ⚠️ 计数该 Tag 的所有 Links（不受顶层 where 条件限制）
   },
   orderBy: [{ name: "asc" }, { id: "asc" }],
 });
 ```
 
-**Prisma 关键行为**：`findMany` 不显式 `select` 时默认返回 Tag 模型所有标量字段，加上 `include` 的 `_count.links`。
+**Prisma 关键行为**：
+- `findMany` 不显式 `select` 时默认返回 Tag 模型所有标量字段，加上 `include` 的 `_count.links`
+- **顶层 `where.links.some({ collectionId })` 仅用于筛选"哪些 Tag 会被返回"**，不影响 `_count` 的聚合范围
+- `_count.select.links: true` **未指定 `where` 条件**，因此计数的是该 Tag 在**所有 Collection**中关联的全部 Link 总数（包括 Tag 所有者的私有 Collection）
+
+根据 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/packages/prisma/schema.prisma#L166-L218)，Link 和 Tag 为隐式多对多关联（`Link.tags Tag[]` + `Tag.links Link[]`，Prisma 自动生成 `_LinkToTag` 关联表）。`_count.links` 统计的是该 Tag 在 `_LinkToTag` 表中的全部关联记录数，不区分 Link 的 collectionId。
 
 根据 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/packages/prisma/schema.prisma#L200-L218)，完整暴露的 Tag 字段如下：
 
@@ -401,19 +406,71 @@ const tags = await prisma.tag.findMany({
 | `aiGenerated` | ✅ | Boolean | 该 Tag 是否由 AI 生成 |
 | `createdAt` | ✅ | DateTime | Tag 创建时间 |
 | `updatedAt` | ✅ | DateTime | Tag 更新时间 |
-| `_count.links` | ✅ | Int | 该 Tag 在当前 Collection 下关联的 Link 数量 |
+| **`_count.links`** | ✅ | Int | **该 Tag 在所有 Collection（含所有者私有 Collection）中的总 Link 数，不是当前公开 Collection 下的数量** —— 详见 5.3.3.1 |
 
 不返回的关联字段（未显式 include）：`links`、`owner`（但 `ownerId` 标量字段已暴露）。
+
+#### 5.3.3.1 `_count.links` 计数范围的代码确认
+
+**Prisma where 与 _count 的作用域分离**：
+
+```
+顶层 where 条件（筛选 Tag）：
+  links.some({ collectionId: X })
+    → 作用：只要 Tag 至少有一个 Link 在 Collection X 中，该 Tag 就被返回
+    → 不影响 _count 的聚合范围
+
+嵌套 include._count（聚合计数）：
+  select: { links: true }  // 无 where
+    → 作用：统计该 Tag 关联的全部 Links（不区分 Collection）
+    → 与顶层 where.links.some 完全独立
+```
+
+项目使用 Prisma `^6.10.1`，支持 filtered relation counts 语法，但代码中未使用：
+```typescript
+// 当前代码（全局计数）：
+_count: { select: { links: true } }
+
+// 如果要仅限当前 Collection 计数，应该写为：
+_count: { select: { links: { where: { collectionId } } } }
+```
+
+**计数范围的举例说明**：
+- 用户 A 拥有 Tag "javascript"
+- 该 Tag 在用户 A 的 5 个不同 Collection 中共被 100 个 Links 使用
+- 其中 Collection X（当前公开的，id=42）下有 5 个 Links 使用了该 Tag
+- 匿名用户访问 `/api/v1/public/collections/tags?collectionId=42` 时：
+  - Tag "javascript" 会被返回（因为满足 `links.some({ collectionId: 42 })`
+  - **`_count.links` 返回值为 100（全部 Links），而不是 5（当前 Collection 下的 Links）**
+
+**order 排序同样受全局计数影响**：
+[getTags.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/tags/getTags.ts#L43-L46) 中 `TagSort.LinkCountHighLow` / `LinkCountLowHigh` 排序使用 `links: { _count: "desc" }`，同样按全局 Links 数量排序，而非当前 Collection 下的数量。（注：该排序在 collectionId 分支未实际启用，collectionId 分支硬编码 `orderBy: [{ name: "asc" }, { id: "asc" }]`，所以排序问题不存在。）
+
+**userId 分支同样存在此问题**：
+已登录用户通过 userId 分支获取 Tags 时，`_count.links` 返回的也是该 Tag 的全局 Links 总数，而不是该用户有权限访问的 Collection 下的 Links 数量。不过对已登录用户来说，这属于自己的 Tag，信息泄露风险较小。
+
+#### 5.3.3.2 `_count.links` 计数范围对匿名访问边界的影响
+
+1. **私有 Collection 内容规模泄露**：
+   匿名用户通过 `_count.links` 的数值，可以推测 Tag 所有者在私有 Collection 中使用该 Tag 的规模。例如：如果某个 Tag 在当前公开 Collection 下目测只有 2 个 Links，但 `_count.links` 显示为 500，则说明该用户有 498 个 Links（约等于该 Tag 被用于 498 个其他 Links，大概率在私有 Collection 中）。
+
+2. **跨 Collection 使用痕迹泄露**：
+   即使某个 Tag 在当前公开 Collection 下只有很少的使用量，高 `_count.links` 值也会泄露该 Tag 被用户重度使用的事实，反映出用户的兴趣方向和内容规模。
+
+3. **与 Link 接口中 tags 的对比**：
+   Link 对象中 `include: { tags: true }` **不包含 `_count`**，因此 Link 接口不会泄露 Tag 的全局 Links 使用总数。只有独立的公开 Tags API（和已登录用户的 Tags API）存在这个泄露问题。
 
 **Tag 字段暴露的安全影响**：
 
 1. **`ownerId` 暴露**：Tag 是用户级资源（`@@unique([name, ownerId])`，每个用户拥有独立的 Tag 命名空间）。当多个用户共享一个 Collection 时，该 Collection 下的 Links 可能关联了不同用户的 Tag。匿名用户通过公开 Tags API 可以枚举到**所有参与该 Collection 的用户 ID**（通过所有 Tag 的 `ownerId` 去重），比 Collection 的 members 列表可能更全面（members 只列明确添加的协作者，Tag ownerId 可能包含通过 Link 创建间接参与的用户）。
 
-2. **归档偏好和 AI 设置泄露**：每个 Tag 的 `archiveAs*` 系列和 `aiTag` / `aiGenerated` 设置被泄露，反映了该 Tag 所有者的使用习惯。
+2. **`_count.links` 全局计数泄露**：见 5.3.3.1，泄露 Tag 所有者在所有 Collection（含私有）中的总 Link 使用规模。
 
-3. **无业务必要性**：匿名用户浏览公开 Collection 的 Links 时只需要 Tag 的 `id` 和 `name`（以及 `_count.links` 用于展示计数），其他字段（ownerId、归档偏好、AI 设置）对匿名视图没有任何用途。
+3. **归档偏好和 AI 设置泄露**：每个 Tag 的 `archiveAs*` 系列和 `aiTag` / `aiGenerated` 设置被泄露，反映了该 Tag 所有者的使用习惯。
 
-4. **与 Link 接口的一致性对比**：Link 对象中 `include: { tags: true }` 返回的 Tag 字段与公开 Tags API 返回的字段**完全相同**（所有标量字段），所以两个入口在 Tag 暴露粒度上是一致的——均存在过度暴露问题。
+4. **无业务必要性**：匿名用户浏览公开 Collection 的 Links 时只需要 Tag 的 `id` 和 `name`，`_count.links` 应该只计当前 Collection 下的数量，其他字段（ownerId、归档偏好、AI 设置）对匿名视图没有任何用途。
+
+5. **与 Link 接口的一致性对比**：Link 对象中 `include: { tags: true }` 返回的 Tag 标量字段与公开 Tags API 相同（均为所有标量字段），但**不含 `_count`**。因此两个入口在 Tag 暴露粒度上不完全一致：公开 Tags API 额外暴露了 `_count.links` 全局计数，信息泄露更严重。
 
 ### 5.4 字段暴露汇总
 
@@ -465,15 +522,15 @@ const tags = await prisma.tag.findMany({
 |-----------|-------------------------------------|------------------------------------------------|------|
 | `id` | ✅ | ✅ | |
 | `name` | ✅ | ✅ | 正常公开内容 |
-| **`ownerId`** | ✅ | ✅ | **Tag 所有者用户 ID，可反查用户 |
+| **`ownerId`** | ✅ | ✅ | **Tag 所有者用户 ID，可反查公开用户 API |
 | `archiveAsScreenshot` / `archiveAsMonolith` / `archiveAsPDF` / `archiveAsReadable` / `archiveAsWaybackMachine` | ✅ | ✅ | 归档偏好设置 |
 | `aiTag` / `aiGenerated` | ✅ | ✅ | AI 打标相关设置 |
 | `createdAt` / `updatedAt` | ✅ | ✅ | 时间元数据 |
-| `_count.links` | ❌ | ✅ | 公开 Tags API 额外返回该 Collection 下的链接计数 |
+| **`_count.links`** | ❌ | ✅ | **公开 Tags API 额外返回该 Tag 在所有 Collection（含私有）中的总 Links 计数，不是当前 Collection 下的数量** —— 详见 5.3.3.1 |
 | `links`（关联） | ❌ | ❌ | 未 include |
 | `owner`（关联） | ❌ | ❌ | 未 include，但 ownerId 已暴露 |
 
-**暴露差异**：Link 对象中的 tags 与公开 Tags API 在标量字段上**完全一致（都返回所有标量字段）。公开 Tags API 额外返回 `_count.links` 计数。两者均存在过度暴露（ownerId、归档偏好、AI 设置）。
+**暴露差异**：Link 对象中的 tags 与公开 Tags API 在标量字段上**完全一致**（都返回所有标量字段）。公开 Tags API 额外返回 `_count.links` **全局计数**（泄露私有内容规模），信息泄露比 Link 接口更严重。两者均存在过度暴露（ownerId、归档偏好、AI 设置）。
 
 ### 5.5 textContent 裁剪差异的安全边界
 
@@ -776,7 +833,7 @@ archives/preview/${collectionId}/${linkId}.jpeg
 7. ✅ searchLinks 列表 API 裁剪 textContent
 8. ✅ Highlights（高亮）接口需要 verifyUser 认证，公开路由无法访问
 9. ✅ `private` Cache-Control 防止 CDN/代理缓存归档文件
-10. ✅ 公开 Tags API 仅返回指定 Collection 下使用过的 Tag，不会泄露其他 Collection 的 Tag
+10. ✅ 公开 Tags API 仅返回指定 Collection 下使用过的 Tag（通过 `links.some` 筛选），不会返回其他 Collection 中独立使用的 Tag 列表
 
 ### 9.2 潜在风险点
 
@@ -785,13 +842,14 @@ archives/preview/${collectionId}/${linkId}.jpeg
 | 归档文件浏览器缓存 1 年 immutable | `/api/v1/archives/[linkId].ts` | 撤销公开后 1 年内浏览器仍可访问已缓存文件 | **高** |
 | 公开用户 API 支持按 email 查找导致用户枚举 | `/api/v1/public/users/[id].ts`、`getPublicUser.ts` | 可无速率限制地枚举系统用户邮箱，用于钓鱼/撞库前置侦察 | **高** |
 | **公开 Collection 详情 API 暴露 members 权限字段** | `getPublicCollection.ts` | members 关联表（UsersAndCollections）所有标量字段默认返回，匿名用户可查看每个协作者的 `canCreate` / `canUpdate` / `canDelete` 权限级别及 `userId`，暴露团队内部角色分工和用户 ID | **中** |
+| **Tag `_count.links` 全局计数泄露私有 Collection 内容规模** | `getTags.ts` collectionId 分支 | 公开 Tags API 返回的 `_count.links` 是该 Tag 在**所有 Collection（含私有）**中的总 Links 数，而非当前公开 Collection 下的数量。匿名用户可据此推测 Tag 所有者在私有 Collection 中的内容规模 | **中** |
 | **Tag.ownerId 在所有公开入口过度暴露** | `getTags.ts`、Link 查询 `include: { tags: true }` | Tag 是用户级资源，公开 Tags API 和 Link 中的 tags 均返回 `ownerId`，可枚举到所有参与该 Collection 的用户（比 members 列表可能更全面），并可进一步查询公开用户 API | **中** |
 | **Tag 归档偏好与 AI 设置过度暴露** | 同上 | 所有 Tag 的 `archiveAsScreenshot` / `archiveAsPDF` / `archiveAsMonolith` / `archiveAsReadable` / `archiveAsWaybackMachine` / `aiTag` / `aiGenerated` 字段均暴露，反映 Tag 所有者使用习惯，对匿名访问无业务必要性 | **低** |
 | 单 Link API 未裁剪 textContent | `public/links/linkId/getLinkById.ts` | 匿名用户可获取网页正文提取文本（含潜在 PII/版权内容），且与列表 API 策略不一致 | **中** |
 | 公开 Link 返回 collection.ownerId 造成信息关联泄露 | `public/links/linkId/getLinkById.ts`、`searchLinks.ts` | 暴露 Collection 所有者用户 ID，可进一步反向查询该用户的公开基础信息（username/name/头像），但**不能正方向从 ownerId 枚举该用户所有公开 Collection**（无对应 API） | **低** |
 | 公开 Link 返回 collection.parentId 可探测层级结构 | 同上 | 可用于发现父 Collection ID 及未公开的层级结构 | **低** |
 | 公开 Link 返回 collection.isPublic 可探测公开状态 | 同上 | 可直接确认 Collection 是否为公开状态 | **低** |
-| 公开入口信息粒度不一致 | `getPublicCollection.ts` vs Link 查询 | Collection 详情 API 比 Link 对象中的 collection 字段多暴露了 `members`（含权限字段）和 `_count.links`；各入口的字段裁剪策略不统一 | **低** |
+| 公开入口信息粒度不一致 | `getPublicCollection.ts` vs Link 查询 vs 公开 Tags API | Collection 详情 API 比 Link 对象中的 collection 字段多暴露了 `members`（含权限字段）和 `_count.links`；公开 Tags API 比 Link 中的 tags 多暴露了 `_count.links` 全局计数；各入口的字段裁剪策略不统一 | **低** |
 | 无下载速率/次数限制 | 所有 `/api/v1/archives/*` | 匿名用户可无限制下载，潜在带宽滥用 | **中** |
 | 前端 React Query 缓存不随 isPublic 变更自动失效 | `packages/router/*` | 关闭公开后前端仍显示旧数据直到刷新 | **低** |
 | Meilisearch 索引异步更新 | worker 索引延迟 | 搜索结果中仍可搜到刚关闭公开的 Links（分钟级窗口） | **低** |
