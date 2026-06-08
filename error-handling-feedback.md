@@ -143,11 +143,16 @@ const submit = async () => {
 | 字段值 | 代表阶段 | 产生位置 | 是否被 Worker 取到 | 前端展示 |
 |---|---|---|---|---|
 | `null` | **队列中待处理** | 创建链接时的初始值；或刷新归档 API 主动清空 | ✅ **是**（Worker 只取 `lastPreserved: null` 的链接） | 加载动画 / 轮询触发 |
-| `"unavailable"` | **已处理但失败** | Worker archiveHandler 的 finally 块，当某格式未成功生成时写入 | ❌ **否**（Worker 不再碰它） | 该项被隐藏 |
+| `"unavailable"` | **已处理但失败** | Worker archiveHandler 的 finally 块，当某格式未成功生成时写入 | ❌ **否**（Worker 不再碰它） | 该项被隐藏（或显示灰色占位） |
 | 真实路径字符串（如 `"archives/123/456.png"`） | **已处理且成功** | Worker archiveHandler 正常生成文件后写入 | ❌ **否** | 正常展示图片/链接 |
 
 > ⚠️ 核心差异：**`null` 会被 Worker 重新消费，`"unavailable"` 不会。**
-> 因此将某链接从失败状态重新纳入处理队列的唯一方法，就是把相关字段**从 `"unavailable"` 改回 `null`**——这正是所有"刷新/重试"API 做的事。
+> 因此将某链接从失败状态重新纳入处理队列的唯一方法，就是把相关字段**从 `"unavailable"` 改回 `null`**——这是"刷新/重试"API 做的事。
+>
+> ⚠️ **preview 是特殊字段**：
+> 1. 它不参与 `isReady()` 和 `atLeastOneFormatAvailable()` 的判定（这两个函数只看 image/pdf/readable/monolith）
+> 2. 但它是前端**轮询启动的唯一判断依据**（Links.tsx 和 DashboardLinks.tsx 都只看 preview）
+> 3. 管理员 `allBroken`（重新生成损坏链接）**不会处理 preview=unavailable 的情况**（详见第十一章）
 
 ### 3.2 三态在代码中的判断位置
 
@@ -178,7 +183,7 @@ if (links?.some(e => !e.preview?.startsWith("archives") && e.preview !== "unavai
 }
 ```
 
-**详情页 isReady（只判断非空，不区分 unavailable vs 路径）**：
+**详情页 isReady（只判断 image/pdf/readable/monolith，完全不看 preview）**：
 [LinkDetails.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkDetails.tsx#L106-L114)
 ```typescript
 const isReady = () => {
@@ -186,9 +191,28 @@ const isReady = () => {
     (collectionOwner.archiveAsScreenshot ? link.pdf : true) &&
     (collectionOwner.archiveAsMonolith ? link.monolith : true) &&
     (collectionOwner.archiveAsPDF ? link.pdf : true) &&
-    link.readable;  // ← 只要非空就算 ready，"unavailable" 也算 ready
+    link.readable;
+  // ↑ 四个判断：pdf（对应截图和PDF两种格式）、monolith、readable
+  // ↑ 注意：**完全不包含 preview**
+  // ↑ 只要非空就算 ready，"unavailable" 也算 ready
 };
 ```
+
+**atLeastOneFormatAvailable（同样不包含 preview）**：
+[formatStats.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/packages/lib/formatStats.ts#L11-L20)
+```typescript
+export const atLeastOneFormatAvailable = (link) => {
+  return (
+    formatAvailable(link, "image") ||
+    formatAvailable(link, "pdf") ||
+    formatAvailable(link, "readable") ||
+    formatAvailable(link, "monolith")
+    // ↑ 四个格式，**完全不包含 preview**
+  );
+};
+```
+
+因此 preview 无论是 null 还是 "unavailable"，都不影响 LinkDetails 的三态分支判断。
 
 **Worker 统计 failed（全部四个格式均为 unavailable）**：
 [getWorkerStats.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/lib/api/controllers/worker/getWorkerStats.ts#L25-L34)
@@ -531,7 +555,8 @@ for (const link of brokenArchives) {
 与"批量 DELETE /api/v1/links/archive"的关键差异：
 - **allBroken 不删文件**（没有调用 `removeFiles`），只把 DB 字段改回 null。
 - **allBroken 有选择性**：只把用户需要（根据用户设置和归档标签判断）且已失败的那些格式改为 null，不影响已成功的格式。
-- **allAndRePreserve 与批量 DELETE 效果相同**：全部字段 → null + 删文件。
+- **⚠️ allBroken 不会处理 preview**：brokenArchives 查询的 OR 条件包含 `{ preview: "unavailable" }`（能把只 preview 失败的链接捞出来），但 `needsReprocessing` 判断和 `data` 更新对象里完全没有 preview 字段。因此如果一个链接只有 preview = unavailable、其余格式都成功，它会被查出来但 needsReprocessing = false，什么也不做（详见第十一章）。
+- **allAndRePreserve 与批量 DELETE 效果相同**：全部字段（包括 preview）→ null + 删文件。
 
 ### 5.4 三条 API 的"重新排队"流程总结
 
@@ -603,16 +628,19 @@ try {
 | **部分就绪** | `!isReady() && atLeastOneFormatAvailable(link)` | 小加载动画 + `there_are_more_formats` + `check_back_later` |
 | **全部完成** | `isReady()` | 展示可用格式（不可用的被 `formatAvailable` 隐藏） |
 
-注意：当所有格式都是 `"unavailable"` 时，`isReady()` 返回 true（非空即可），`atLeastOneFormatAvailable()` 返回 false（`"unavailable"` 被判定为不可用），但因为 `isReady()` 已为 true，页面直接展示"全部完成"态——这意味着**全失败的链接看起来和全部成功的一样，只是所有格式行都被隐藏了**，用户只能通过缺少内容来推测失败。
+注意：
+1. `isReady()` 和 `atLeastOneFormatAvailable()` **完全不包含 preview**——只看 image/pdf/readable/monolith。preview 为 null 或 unavailable 都不影响详情页三态分支的选择。
+2. 当所有格式都是 `"unavailable"` 时，`isReady()` 返回 true（非空即可），`atLeastOneFormatAvailable()` 返回 false（`"unavailable"` 被判定为不可用），但因为 `isReady()` 已为 true，页面直接展示"全部完成"态——这意味着**全失败的链接看起来和全部成功的一样，只是所有格式行都被隐藏了**，用户只能通过缺少内容来推测失败。
+3. 前端列表页轮询**只看 preview**，与详情页三态的判断来源完全不同。
 
 ### 6.3 列表页的自动轮询
 
-[Links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/Links.tsx#L405-L425)
+[Links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/Links.tsx#L405-L425) 和 [DashboardLinks.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/DashboardLinks.tsx#L110-L130) 轮询逻辑完全一致。
 
 ```typescript
 useEffect(() => {
   let interval = null;
-  // 只要有任一链接的 preview 既不是已完成路径也不是 unavailable，就每 5s 刷新
+  // ⚠️ 只看 preview！image/pdf/readable/monolith 一概不看
   if (links?.some(e => !e.preview?.startsWith("archives") && e.preview !== "unavailable")) {
     interval = setInterval(async () => {
       useData.refetch();
@@ -622,7 +650,12 @@ useEffect(() => {
 }, [links]);
 ```
 
-这是"队列中"状态自动消失的机制——持续轮询直到所有格式被标记为已完成路径或 `"unavailable"`。
+轮询条件解读：
+- `preview` 既不是 `archives/` 开头（真实路径），也不是 `"unavailable"` → 视为 `null`/处理中 → 启动轮询
+- `preview = "unavailable"` → 视为终态（和真实路径一样）→ 不轮询
+- ⚠️ **即使 image/pdf/readable/monolith 全部仍为 null（在队列中），只要 preview 已完成或已 unavailable，轮询就不会启动**。这意味着 preview 是前端轮询的唯一哨兵。
+
+这是"队列中"状态自动消失的机制——持续轮询直到 preview 被标记为已完成路径或 `"unavailable"`。
 
 ---
 
@@ -835,12 +868,16 @@ admin/background-jobs → 点击 regenerate_broken_links
 | `toast.error(t(error.message))` 的 message 都是 i18n key？ | ❌ 只有前端主动抛出的少量是 key（如 `invalid_url_guide`），后端返回的全是英文硬编码，`t()` 找不到就原样输出 |
 | `"unavailable"` 和 `null` 含义相同？ | ❌ `null` = 在队列中未处理，**Worker 会取**；`"unavailable"` = 已处理但失败，**Worker 不会再取**。前者触发轮询，后者不 |
 | Worker 失败后会自动重试吗？ | ❌ 不会。linkProcessing 的 catch 只打 console.error，finally 已经把 lastPreserved 写为非 null，Worker 下一轮取不到这条链接。必须人工通过刷新 API 把 lastPreserved 改回 null |
-| `isReady()` 判断归档完成？ | ❌ 只判断字段非空。全部都是 `"unavailable"` 也会被判定为 ready，此时页面看起来"完成了"但所有格式行都被隐藏 |
+| `isReady()` 判断归档完成，包含 preview 吗？ | ❌ **完全不包含 preview**。isReady() 只看 pdf（对应截图和PDF）、monolith、readable 四个判断；atLeastOneFormatAvailable() 同样不含 preview。preview 为 null 或 unavailable 都不影响详情页三态 |
+| `isReady()` 如何判断"完成"？ | ❌ 只判断字段非空。全部都是 `"unavailable"` 也会被判定为 ready，此时页面看起来"完成了"但所有格式行都被隐藏 |
 | `formatAvailable()` 参与页面三态判断？ | ✅ 三态用 `isReady()` + `atLeastOneFormatAvailable()`，后者又依赖 `formatAvailable()` |
+| 前端轮询启动的判断依据是什么？ | **只看 preview**（Links.tsx 和 DashboardLinks.tsx 都只检查 preview）——`!preview.startsWith("archives") && preview !== "unavailable"` 才启动轮询。和 isReady/atLeastOneFormatAvailable 的判断源完全不同 |
 | 乐观更新失败时 toast 和回滚谁先执行？ | 先 toast，后回滚缓存。在 `onError` 中顺序执行 |
 | 刷新重试的入口有几个？ | **4 个**：列表卡片下拉、详情页按钮（这两个走单条 PUT）；已选链接批量（走 DELETE /api/v1/links/archive）；后台 Background Jobs 的全部损坏/全部（走 DELETE /api/v1/worker/preservation） |
 | 批量刷新和单条刷新除了条数还有什么区别？ | 批量 DELETE 先返回 200 再异步处理，单条 PUT 处理完后才返回；批量权限校验用 canDelete，单条用 canUpdate；批量不检查 URL 有效性（where 已过滤） |
-| allBroken 和 allAndRePreserve 的区别？ | allAndRePreserve 把所有链接的所有格式都置 null（且删文件），等价于全量刷新；allBroken 只把用户开启且当前为 unavailable 的那些字段置 null（不删文件），不影响已成功的格式 |
+| allBroken 和 allAndRePreserve 的区别？ | allAndRePreserve 把所有链接的所有格式（含 preview）都置 null（且删文件），等价于全量刷新；allBroken 只把用户开启且当前为 unavailable 的 image/pdf/readable/monolith 置 null（不删文件），**不处理 preview** |
+| allBroken 能修复 preview=unavailable 的链接吗？ | ❌ **不能**。brokenArchives 查询的 OR 条件包含 preview=unavailable（能查出来），但 needsReprocessing 和 update data 中完全没有 preview 字段。若链接只有 preview 失败、其余四个都成功 → needsReprocessing = false → 什么都不做。只能走单条刷新、批量已选刷新、或 allAndRePreserve |
+| handleArchivePreview 的 buffer 超限会抛异常吗？ | ❌ 不会。screenshot.then() 里 buffer 超限只是 `return console.log(...)`，Promise 正常 resolve，handleArchivePreview 正常返回（静默失败），最后 finally 兜底把 preview 写为 unavailable。只有 page.screenshot() 本身 reject 才会向外抛异常 |
 | 让 Worker 重新处理一条链接的唯一手段是什么？ | **把 lastPreserved 改回 null**。Worker 的取任务条件 hardcode 为 `lastPreserved: null`，改其他字段都没用 |
 
 ---
@@ -950,24 +987,37 @@ if (ogImageUrl) {
 **分支 2：og:image 不存在或失败，直接对页面截图**
 ```typescript
 if (!previewGenerated && !link.preview?.startsWith("archive")) {
-  await page.screenshot({ type: "jpeg", quality: 20 })
+  await page
+    .screenshot({ type: "jpeg", quality: 20 })
     .then(async (screenshot) => {
-      if (Buffer.byteLength(screenshot) > 1024 * 1024 * PREVIEW_MAX_BUFFER)
+      if (
+        Buffer.byteLength(screenshot) >
+        1024 * 1024 * Number(process.env.PREVIEW_MAX_BUFFER || 10)
+      )
         return console.log("Error generating preview: Buffer size exceeded");
-      // 写文件 + 写 DB
-      await createFile({ data: screenshot, filePath: `archives/preview/...` });
+
+      await createFile({
+        data: screenshot,
+        filePath: `archives/preview/${link.collectionId}/${link.id}.jpeg`,
+      });
+
       await prisma.link.update({
         where: { id: link.id },
-        data: { preview: `archives/preview/${link.collectionId}/${link.id}.jpeg` },
+        data: {
+          preview: `archives/preview/${link.collectionId}/${link.id}.jpeg`,
+        },
       });
     });
-  // 注意：这里是 .then() 不是 await！
-  // 如果 screenshot 本身抛异常，Promise 被 reject，没有 .catch，最终 unhandled →
-  //    archiveHandler 的 catch 捕获 → finally 执行 → preview 仍为空 → 写 unavailable
+  // 注意：外层有 await！await 包裹整个 page.screenshot().then(...) Promise 链
+  // 路径 A：page.screenshot() 本身 reject → 整个 Promise 链 reject → await 抛出 →
+  //    handleArchivePreview 抛错 → archiveHandler catch 捕获 → finally 执行
+  // 路径 B：screenshot 成功但 buffer 超限 → .then() 回调里 return console.log(...) →
+  //    Promise 正常 resolve（值为 undefined）→ handleArchivePreview 正常返回、不抛错 →
+  //    但 preview 字段仍为 null → finally 把它写为 "unavailable"（静默失败，只有 console.log）
 }
 ```
 
-关键点：**`page.screenshot()` 没有 `await`，用的是 `.then()` 链式调用**。如果 screenshot 本身 reject（例如页面已关闭、浏览器断开），这个 Promise 的错误会冒泡到外层 Promise.race → archiveHandler catch → finally。此时 `finalLink.preview` 仍为 null，finally 就会写 `"unavailable"`。
+关键点：**`await` 包裹了整个 `page.screenshot().then(...)` 链**，所以 screenshot reject 会向外层传播。但 buffer 超限是 `.then()` 回调内部的 `return`，不抛异常，属于**静默失败**——函数正常返回，preview 没写入 DB，最后 finally 兜底写 unavailable。
 
 **而 preview 与其他四个格式不同之处**：它不受用户 `archivalSettings` 控制——不管用户有没有开启 archiveAsScreenshot/PDF，preview 都会无条件尝试生成（[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/archiveHandler.ts#L168-L169)）：
 ```typescript
@@ -1070,9 +1120,9 @@ lastPreserved: "2026-06-08T10:00:00.000Z"
 |---|---|---|
 | Worker 取任务？ | ❌ lastPreserved ≠ null | 不会被重新处理 |
 | `formatAvailable(link, "preview")` | ❌ preview = "unavailable" | 认为该格式不可用 |
-| `isReady()` 判断 | ✅ preview 非空即可 | 认为"准备就绪" |
-| `atLeastOneFormatAvailable()` | ✅ image/pdf 等有真实路径 | 认为至少有一个可用 |
-| 详情页状态 | 走"全部完成"分支 | 看起来正常，只是预览图区域是灰色占位块 |
+| `isReady()` 判断 | ✅ true（preview 不参与判断） | isReady() 只看 pdf/monolith/readable，不看 preview → 认为"准备就绪" |
+| `atLeastOneFormatAvailable()` | ✅ true（image/pdf 等有真实路径） | 同样不包含 preview → 认为至少有一个可用 |
+| 详情页状态 | 走"全部完成"分支 | 因为 isReady() = true，直接渲染完成态 |
 | 前端列表轮询 | ❌ preview = "unavailable" | 轮询不启动 |
 
 **4. 前端轮询为什么不启动？**
