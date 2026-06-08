@@ -341,17 +341,74 @@ const replaceLinkInInfiniteData = (oldData, link) => {
 
 #### 6.2.3 错配场景详解：useDeleteLink 的移除
 
-[removeLinkFromInfiniteData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L224-L234) 的逻辑是：**从所有 pages 中过滤掉匹配 id 的链接**。
+[removeLinkFromInfiniteData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L224-L234) 的逻辑是：**遍历所有已缓存的 pages，对每一页的 links 数组执行 filter，删除匹配 id 的元素**。
 
-这个操作是安全的——从所有筛选缓存中删除该 id 都不会引入"不该存在的元素"，最多是从本来就不包含它的缓存中做了一次空过滤。但仍有一个细节：
+```typescript
+const removeLinkFromInfiniteData = (oldData, linkId) => {
+  if (!oldData?.pages?.length) return oldData;
+  return {
+    ...oldData,
+    pages: oldData.pages.map(page => ({
+      ...page,
+      links: (page.links ?? []).filter(item => item.id !== linkId),  // 每一页都 filter
+    })),
+  };
+};
+```
 
-| 缓存 | onMutate 后 | onSuccess 后 |
-|------|------------|-------------|
-| 包含该 id 的缓存（如 col1） | ✅ 正确删除 | `setQueriesData` 再次 filter 确保删除 |
-| 不包含该 id 的缓存（如 col2） | ⚠️ 无变化（正确） | ⚠️ 无变化 |
-| 所有缓存 | - | `invalidateQueries(dashboardData, collections, tags, publicLinks)` |
+这个操作**不会因为链接不在第一页而漏删**——`pages.map()` 会覆盖所有已加载的分页。onMutate 中调用一次，onSuccess 中用服务端返回的 id 又防御性地 filter 一次，路径如下：
 
-**注意**：useDeleteLink 的 onSuccess **没有** `invalidateQueries(["links"])`，而是用 `setQueriesData` 手动再删一遍。这意味着删除后不会触发 links 缓存的刷新，依赖乐观删除的准确性——如果 onMutate 删除时有遗漏（例如缓存分页不在第一页），onSuccess 的 filter 也会漏掉。
+| 阶段 | 函数 | 范围 |
+|------|------|------|
+| onMutate | `removeLinkFromInfiniteData(oldData, id)` | 所有已缓存页 |
+| onSuccess | `pages.map(page => page.links.filter(...))` | 所有已缓存页（与 onMutate 等价，防御性冗余） |
+
+从筛选错配的角度看，删除操作是**安全的**——从所有筛选缓存中删除该 id 不会引入"不该存在的元素"，最多是从本来就不包含它的缓存中做了一次空过滤。
+
+##### ⚠️ 删除后不重新拉取 links 缓存带来的分页空洞
+
+`useDeleteLink` 的 onSuccess **没有** `invalidateQueries(["links"])`，这意味着 links 缓存不会从服务端重新拉取。这样避免了网络请求，但引入了**分页空洞**和**数量回补边界**问题：
+
+**分页空洞的形成**（假设 `PAGINATION_TAKE_COUNT=50`）：
+
+```
+初始缓存（3 页，每页 50 条，nextCursor 基于每页最后一条的 id）：
+  page1: [id1..id50]   nextCursor=id50
+  page2: [id51..id100] nextCursor=id100
+  page3: [id101..id150] nextCursor=id150  →  hasNextPage = true
+
+用户删除 id75（位于 page2 中间）后：
+  page1: [id1..id50]   nextCursor=id50    (不变)
+  page2: [id51..id74, id76..id100]  →  **49 条**（空洞出现）  nextCursor=id100 (不变)
+  page3: [id101..id150] nextCursor=id150  (不变)  →  hasNextPage = true
+```
+
+关键事实：
+1. **每页的 `nextCursor` 在删除时完全不更新**——它保留的是删除前该页最后一条的 id
+2. 某页被删除到 0 条也不会触发该页从 pages 数组中移除，只是变成空数组
+3. **`hasNextPage` 只看最后一页的 `nextCursor` 是否存在**，与各页实际条数无关
+
+**数量回补边界分析**（用户继续滚动，触发 `fetchNextPage()`）：
+
+| 场景 | 行为 | 后果 |
+|------|------|------|
+| 空洞在中间页（如 page2=49 条） | `fetchNextPage` 用 page3.nextCursor=id150 请求 page4 | 新页 page4 正常返回 id151..id200 的 **50 条完整数据**，但 page2 的 49 条空洞**永远不会被回补** |
+| 空洞在最后一页，删完后 lastPage 仍有数据 | nextCursor 不变，继续正常拉取下一页 | 同上，不回补旧空洞 |
+| 空洞在最后一页且恰好删光（page3 从 1 条 → 0 条） | page3.nextCursor 仍保留原值，`hasNextPage=true` | 用户看到底部骨架屏 → fetchNextPage 拉到 id>page3.originalLastId 的 50 条新页 → 视觉上从"空尾页"跳到"新的完整页"，中间缺的数据丢失 |
+| 极端：累计删除量 > 已加载总数 - 1 | nextCursor 仍然有效 | 可能出现"本地只剩 10 条显示，但 hasNextPage 仍为 true"的反直觉状态 |
+
+**`useBulkDeleteLinks` 的行为相同**——[onSuccess](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L920-L936) 同样只做 `pages.map + filter`，不 invalidate links 缓存，批量删除时分页空洞数量可能更多。
+
+##### 为什么不 invalidate？——权衡设计
+
+选择手动 filter 而不重新拉取 links 缓存，是基于以下权衡：
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **当前：手动 filter（乐观删除）** | 立即响应、无网络开销、不破坏已加载分页的用户滚动位置 | 分页空洞、nextCursor 不更新、极端状态反直觉 |
+| 替代：invalidateQueries 全量刷新 | 数据与服务端严格一致，无空洞 | 网络请求开销、用户滚动位置可能丢失、闪烁 |
+
+当前选择偏向用户体验的即时性，分页空洞在大多数情况下不明显（用户删除后通常不会立刻细查每页数量）。
 
 #### 6.2.4 dashboardData 与 links 缓存的差异
 
