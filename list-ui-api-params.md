@@ -112,6 +112,54 @@ Object.keys(params)
 
 **⚠️ 潜在风险**：`pinnedOnly: false` 会被序列化为 `pinnedOnly=false` 发送，但后端仅检查 `pinnedOnly && userId`，因此值为 `false` 时不会触发 pinned 过滤。然而对于布尔参数的语义可能造成混淆。
 
+### 3.5 请求参数进入搜索接口前的类型转换链路
+
+参数从前端到后端 `searchLinks` 控制器经历 **4 次形态转换**，每一步都有类型丢失或错配风险：
+
+```
+前端 LinkRequestQuery (强类型对象)
+    │  buildQueryString + encodeURIComponent
+    ▼
+URL query string (全是字符串)
+    │  Next.js 解析为 req.query (string | string[] | undefined)
+    ▼
+后端路由层手动类型转换 (强转/条件判断)
+    │  [/api/v1/search/index.ts] / [/api/v1/public/collections/links/index.ts]
+    ▼
+searchLinks({ query: LinkRequestQuery, userId, publicOnly })
+```
+
+#### 转换细节对照表（以私有接口 [search/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/apps/web/pages/api/v1/search/index.ts#L15-L28) 为例）
+
+| 参数 | 前端类型 | URL 中形态 | req.query 类型 | 后端转换代码 | 转换后类型 | 边界漏洞 |
+|------|---------|-----------|---------------|-------------|-----------|---------|
+| sort | `Sort \| undefined` (number enum) | `"sort=0"` | `string \| undefined` | `Number(req.query.sort as string)` | `number` (可能为 NaN) | **不传时为 NaN**，而 NaN 不等于 Sort 枚举任一值，fallback 到 `{ id: "desc" }` (等同于 DateNewestFirst) |
+| cursor | `number \| undefined` | `"cursor=50"` / 无 | `string \| undefined` | `req.query.cursor ? Number(...) : undefined` | `number \| undefined` | cursor=0 被当作"无游标"，在 prisma cursor 模式下不会 skip |
+| collectionId | `number \| undefined` | `"collectionId=3"` | `string \| undefined` | `req.query.collectionId ? Number(...) : undefined` | `number \| undefined` | 传空串 `""` 走 undefined 分支；传 `"abc"` 转为 NaN 进入查询会查不到结果 |
+| tagId | `number \| undefined` | `"tagId=7"` | `string \| undefined` | `req.query.tagId ? Number(...) : undefined` | `number \| undefined` | 同上 |
+| pinnedOnly | `boolean \| undefined` | `"pinnedOnly=true"` / `"pinnedOnly=false"` / 无 | `string \| undefined` | `req.query.pinnedOnly ? req.query.pinnedOnly === "true" : undefined` | `boolean \| undefined` | `"false"` 字符串被视为 truthy，会正确返回 false；**不传和传空串都返回 undefined**，但前端若传 pinnedOnly=false 则 URL 中有值且被转为 false，后端不会走 pinned 过滤 |
+| searchQueryString | `string \| undefined` | `"searchQueryString=hello"` | `string \| undefined` | 原样透传 | `string \| undefined` | 前端 SearchBar 用 `router.query.q`，但 useLinks 接收的参数名是 `searchQueryString`，两者通过页面组件中转时需 rename |
+
+#### 公共接口 vs 私有接口的参数差异
+
+公共接口 [public/collections/links/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/apps/web/pages/api/v1/public/collections/links/index.ts#L11-L23) **缺少 `tagId` 字段处理**：
+
+```typescript
+// 私有接口：支持全部 6 个字段
+const convertedData: LinkRequestQuery = { sort, cursor, collectionId, tagId, pinnedOnly, searchQueryString };
+
+// 公共接口：只有 5 个字段，无 tagId
+const convertedData: LinkRequestQuery = { sort, cursor, collectionId, pinnedOnly, searchQueryString };
+```
+
+这意味着**公共集合页面无法按标签筛选**，不是 bug 而是设计，但在新增参数时两处需同步更新。
+
+#### 易漏类型转换 Checklist
+
+1. ☐ 新增 `LinkRequestQuery` 字段时，**两个**路由文件（私有 + 公共）都要加转换逻辑
+2. ☐ Number() 转换后若为 NaN，应 fallback 到 undefined 而非传入查询
+3. ☐ `searchQueryString` 前后端参数名不对称：前端 SearchBar 用 `q`，页面需手动映射到 `searchQueryString`
+
 ---
 
 ## 四、筛选变更后的分页复位
@@ -223,14 +271,104 @@ onSuccess:
 | `isFetchingNextPage` 守卫 | [Links.tsx:379](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/apps/web/components/LinkViews/Links.tsx#L379) | 防止无限滚动重复请求 |
 | `setQueriesData` 同步更新 | mutation onMutate/onSuccess | 本地状态立即更新，避免等待网络 |
 
-### 6.2 多 queryKey 数据同步问题
+### 6.2 多 queryKey 数据同步与筛选缓存错配
 
-`useLinks` 的 queryKey 为 `["links", { params }]`，不同筛选参数会产生不同缓存条目。Mutation 使用 `setQueriesData({ queryKey: ["links"] })` 匹配**所有**以 `["links"]` 开头的 key。
+`useLinks` 的 queryKey 为 `["links", { params }]`，不同筛选参数会产生**独立的缓存条目**。典型的缓存矩阵如下：
 
-**存在的同步风险**：
-1. 用户在 `/collections/1` 编辑了链接 → `setQueriesData` 更新所有 `["links", ...]` 缓存
-2. 用户切换到 `/collections/2` → 若该缓存已存在，数据是正确同步的
-3. 但若 `/collections/2` 缓存尚未加载，后续加载时会从服务端获取最新数据 → **最终一致**
+| queryKey | 对应场景 |
+|----------|---------|
+| `["links", { params: "sort=0" }]` | /links 全部链接 |
+| `["links", { params: "sort=0&collectionId=1" }]` | /collections/1 |
+| `["links", { params: "sort=0&tagId=5" }]` | /tags/5 |
+| `["links", { params: "sort=0&pinnedOnly=true" }]` | /links/pinned |
+| `["links", { params: "sort=0&searchQueryString=hello" }]` | /search?q=hello |
+
+Mutation 使用 `setQueriesData({ queryKey: ["links"] })` 匹配**所有**以 `["links"]` 开头的 key——这意味着一次更新会同时写入上述全部 5 个缓存。
+
+#### 6.2.1 错配场景详解：useAddLink 的乐观插入
+
+[upsertLinkInInfiniteData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L162-L191) 的逻辑是：**已存在则替换，不存在则追加到第一页开头**。
+
+```typescript
+const upsertLinkInInfiniteData = (oldData, link, optimisticId) => {
+  // ...遍历 pages 尝试替换...
+  if (!replaced) {
+    // 未找到 → 无脑插入到第一页最前面
+    pages[0] = { ...firstPage, links: upsertLinkInList(firstPage?.links ?? [], link, optimisticId) };
+  }
+  return { ...oldData, pages };
+};
+```
+
+**典型错配场景**：用户在 `/collections/1` 页面下，通过 NewLinkModal 创建了一个归属 `collectionId=2` 的新链接。各缓存的瞬时状态：
+
+| 缓存 (queryKey) | 应不应该包含新链接 | onMutate 后的实际状态 | 后果 |
+|-----------------|-------------------|----------------------|------|
+| `params="collectionId=1"` | ❌ 不应包含 | ✅ 被乐观插入 | **错配**：当前页短暂出现一条不属于该集合的链接 |
+| `params="collectionId=2"` | ✅ 应该包含 | ✅ 被乐观插入 | 正确（若缓存已存在） |
+| `params="collectionId=2"` 尚未加载 | ✅ 应该包含 | ❌ 缓存不存在，无写入 | 正确（首次加载时从服务端获取） |
+| `params="tagId=5"` | ❌ 若新链接无此 tag 则不应 | ✅ 被乐观插入 | **错配**：tag 列表混入无关链接 |
+| `params="pinnedOnly=true"` | ❌ 若未 pin 则不应 | ✅ 被乐观插入 | **错配**：pinned 页出现未 pin 链接 |
+| `params="searchQueryString=xxx"` | 取决于搜索词 | ✅ 被乐观插入 | **错配**：搜索结果页混入不匹配的新链接 |
+
+**修正时序**：onSuccess 中 `invalidateQueries({ queryKey: ["dashboardData", "collections", "tags", "publicLinks"] })` 会触发这些缓存重新获取；但 `["links"]` 缓存**没有被 invalidate**，而是通过 `setQueriesData` 将乐观 ID 替换为真实 ID——意味着上述错配数据会**一直保留**，直到用户切换页面触发新 queryKey 或手动刷新。
+
+#### 6.2.2 错配场景详解：useUpdateLink 的替换
+
+[replaceLinkInInfiniteData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L307-L328) 的逻辑是：**遍历所有 page，找到匹配 id 则替换，找不到则原样返回**。
+
+```typescript
+const replaceLinkInInfiniteData = (oldData, link) => {
+  let updated = false;
+  const pages = oldData.pages.map(page => ({
+    ...page,
+    links: page.links.map(item => item.id === link.id ? (updated = true, link) : item)
+  }));
+  return updated ? { ...oldData, pages } : oldData;  // 未找到则不变更
+};
+```
+
+**典型错配场景**：用户将链接 A 从 `collectionId=1` 移动到 `collectionId=2`。
+
+| 缓存 | 应不应该包含链接 A | onMutate 后状态 | 后果 |
+|------|-------------------|----------------|------|
+| `params="collectionId=1"` | ❌ 应该被移除 | ✅ 仍存在（原地替换，未删除） | **错配**：col1 页面残留已移走的链接 |
+| `params="collectionId=2"` | ✅ 应该出现 | ❌ 若原缓存中无此 id 则不会被插入 | **错配**：col2 页面看不到新移入的链接 |
+| `params="tagId=5"` | 取决于 A 是否仍有 tag5 | 原地替换字段 | 基本正确（若 tag 也变了则仍有短暂错配） |
+| `params="pinnedOnly=true"` | 取决于 A 是否仍 pinned | 原地替换 pinnedBy 字段 | 基本正确 |
+
+**修正时序**：useUpdateLink 的 onSuccess **有** `invalidateQueries({ queryKey: ["links"] })`，会触发全量重新获取，所以错配是暂时的。
+
+#### 6.2.3 错配场景详解：useDeleteLink 的移除
+
+[removeLinkFromInfiniteData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L224-L234) 的逻辑是：**从所有 pages 中过滤掉匹配 id 的链接**。
+
+这个操作是安全的——从所有筛选缓存中删除该 id 都不会引入"不该存在的元素"，最多是从本来就不包含它的缓存中做了一次空过滤。但仍有一个细节：
+
+| 缓存 | onMutate 后 | onSuccess 后 |
+|------|------------|-------------|
+| 包含该 id 的缓存（如 col1） | ✅ 正确删除 | `setQueriesData` 再次 filter 确保删除 |
+| 不包含该 id 的缓存（如 col2） | ⚠️ 无变化（正确） | ⚠️ 无变化 |
+| 所有缓存 | - | `invalidateQueries(dashboardData, collections, tags, publicLinks)` |
+
+**注意**：useDeleteLink 的 onSuccess **没有** `invalidateQueries(["links"])`，而是用 `setQueriesData` 手动再删一遍。这意味着删除后不会触发 links 缓存的刷新，依赖乐观删除的准确性——如果 onMutate 删除时有遗漏（例如缓存分页不在第一页），onSuccess 的 filter 也会漏掉。
+
+#### 6.2.4 dashboardData 与 links 缓存的差异
+
+[dashboardData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/dashboardData.tsx#L16-L35) 是独立缓存（queryKey 为 `["dashboardData"]`，非 `["links", ...]`），结构也不同：
+
+```typescript
+// dashboardData 结构（非 infinite pages）
+{
+  links: Link[],                    // 最近 16 条
+  collectionLinks: { [colId]: Link[] },  // 各集合最近 16 条
+  numberOfPinnedLinks: number,
+  numberOfTags: number,
+  ...
+}
+```
+
+乐观更新函数 [upsertLinkInDashboardData](file:///d:/fz/0601/solo-dogfeeding/code/95-linkwarden/packages/router/links.tsx#L193-L222) 有针对性逻辑：**只把链接插入到对应 collectionId 的 collectionLinks 子列表中**，不会污染其他集合的 dashboard 缓存。这与 `upsertLinkInInfiniteData` 的"全量无脑插入"形成对比——dashboardData 的筛选感知更强，但 links 的分页缓存做不到按筛选条件过滤。
 
 ### 6.3 queryKey 参数敏感性
 
