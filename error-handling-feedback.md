@@ -134,9 +134,433 @@ const submit = async () => {
 
 ---
 
-## 三、异步归档失败处理流程
+## 三、归档字段三态定义（null / unavailable / 真实路径）
 
-### 3.1 Worker 端归档处理
+这是整个串联系统最关键的约定，三种字段值分别代表完全不同的生命周期阶段。
+
+### 3.1 三态含义一览
+
+| 字段值 | 代表阶段 | 产生位置 | 是否被 Worker 取到 | 前端展示 |
+|---|---|---|---|---|
+| `null` | **队列中待处理** | 创建链接时的初始值；或刷新归档 API 主动清空 | ✅ **是**（Worker 只取 `lastPreserved: null` 的链接） | 加载动画 / 轮询触发 |
+| `"unavailable"` | **已处理但失败** | Worker archiveHandler 的 finally 块，当某格式未成功生成时写入 | ❌ **否**（Worker 不再碰它） | 该项被隐藏 |
+| 真实路径字符串（如 `"archives/123/456.png"`） | **已处理且成功** | Worker archiveHandler 正常生成文件后写入 | ❌ **否** | 正常展示图片/链接 |
+
+> ⚠️ 核心差异：**`null` 会被 Worker 重新消费，`"unavailable"` 不会。**
+> 因此将某链接从失败状态重新纳入处理队列的唯一方法，就是把相关字段**从 `"unavailable"` 改回 `null`**——这正是所有"刷新/重试"API 做的事。
+
+### 3.2 三态在代码中的判断位置
+
+**Worker 取任务的 where 条件（只认 null）**：
+[getLinkBatchFairly.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/getLinkBatchFairly.ts#L35-L38)
+```typescript
+const baseLinkWhere: Prisma.LinkWhereInput = {
+  url: { not: null },
+  lastPreserved: null,   // ← 只有 lastPreserved 为 null 才会被取出处理
+};
+```
+
+**前端判断某格式是否可用**：
+[formatStats.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/packages/lib/formatStats.ts#L1-L20)
+```typescript
+export function formatAvailable(link, format) {
+  return Boolean(link && link[format] && link[format] !== "unavailable");
+}
+// 返回 true 的情况：格式存在且不是 "unavailable" → 即只有真实路径才通过
+```
+
+**前端列表页轮询触发条件（认为"在队列中"）**：
+[Links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/Links.tsx#L405-L425)
+```typescript
+// preview 既不是 archives/ 开头（真实路径），也不是 "unavailable" → 视为 null/处理中
+if (links?.some(e => !e.preview?.startsWith("archives") && e.preview !== "unavailable")) {
+  interval = setInterval(..., 5000);
+}
+```
+
+**详情页 isReady（只判断非空，不区分 unavailable vs 路径）**：
+[LinkDetails.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkDetails.tsx#L106-L114)
+```typescript
+const isReady = () => {
+  return link &&
+    (collectionOwner.archiveAsScreenshot ? link.pdf : true) &&
+    (collectionOwner.archiveAsMonolith ? link.monolith : true) &&
+    (collectionOwner.archiveAsPDF ? link.pdf : true) &&
+    link.readable;  // ← 只要非空就算 ready，"unavailable" 也算 ready
+};
+```
+
+**Worker 统计 failed（全部四个格式均为 unavailable）**：
+[getWorkerStats.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/lib/api/controllers/worker/getWorkerStats.ts#L25-L34)
+```typescript
+const linkFailed = await prisma.link.count({
+  where: {
+    url: { not: null },
+    lastPreserved: { not: null },
+    image: "unavailable",
+    pdf: "unavailable",
+    readable: "unavailable",
+    monolith: "unavailable",
+  },
+});
+```
+
+**Worker 统计 pending（lastPreserved 为 null）**：
+[getWorkerStats.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/lib/api/controllers/worker/getWorkerStats.ts#L6-L11)
+```typescript
+const linkPending = await prisma.link.count({
+  where: { url: { not: null }, lastPreserved: null },
+});
+```
+
+### 3.3 失败写入 unavailable 的代码位置
+
+[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/archiveHandler.ts#L205-L225)
+
+无论 try 成功还是 catch 抛错，finally 都会执行：
+```typescript
+finally {
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      lastPreserved: new Date().toISOString(),   // ← 同时把 lastPreserved 设为非 null
+      readable: !finalLink.readable ? "unavailable" : undefined,
+      image:    !finalLink.image    ? "unavailable" : undefined,
+      monolith: !finalLink.monolith ? "unavailable" : undefined,
+      pdf:      !finalLink.pdf      ? "unavailable" : undefined,
+      preview:  !finalLink.preview  ? "unavailable" : undefined,
+      indexVersion: null,
+    },
+  });
+}
+```
+
+`lastPreserved` 被设置为当前时间 → 此链接从 Worker 队列中永久移出（除非人工刷新把它改回 null）。
+
+---
+
+## 四、Worker 失败后无自动重试机制
+
+### 4.1 linkProcessing 循环的 catch 只打日志
+
+[linkProcessing.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/workers/linkProcessing.ts#L45-L73)
+
+```typescript
+const archiveLink = async (link) => {
+  try {
+    await archiveHandler(link, browser);
+    console.log(`Succeeded processing link ${link.url}...`);
+  } catch (error: any) {
+    console.error(`Error processing link ${link.url}...:`, error);  // ← 仅打日志
+    if (!browser.isConnected?.()) {
+      await restartBrowser("browser disconnected");  // ← 唯一的"重试"：浏览器断了就重启浏览器
+    }
+  }
+};
+
+const processingPromises = links.map((e) => archiveLink(e));
+await Promise.allSettled(processingPromises);  // ← 所有链接处理完就进入下一轮
+```
+
+关键点：
+1. **没有重试队列**：单个链接失败后 catch 只 `console.error`，不会把它重新塞回队列、不会记录重试次数、不会有指数退避。
+2. **没有重试计数**：数据库里没有 `retryCount`、`nextRetryAt` 之类的字段。
+3. **finally 已经写了 lastPreserved 和 unavailable**：archiveHandler 内部的 finally 在 catch 向外抛出之前就已经把字段标记为失败状态，所以即使外层想重试也找不到这个链接了。
+4. **浏览器重启 ≠ 链接重试**：只有当检测到浏览器 websocket 断开时才重启浏览器，但这不会重新处理刚才失败的链接——下一轮循环取的是新的 `lastPreserved: null` 链接。
+
+### 4.2 Worker "重新取任务"的唯一标准：lastPreserved = null
+
+[getLinkBatchFairly.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/getLinkBatchFairly.ts#L35-L38) 已经写死：
+```typescript
+lastPreserved: null
+```
+
+Worker 不会扫描 `image = "unavailable"` 的链接做自动重试，因为它们的 `lastPreserved` 已经被 finally 设为非 null。
+
+**结论：Worker 端的失败是"终态"，必须通过前端手动触发刷新 API，把 lastPreserved 和对应格式字段改回 null，才能让 Worker 重新处理。**
+
+---
+
+## 五、三条刷新/重试入口的真实串联
+
+一共有 **4 个**入口（之前写的 3 个加上"已选链接批量刷新"），对应 **3 条后端 API**：
+
+| 入口 | 前端组件 | 调用 API | 清空字段策略 |
+|---|---|---|---|
+| 单条刷新（卡片菜单） | [LinkActions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkActions.tsx#L59-L76) | `PUT /api/v1/links/{id}/archive` | 全部 6 个字段 → null |
+| 单条刷新（详情页按钮） | [LinkDetails.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkDetails.tsx#L480-L501) / [LinkModal.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/ModalContent/LinkModal.tsx#L123-L139) | `PUT /api/v1/links/{id}/archive` | 全部 6 个字段 → null |
+| **已选链接批量刷新** | [LinkListOptions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkListOptions.tsx#L93-L115) | `DELETE /api/v1/links/archive` | 全部 6 个字段 → null |
+| 管理员"全部损坏 / 全部" | [background-jobs.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/admin/background-jobs.tsx#L16-L204) | `DELETE /api/v1/worker/preservation` | 只把 unavailable 的改为 null（有选择性） |
+
+### 5.1 入口 A：单条刷新 — PUT /api/v1/links/{id}/archive
+
+[archive/[id]/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/api/v1/links/%5Bid%5D/archive/index.ts#L39-L72)
+
+```typescript
+if (req.method === "PUT") {
+  if (!link.url || !isValidUrl(link.url))
+    return res.status(200).json({ response: "Invalid URL." });
+
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      image: null,
+      pdf: null,
+      readable: null,
+      monolith: null,
+      preview: null,
+      lastPreserved: null,   // ← 关键：置 null 后 Worker 下一轮就会取到
+      indexVersion: null,
+      clientSide: false,
+    },
+  });
+
+  await removeFiles(link.id, link.collection.id);  // 删除磁盘上的旧文件
+
+  return res.status(200).json({ response: "Link is being archived." });
+}
+```
+
+前端调用（[LinkActions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkActions.tsx#L59-L76)）：
+```typescript
+const updateArchive = async () => {
+  const load = toast.loading(t("sending_request"));
+  const response = await fetch(`/api/v1/links/${link?.id}/archive`, { method: "PUT" });
+  const data = await response.json();
+  toast.dismiss(load);
+
+  if (response.ok) {
+    refetch();
+    toast.success(t("link_being_archived"));
+  } else {
+    toast.error(data.response);  // 后端英文直显，不走 t()
+  }
+};
+```
+
+### 5.2 入口 B：已选链接批量刷新 — DELETE /api/v1/links/archive
+
+**这是用户最常用的批量路径**，之前的分析遗漏了。
+
+前端触发点（[LinkListOptions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkListOptions.tsx#L93-L115)）：
+
+```typescript
+const bulkRefreshPreservations = async () => {
+  const load = toast.loading(t("sending_request"));
+  const ids = Object.keys(selectedIds).map(Number);   // 从 useLinkStore 取勾选的链接 ID
+
+  await refreshPreservations.mutateAsync(
+    { linkIds: ids },
+    {
+      onSettled: (data, error) => {
+        toast.dismiss(load);
+        if (error) {
+          toast.error(error.message);
+        } else {
+          clearSelected();
+          setEditMode?.(false);
+          toast.success(t("links_being_archived"));   // 注意这里是复数 links_being_archived
+        }
+      },
+    }
+  );
+};
+```
+
+UI 触发位置（[LinkListOptions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkListOptions.tsx#L176-L273)）：
+
+```
+编辑模式（✎ 铅笔图标开启）
+  → 出现复选框，勾选多条
+  → 工具栏出现 ↻ 图标 (bi-arrow-clockwise)，tooltip=refresh_preserved_formats
+  → 点击 → ConfirmationModal
+  → 确认后调用 bulkRefreshPreservations()
+```
+
+Router hook 实现（[links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/packages/router/links.tsx#L1097-L1122)）：
+
+```typescript
+const useArchiveAction = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload) => {
+      const response = await fetch("/api/v1/links/archive", {
+        body: JSON.stringify({ linkIds: payload.linkIds }),
+        method: "DELETE",                       // ← 注意是 DELETE，不是 PUT
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.response);
+      return data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["links"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboardData"] });
+    },
+  });
+};
+```
+
+后端处理（[links/archive/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/api/v1/links/archive/index.ts#L11-L90)）：
+
+```typescript
+if (req.method === "DELETE") {
+  const dataValidation = LinkArchiveActionSchema.safeParse(req.body);
+  // ...
+
+  const { linkIds } = dataValidation.data;
+
+  if (linkIds) {
+    // 权限检查：只能操作自己拥有或有 canDelete 的 collection 内的链接
+    const authorizedLinks = await prisma.link.findMany({
+      where: {
+        id: { in: linkIds },
+        url: { not: null },
+        OR: [
+          { collection: { ownerId: user.id } },
+          { collection: { members: { some: { userId: user.id, canDelete: true } } } },
+        ],
+      },
+      select: { id: true, collectionId: true },
+    });
+
+    if (authorizedLinks.length === 0) {
+      return res.status(401).json({ response: "Permission denied." });
+    }
+
+    res.status(200).json({ response: "Success." });  // ← 先返回 HTTP 200
+
+    // 再异步处理（用户不等待）
+    for (const link of authorizedLinks) {
+      await removeFiles(link.id, link.collectionId);  // 删磁盘文件
+      await prisma.link.update({
+        where: { id: link.id },
+        data: {
+          image: null,
+          pdf: null,
+          readable: null,
+          monolith: null,
+          preview: null,
+          lastPreserved: null,   // ← 置 null，Worker 下一轮取到
+          indexVersion: null,
+        },
+      });
+      console.log("Deleted preservation link:", link.id);
+    }
+    return;
+  }
+}
+```
+
+与单条 PUT 的对比：
+| 维度 | 单条 PUT /{id}/archive | 批量 DELETE /links/archive |
+|---|---|---|
+| HTTP Method | PUT | DELETE |
+| 返回时机 | 处理完后返回 | 先 200，再异步处理每条 |
+| 权限粒度 | 单链接 getPermission（canUpdate） | 批量 where + OR（owner 或 canDelete） |
+| 清空字段 | 相同（6 字段 + clientSide → null） | 相同（6 字段 → null，无 clientSide） |
+| removeFiles | 是 | 是 |
+| 无效 URL 提前检查 | 有（返回 "Invalid URL."） | 无（url 已在 authorizedLinks where 中过滤 not null） |
+
+### 5.3 入口 C：管理员级刷新 — DELETE /api/v1/worker/preservation
+
+[preservation.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L18-L166)
+
+需要 server admin 权限（`user.id === NEXT_PUBLIC_ADMIN`）。有两个 action：
+
+**action = "allAndRePreserve"（重新生成全部链接）**：
+```typescript
+// 取自己所有 url 类型链接，全部字段设为 null
+const allLinks = await prisma.link.findMany({
+  where: { collection: { ownerId: user.id }, type: "url", url: { not: null } },
+});
+for (const link of allLinks) {
+  await removeFiles(link.id, link.collectionId);
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      image: null, pdf: null, readable: null, monolith: null, preview: null,
+      lastPreserved: null, indexVersion: null,
+    },
+  });
+}
+```
+等价于对自己的所有链接执行一次"批量刷新"。
+
+**action = "allBroken"（只重新生成损坏的链接）**：
+```typescript
+// 先找任一格式为 "unavailable" 的链接
+const brokenArchives = await prisma.link.findMany({
+  where: {
+    type: "url", url: { not: null },
+    collection: { ownerId: user.id },
+    OR: [
+      { image: "unavailable" }, { pdf: "unavailable" },
+      { readable: "unavailable" }, { monolith: "unavailable" },
+      { preview: "unavailable" },
+    ],
+  },
+  include: { createdBy: { select: { archiveAsScreenshot, ... } }, tags: true },
+});
+
+for (const link of brokenArchives) {
+  // 根据用户设置或标签，判断这个"unavailable"的格式是否是用户真想要的
+  const needsReprocessing =
+    (link.image === "unavailable" && shouldArchive.archiveAsScreenshot) ||
+    (link.monolith === "unavailable" && shouldArchive.archiveAsMonolith) ||
+    (link.pdf === "unavailable" && shouldArchive.archiveAsPDF) ||
+    (link.readable === "unavailable" && shouldArchive.archiveAsReadable);
+
+  if (needsReprocessing) {
+    await prisma.link.update({
+      where: { id: link.id },
+      data: {
+        // 只把用户开启且当前为 unavailable 的那些字段改为 null
+        image:    shouldArchive.archiveAsScreenshot && link.image === "unavailable"    ? null : link.image,
+        pdf:      shouldArchive.archiveAsPDF && link.pdf === "unavailable"              ? null : link.pdf,
+        readable: shouldArchive.archiveAsReadable && link.readable === "unavailable"    ? null : link.readable,
+        monolith: shouldArchive.archiveAsMonolith && link.monolith === "unavailable"    ? null : link.monolith,
+        lastPreserved: null,  // ← 仍然要置 null，否则 Worker 取不到
+        indexVersion: null,
+      },
+    });
+  }
+}
+```
+
+与"批量 DELETE /api/v1/links/archive"的关键差异：
+- **allBroken 不删文件**（没有调用 `removeFiles`），只把 DB 字段改回 null。
+- **allBroken 有选择性**：只把用户需要（根据用户设置和归档标签判断）且已失败的那些格式改为 null，不影响已成功的格式。
+- **allAndRePreserve 与批量 DELETE 效果相同**：全部字段 → null + 删文件。
+
+### 5.4 三条 API 的"重新排队"流程总结
+
+所有刷新 API 最终都做同一件事——**把 `lastPreserved` 改回 `null`**，从而让 Worker 的 `getLinkBatchFairly` 在下一轮循环里把这条链接取出来重新处理。
+
+流程链路：
+```
+用户点击刷新
+  ↓
+API 把 lastPreserved + 各格式字段 → null，同时删磁盘文件（某些场景）
+  ↓
+HTTP 200 返回前端
+  ↓
+前端 toast.success("links_being_archived") + invalidateQueries(["links"])
+  ↓
+Links.tsx useEffect 检测到 preview=null/undefined，启动 5s 轮询
+  ↓
+Worker 下一轮 linkProcessing → getLinkBatchFairly(where lastPreserved = null) 取到该链接
+  ↓
+archiveHandler 执行 → finally 写 "unavailable" 或 真实路径
+  ↓
+前端轮询拉取到最新状态 → 轮询停止
+```
+
+---
+
+## 六、异步归档失败处理流程
+
+### 6.1 Worker 端归档处理
 
 [archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/archiveHandler.ts#L25-L231)
 
@@ -149,7 +573,7 @@ try {
 } catch (err) {
   console.log("Failed Link:", link.url);
   console.log("Reason:", err);
-  throw err;  // 向外抛出，由 Worker 上层决定重试
+  throw err;  // 向外抛出，由 linkProcessing catch 打日志
 } finally {
   // 无论成功失败，最后都更新数据库
   await prisma.link.update({
@@ -167,43 +591,9 @@ try {
 }
 ```
 
-**失败标记机制**：失败的格式字段被设置为字符串 `"unavailable"`，而不是 null。
+**失败标记机制**：失败的格式字段被设置为字符串 `"unavailable"`，而不是 null。`lastPreserved` 被设置为当前时间，表示"此链接已从队列中取出并处理过"。
 
-### 3.2 前端状态判断
-
-[formatStats.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/packages/lib/formatStats.ts#L1-L20)
-
-```typescript
-export function formatAvailable(link, format) {
-  return Boolean(link && link[format] && link[format] !== "unavailable");
-}
-```
-
-判断逻辑三态：
-
-| 字段值 | 含义 | 显示 |
-|---|---|---|
-| `null` / `undefined` / `""` | 尚未处理（在队列中） | 加载动画 |
-| `"unavailable"` | 处理失败 | 不显示该项 |
-| 路径字符串如 `"archives/123/456.png"` | 处理成功 | 显示链接/图片 |
-
-[LinkDetails.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkDetails.tsx#L106-L114)
-
-```typescript
-const isReady = () => {
-  return (
-    link &&
-    (collectionOwner.archiveAsScreenshot === true ? link.pdf : true) &&
-    (collectionOwner.archiveAsMonolith === true ? link.monolith : true) &&
-    (collectionOwner.archiveAsPDF === true ? link.pdf : true) &&
-    link.readable
-  );
-};
-```
-
-注意：`isReady` 只判断"非空"，不区分 `"unavailable"` 还是真实路径。真正展示时由 `formatAvailable` 过滤。
-
-### 3.3 页面三种状态渲染
+### 6.2 页面三种状态渲染
 
 [LinkDetails.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkDetails.tsx#L560-L593)
 
@@ -213,7 +603,9 @@ const isReady = () => {
 | **部分就绪** | `!isReady() && atLeastOneFormatAvailable(link)` | 小加载动画 + `there_are_more_formats` + `check_back_later` |
 | **全部完成** | `isReady()` | 展示可用格式（不可用的被 `formatAvailable` 隐藏） |
 
-### 3.4 列表页的自动轮询
+注意：当所有格式都是 `"unavailable"` 时，`isReady()` 返回 true（非空即可），`atLeastOneFormatAvailable()` 返回 false（`"unavailable"` 被判定为不可用），但因为 `isReady()` 已为 true，页面直接展示"全部完成"态——这意味着**全失败的链接看起来和全部成功的一样，只是所有格式行都被隐藏了**，用户只能通过缺少内容来推测失败。
+
+### 6.3 列表页的自动轮询
 
 [Links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/Links.tsx#L405-L425)
 
@@ -234,9 +626,9 @@ useEffect(() => {
 
 ---
 
-## 四、Toast 提示系统
+## 七、Toast 提示系统
 
-### 4.1 全局配置
+### 7.1 全局配置
 
 [_app.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/_app.tsx#L80-L108)
 
@@ -259,12 +651,12 @@ import { Toaster, ToastBar } from "react-hot-toast";
 </Toaster>
 ```
 
-### 4.2 Toast 使用模式
+### 7.2 Toast 使用模式
 
 | 模式 | 示例 | 位置 |
 |---|---|---|
-| **`toast.error(t(key))`** - 翻译后的错误 | `toast.error(t(error.message))` | Mutation onError |
-| **`toast.error(string)`** - 后端英文错误直显 | `toast.error(data.response)` | LinkActions.updateArchive |
+| **`toast.error(t(key))`** - 翻译后的错误 | `toast.error(t(error.message))` | Mutation onError（useAddLink 等） |
+| **`toast.error(string)`** - 后端英文错误直显 | `toast.error(data.response)` | LinkActions.updateArchive、LinkListOptions.bulkRefreshPreservations |
 | **`toast.success(t(key))`** - 翻译后的成功 | `toast.success(t("link_created"))` | 成功回调 |
 | **`toast.loading(t(key))`** + `toast.dismiss(id)` | 见下 | 异步操作包裹 |
 
@@ -288,14 +680,14 @@ const updateArchive = async () => {
 
 ---
 
-## 五、本地化文案（i18n）
+## 八、本地化文案（i18n）
 
-### 5.1 文案文件位置
+### 8.1 文案文件位置
 
 - 英文：[en/common.json](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/public/locales/en/common.json)
 - 中文：[zh/common.json](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/public/locales/zh/common.json)
 
-### 5.2 文案使用与错误消息的矛盾映射
+### 8.2 文案使用与错误消息的矛盾映射
 
 ⚠️ **这是最容易混淆的地方**：错误消息 message 字段有三种类型，处理方式不同：
 
@@ -316,7 +708,7 @@ onError: (error, _variables, context) => {
 
 只有前端主动抛出的 `"invalid_url_guide"` 是真正的 i18n key，后端返回的英文错误通过 `t()` 后因找不到翻译而透传。
 
-### 5.3 归档/异步相关 i18n key
+### 8.3 归档/异步相关 i18n key
 
 | Key | 中文 | 英文 |
 |---|---|---|
@@ -326,78 +718,19 @@ onError: (error, _variables, context) => {
 | `link_being_archived` | 链接正在归档... | Link is being archived... |
 | `links_being_archived` | 链接正在归档…… | Links are being archived... |
 | `refresh_preserved_formats` | 刷新保留格式 | Refresh Preserved Formats |
+| `refresh_preserved_formats_confirmation_desc` | 您确定要刷新此链接保留的格式吗？ | Are you sure you want to refresh the preserved formats for this link? |
+| `refresh_multiple_preserved_formats_confirmation_desc` | 您确定要刷新 {{count}} 个链接的已保存格式吗？ | Are you sure you want to refresh the preserved formats for {{count}} links? |
 | `no_broken_preservations` | 未发现损坏的存档。 | No broken preservations. |
 | `links_are_being_represerved` | 链接正在被重新保存…… | Links are being re-preserved... |
 | `preview_unavailable` | 预览不可用 | Preview Unavailable |
+| `sending_request` | 发送请求... | Sending Request... |
+| `regenerate_broken_links` | 重新生成损坏的链接 | Regenerate Broken Links |
+| `regenerate_all_links` | 重新生成全部链接 | Regenerate All Links |
+| `link_selected` / `links_selected` | 已选择 1 条链接 / 已选择 N 条链接 | 1 link selected / N links selected |
 
 ---
 
-## 六、重试入口串联
-
-### 6.1 单条链接级重试
-
-两个入口都会弹出 `ConfirmationModal`，确认后走同一条 API：
-
-**入口 1：LinkActions 下拉菜单**（[LinkActions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkActions.tsx#L54-L76)）
-```
-LinkCard 三个点 → Refresh Preserved Formats → ConfirmationModal → updateArchive()
-→ PUT /api/v1/links/{id}/archive → toast.success("link_being_archived") → refetch()
-```
-
-**入口 2：LinkModal/LinkDetails 详情页刷新按钮**（[LinkModal.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/ModalContent/LinkModal.tsx#L123-L139), [LinkDetails.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkDetails.tsx#L480-L501)）
-```
-详情页 → ⟳ 按钮 tooltip="refresh_preserved_formats" → ConfirmationModal → updateArchive()
-```
-
-### 6.2 批量/管理员级重试
-
-[background-jobs.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/admin/background-jobs.tsx#L16-L204)
-
-两个按钮：
-
-| 按钮 | i18n Key | action | 调用 API |
-|---|---|---|---|
-| 重新生成损坏的链接 | `regenerate_broken_links` | `"allBroken"` | `DELETE /api/v1/worker/preservation` |
-| 重新生成全部链接 | `regenerate_all_links` | `"allAndRePreserve"` | `DELETE /api/v1/worker/preservation` |
-
-对应 router hook：[useDeletePreservations](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/packages/router/worker.tsx#L23-L49)
-
-```typescript
-const deletePreservations = useDeletePreservations();
-
-await deletePreservations.mutateAsync(
-  { action },
-  {
-    onSettled: (data, error) => {
-      toast.dismiss(load);
-      if (error) toast.error(error.message);          // 错误：原始消息
-      else toast.success(t("links_are_being_represerved")); // 成功：i18n
-    },
-  }
-);
-```
-
-成功后自动：
-```typescript
-onSuccess: () => {
-  queryClient.invalidateQueries({ queryKey: ["links"] });
-  queryClient.invalidateQueries({ queryKey: ["dashboardData"] });
-  queryClient.invalidateQueries({ queryKey: ["worker"] });  // 刷新统计数字
-}
-```
-
-### 6.3 Worker 统计展示
-
-[useWorker](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/packages/router/worker.tsx#L6-L21) 拉取 `/api/v1/worker` 数据，展示：
-
-- `link.pending` - 待处理
-- `link.done` - 已完成
-- `link.failed` - 失败数（用于 `regenerate_broken_links` 按钮的影响链接数显示）
-- `search.pending` / `search.done` - 搜索索引状态
-
----
-
-## 七、完整调用链示例
+## 九、完整调用链示例
 
 ### 示例 1：创建链接时 URL 格式错误（前端预校验 → toast i18n）
 
@@ -425,13 +758,37 @@ NewLinkModal.submit()
                  → t() 找不到 key，fallback 显示英文 "Link already exists"
 ```
 
-### 示例 3：单条链接刷新归档（异步重试 → toast + 轮询）
+### 示例 3：已选链接批量刷新（DELETE /api/v1/links/archive → 重新排队）
+
+```
+LinkListOptions 编辑模式
+  ├─ 用户勾选 N 条链接 → selectedIds store 更新
+  ├─ 点击 ↻ 图标 → ConfirmationModal（refresh_multiple_preserved_formats_confirmation_desc）
+  ├─ 确认 → bulkRefreshPreservations()
+  │    ├─ toast.loading(t("sending_request"))
+  │    ├─ useArchiveAction.mutateAsync({ linkIds })
+  │    │    └─ DELETE /api/v1/links/archive  body: { linkIds: [...] }
+  │    │         └─ 后端：校验权限 → 先返回 200 → 异步 for 循环每条链接：
+  │    │              ├─ removeFiles(id, collectionId)
+  │    │              └─ prisma.link.update({ lastPreserved: null, image/pdf/...: null })
+  │    ├─ onSettled → toast.dismiss(load)
+  │    ├─ toast.success(t("links_being_archived"))
+  │    ├─ clearSelected() + setEditMode(false)
+  │    └─ onSuccess → invalidateQueries(["links"], ["dashboardData"])
+  └─ Links.tsx 重渲染
+       └─ useEffect 检测到有 preview 为 null → 启动 5 秒轮询
+            └─ Worker 下一轮 getLinkBatchFairly(lastPreserved = null) 取出这些链接
+                 └─ archiveHandler 处理 → 写 "unavailable" 或路径
+                      └─ 轮询拉取到最终状态 → 轮询停止
+```
+
+### 示例 4：单条链接刷新归档（PUT /api/v1/links/{id}/archive → toast + 轮询）
 
 ```
 LinkActions → updateArchive()
   ├─ toast.loading(t("sending_request"))
   ├─ PUT /api/v1/links/{id}/archive
-  │    └─ 后端：清空 image/pdf/readable/monolith/preview/lastPreserved 为 null
+  │    └─ 后端：校验权限 + 有效 URL → 清空 6 字段为 null → removeFiles → 返回 200
   ├─ toast.dismiss(load)
   ├─ toast.success(t("link_being_archived"))
   └─ refetch() 立即刷新
@@ -440,11 +797,14 @@ LinkActions → updateArchive()
             └─ Worker 成功/失败：字段变为路径 或 "unavailable"，轮询停止
 ```
 
-### 示例 4：归档失败页面状态（"unavailable" → 隐藏项）
+### 示例 5：归档失败页面状态（"unavailable" → 隐藏项，无自动重试）
 
 ```
 Worker archiveHandler 失败
-  └─ finally 块 image/pdf/readable 等被写为 "unavailable"
+  ├─ catch 中仅 console.error，不重试
+  └─ finally 块 image/pdf/readable 等被写为 "unavailable"，lastPreserved=now
+
+Worker 下一轮循环：getLinkBatchFairly 只取 lastPreserved=null → 不再取这条链接（永久失败，除非人工刷新）
 
 前端 Links.tsx 轮询拉取
   └─ LinkDetails 渲染
@@ -454,15 +814,31 @@ Worker archiveHandler 失败
        └─ atLeastOneFormatAvailable() → 取决于是否有任一格式是真实路径
 ```
 
+### 示例 6：管理员只重新生成损坏的（allBroken 选择性置 null）
+
+```
+admin/background-jobs → 点击 regenerate_broken_links
+  └─ DELETE /api/v1/worker/preservation  body: { action: "allBroken" }
+       └─ 后端：找出任意格式为 "unavailable" 的链接
+            └─ 对每条链接：根据用户的 archiveAsScreenshot/PDF/... 设置
+                 └─ 如果 "用户开启了该格式" 且 "该格式当前为 unavailable"
+                      └─ 把该字段改为 null，同时 lastPreserved 改为 null
+       └─ （注意：不删除磁盘文件，不影响已成功的格式）
+```
+
 ---
 
-## 八、容易混淆的要点总结
+## 十、容易混淆的要点总结
 
 | 混淆点 | 真相 |
 |---|---|
 | `toast.error(t(error.message))` 的 message 都是 i18n key？ | ❌ 只有前端主动抛出的少量是 key（如 `invalid_url_guide`），后端返回的全是英文硬编码，`t()` 找不到就原样输出 |
-| `"unavailable"` 和 `null` 含义相同？ | ❌ `null` = 在队列中未处理；`"unavailable"` = 已处理但失败。前者触发轮询，后者不 |
-| `isReady()` 判断归档完成？ | ❌ 只判断字段非空。全部都是 `"unavailable"` 也会被判定为 ready |
+| `"unavailable"` 和 `null` 含义相同？ | ❌ `null` = 在队列中未处理，**Worker 会取**；`"unavailable"` = 已处理但失败，**Worker 不会再取**。前者触发轮询，后者不 |
+| Worker 失败后会自动重试吗？ | ❌ 不会。linkProcessing 的 catch 只打 console.error，finally 已经把 lastPreserved 写为非 null，Worker 下一轮取不到这条链接。必须人工通过刷新 API 把 lastPreserved 改回 null |
+| `isReady()` 判断归档完成？ | ❌ 只判断字段非空。全部都是 `"unavailable"` 也会被判定为 ready，此时页面看起来"完成了"但所有格式行都被隐藏 |
 | `formatAvailable()` 参与页面三态判断？ | ✅ 三态用 `isReady()` + `atLeastOneFormatAvailable()`，后者又依赖 `formatAvailable()` |
 | 乐观更新失败时 toast 和回滚谁先执行？ | 先 toast，后回滚缓存。在 `onError` 中顺序执行 |
-| 重试入口有几种？ | 3 种：列表卡片下拉、详情页按钮（单条）；后台 Background Jobs（批量损坏/全部） |
+| 刷新重试的入口有几个？ | **4 个**：列表卡片下拉、详情页按钮（这两个走单条 PUT）；已选链接批量（走 DELETE /api/v1/links/archive）；后台 Background Jobs 的全部损坏/全部（走 DELETE /api/v1/worker/preservation） |
+| 批量刷新和单条刷新除了条数还有什么区别？ | 批量 DELETE 先返回 200 再异步处理，单条 PUT 处理完后才返回；批量权限校验用 canDelete，单条用 canUpdate；批量不检查 URL 有效性（where 已过滤） |
+| allBroken 和 allAndRePreserve 的区别？ | allAndRePreserve 把所有链接的所有格式都置 null（且删文件），等价于全量刷新；allBroken 只把用户开启且当前为 unavailable 的那些字段置 null（不删文件），不影响已成功的格式 |
+| 让 Worker 重新处理一条链接的唯一手段是什么？ | **把 lastPreserved 改回 null**。Worker 的取任务条件 hardcode 为 `lastPreserved: null`，改其他字段都没用 |
