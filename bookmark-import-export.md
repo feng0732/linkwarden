@@ -372,8 +372,9 @@ interface Backup extends Omit<User, "password" | "id"> {
 ```
 
 **注意事项：**
-- `links` 中故意省略了大体积字段：`textContent`、`preview`、`image`、`readable`、`monolith`、`pdf`（减小备份文件体积）
-- `pinnedLinks` 为独立扁平数组，包含完整的 Link 对象（含旧 id），Linkwarden 导入时尝试通过匹配 `url` 与新建链接关联并设置 pinned
+- `collections.links` 显式 omit 了大体积字段：`textContent`、`preview`、`image`、`readable`、`monolith`、`pdf`，并 include 了 `tags`
+- `pinnedLinks: true` 是 Prisma 简写，默认返回所有 Link 标量字段（**包含**上述 6 个大字段），但**不 include 任何关联**（包括 tags）
+- `pinnedLinks` 为独立扁平数组，Linkwarden 导入时尝试通过匹配 `url` 与新建链接关联并设置 pinned
 
 ### 6.3 导出/导入不对称与字段丢失分析（自有格式）
 
@@ -423,35 +424,107 @@ Collection 模型在 Prisma schema 中定义了以下字段 [schema.prisma#L126-
 - 导入控制器 `importFromLinkwarden.ts` **完全没有处理 `rssSubscriptions`** 的代码——零行
 - 结果：备份中的 RSS 订阅静默丢失，用户恢复数据后需要重新手动添加 RSS 源
 
-#### 6.3.3 pinnedLinks 导出结构与导入匹配问题
+#### 6.3.3 pinnedLinks 导出结构与导入匹配问题（深度对比）
 
-**导出结构** [exportData.ts#L25](apps/web/lib/api/controllers/migration/exportData.ts#L25)：
+**两个查询的配置差异** [exportData.ts#L10-L25](apps/web/lib/api/controllers/migration/exportData.ts#L10-L25)：
 
 ```javascript
-pinnedLinks: true   // User.pinnedLinks 关联字段
+collections: {
+  include: {
+    rssSubscriptions: true,
+    links: {
+      omit: {                      // ↓ 显式排除 6 个大字段
+        textContent: true,
+        preview: true,
+        image: true,
+        readable: true,
+        monolith: true,
+        pdf: true,
+      },
+      include: { tags: true },     // ← 显式 include tags 关联
+    },
+  },
+},
+pinnedLinks: true,                 // ← Prisma 简写，无 omit，无 include
 ```
 
-`pinnedLinks` 是 User 与 Link 之间的多对多关系。导出时返回的是完整的 `LinksIncludingTags[]` 扁平数组：
+**字段差异对照表（Link 模型共 29 个字段/关联）**：
+
+| 类别 | 字段/关联 | `collections.links` | `pinnedLinks: true` |
+|------|----------|-------------------|-------------------|
+| **标量（ID）** | `id` | ✅ | ✅ |
+| **标量（基础）** | `name`, `type`, `description`, `url`, `color`, `icon`, `iconWeight`, `clientSide`, `aiTagged`, `metaDescription`, `indexVersion`, `importDate`, `createdAt`, `updatedAt`, `lastPreserved`, `createdById`, `collectionId` | ✅ 全部 | ✅ 全部 |
+| **大体积标量** | `textContent`, `preview`, `image`, `readable`, `monolith`, `pdf` | ❌ **omit 排除**（减小备份） | ✅ **完整包含**（可能数 MB/条） |
+| **关联** | `tags`（Tag[]） | ✅ **显式 include** | ❌ **不返回**（默认不加载关联） |
+| **关联** | `highlight`, `pinnedBy`, `collection`, `createdBy` | ❌ 不 include | ❌ 不 include |
+
+**关键差异 1：pinnedLinks 包含完整大字段但不含 tags**
+
+这是 `pinnedLinks: true`（Prisma 默认行为）与 `collections.links`（手动配置）最核心的不同：
+
+- `collections.links` 经过精心优化：omit 6 个可能达数 MB 的归档字段，include 了 tags（用于恢复标签）
+- `pinnedLinks: true` 是"原样全拿"——所有标量字段原样返回（包括 textContent/preview 等大 BLOB），但 tags 等关联完全不加载
+
+**对备份体积的影响**：假设用户置顶了 100 条链接，每条 textContent 平均 100KB，则 pinnedLinks 数组就额外膨胀约 **10MB**，而同样这些链接在 collections.links 中仅约数十 KB。
+
+**关键差异 2：TypeScript 类型定义与实际运行时不一致**
+
+类型声明 [global.ts#L129-L132](packages/types/global.ts#L129-L132)：
+```typescript
+export interface Backup extends Omit<User, "password" | "id"> {
+  collections: CollectionIncludingLinks[];
+  pinnedLinks: LinksIncludingTags[];   // ← 声称 tags: Tag[]
+}
+
+export interface LinksIncludingTags extends Link {
+  tags: Tag[];   // ← 声明 tags 必存在
+}
+```
+
+但实际运行时，由于 Prisma 查询 `pinnedLinks: true` 没有 `include: { tags: true }`，返回的 pinnedLinks 数组中**每个对象都没有 `tags` 字段**。TypeScript 类型声称有 `tags: Tag[]`，运行时值为 `undefined`——这是一个编译期类型谎言。
+
+**对 URL 匹配的影响**：
+
+URL 匹配不依赖 tags 或大字段，所以 pinnedLinks 导出结构对 `pinnedLink.url === newLink.url` 比较**没有直接负面影响**——`url` 是 Link 的标量字段，两个查询都会返回。
+
+但存在一个间接风险：如果未来某条 pinned 链接的 URL 恰好为 `null`（Link 模型中 `url` 是 `String?` 可选），而对应 link 在 collections.links 中创建时 URL 被其他逻辑填充（或反之），也会导致匹配不上。
+
+**对旧 ID → 新 ID 映射的影响**：
+
+pinnedLinks 导出时**完整包含旧 `id`**（Link.id 是标量字段，`pinnedLinks: true` 必然返回）。这意味着：
 
 ```jsonc
-// backup.json 中的 pinnedLinks 实际结构
-"pinnedLinks": [
-  {
-    "id": 42,           // 旧数据库中的 link.id
-    "url": "https://example.com/article",
-    "name": "Article Title",
-    "collectionId": 5,  // 旧数据库中的 collection.id
-    "type": "url",
-    "description": "...",
-    "importDate": "...",
-    "createdAt": "...",
-    "updatedAt": "...",
-    "createdById": 1,
-    "tags": [ { "id": 3, "name": "tech", "ownerId": 1 } ]
-    // 注意：不包含 textContent/preview/image/readable/monolith/pdf（与 collections.links 相同的 omit）
-  }
-]
+// pinnedLinks[i] 实际导出的结构（注意：没有 tags，但有完整 id/url/collectionId）
+{
+  "id": 42,                 // ✅ 旧 link.id —— 精确映射的关键！
+  "url": "https://example.com/article",
+  "collectionId": 5,        // ✅ 旧 collection.id
+  "name": "Article Title",
+  "type": "url",
+  "description": "...",
+  "textContent": "<html>完整页面内容...</html>",  // ✅（意外包含，本应 omit）
+  "preview": "base64...",   // ✅（意外包含）
+  "image": "base64...",     // ✅（意外包含）
+  // "tags": [...]          // ❌ 不存在（类型定义说谎）
+  // highlight, pinnedBy    // ❌ 不存在
+}
 ```
+
+导出时**拥有完美的精确关联信息**（`pinnedLinks[i].id` 与 `collections[j].links[k].id` 是同一旧数据库主键），但导入时完全未利用：
+- 导入代码不建立任何 旧 id → 新 id 的映射表
+- 退而求其次使用 URL 模糊匹配
+
+这不是"信息不足"，而是"信息浪费"——精确匹配所需的所有数据都在 backup.json 里，只是代码没读。
+
+**对置顶恢复判断的影响**（导出结构 × 导入逻辑）：
+
+| 置顶恢复要素 | 导出是否提供 | 导入是否利用 | 结果 |
+|------------|------------|------------|------|
+| 旧 link.id（精确唯一键） | ✅ pinnedLinks[i].id | ❌ 完全忽略 | 浪费精确关联机会 |
+| 旧 collection.id（辅助去重） | ✅ pinnedLinks[i].collectionId | ❌ 完全忽略 | 同 URL 跨集合时无法区分，pinned 状态误扩散 |
+| URL（模糊匹配键） | ✅ pinnedLinks[i].url（原值） | ⚠️ 使用但与 newLink.url（trim+slice）做 === | 空格/超长导致不匹配 |
+| tags（辅助匹配） | ❌ 运行时不存在（类型声称有） | ❌ 未利用 | — |
+| 大字段（textContent 等） | ✅ 完整包含（本应 omit） | ❌ 未利用 | 徒增备份体积 |
 
 **导入匹配方式** [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113)：
 
@@ -464,17 +537,8 @@ data?.pinnedLinks.forEach(async (pinnedLink) => {
 });
 ```
 
-**导出与导入的根本性不对称**：
-
-| 维度 | 导出（拥有的信息） | 导入（实际使用的信息） |
-|------|-----------------|---------------------|
-| 唯一标识 | `pinnedLinks[i].id`（旧 link.id，全局唯一） | 完全忽略 |
-| 所属集合 | `pinnedLinks[i].collectionId`（旧 collection.id） | 完全忽略 |
-| URL | `pinnedLinks[i].url`（原始值） | ✅ 使用，但与 `newLink.url`（trim+slice 后）做精确比较 |
-| Tag/名称等 | 全部导出 | 完全忽略 |
-
 **不匹配风险场景**：
-1. 同一用户在两个不同 collection 中收藏了相同 URL，其中只有一个被 pinned → 导入时**两个新链接都会被标记为 pinned**
+1. 同一用户在两个不同 collection 中收藏了相同 URL，其中只有一个被 pinned → 导入时**两个新链接都会被标记为 pinned**（pinnedLinks 有 collectionId 但未用）
 2. URL 在导出后导入前被规范化（如 `link.url.trim().slice(0,2047)` 与备份中的 `pinnedLink.url` 原值有空格/长度差异）→ **完全匹配不上**，pinned 状态丢失
 3. pinnedLinks 数组中的 link.id 可以与 `collections[*].links[*].id` 精确配对 → 但代码没有建立 旧 id → 新 id 的映射表，浪费了精确关联的机会
 
@@ -675,10 +739,12 @@ pinnedLinks 通过 URL 精确字符串匹配（`pinnedLink.url === newLink.url`�
 | 3 | Linkwarden/Pocket/Wallabag 事务 catch 吞异常，始终返回 200 | [importFromLinkwarden.ts#L119](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) 等 | 发生异常但前端显示成功（假阳性），用户误判导入完成 |
 | 4 | Linkwarden pinnedLinks 使用 `forEach(async)`，无 await | [importFromLinkwarden.ts#L102-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L102-L113) | pinned 状态可能部分/全部丢失，或产生未处理 Promise 拒绝 |
 | 5 | pinnedLinks URL 精确匹配，未与 link 创建时的 `trim().slice()` 对齐 | [importFromLinkwarden.ts#L66 vs L103](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66-L103) | URL 含空格/超长时 pinned 状态无法匹配 |
-| 6 | 缺少旧 id → 新 id 映射表，pinnedLinks 可精确关联却退化为 URL 模糊匹配 | [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113) | 同 URL 跨 collection 时 pinned 状态错误扩散；导出的 id/collectionId 完全浪费 |
-| 7 | Linkwarden 自有格式导入不恢复 collection `parentId`，父子层级丢失 | [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50) | 所有 collection 平铺为顶级，嵌套结构不可逆丢失 |
-| 8 | 导出 include 了 `rssSubscriptions`，但导入完全不处理 | [exportData.ts#L8-L9](apps/web/lib/api/controllers/migration/exportData.ts#L8-L9) vs 整个 [importFromLinkwarden.ts](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts) | 所有 RSS 订阅静默丢失 |
-| 9 | Collection 字段部分丢失（icon/iconWeight/isPublic/createdAt/updatedAt） | [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50) | 自定义图标、公开状态、原始创建时间等不可逆丢失 |
-| 10 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
-| 11 | HTML 导入不使用事务，其他格式使用伪事务 | 各控制器 | HTML 导入中途异常抛到顶层（但也不回滚），其他 4 种异常被吞返回 200 |
-| 12 | 所有导入器均未做 URL 去重（与手动 postLink 的 `preventDuplicateLinks` 不一致） | 各控制器 | 重复导入或 URL 已存在时产生重复链接 |
+| 6 | **pinnedLinks 导出包含 textContent/preview/image 等 6 个大体积字段**（collections.links 已 omit） | [exportData.ts#L10-L25](apps/web/lib/api/controllers/migration/exportData.ts#L10-L25) | backup.json 体积严重膨胀，置顶 100 条可能额外增加 10MB+ |
+| 7 | **pinnedLinks 导出不含 tags，但 TS 类型 LinksIncludingTags 声明有 tags** | [exportData.ts#L25](apps/web/lib/api/controllers/migration/exportData.ts#L25) vs [global.ts#L129-L132](packages/types/global.ts#L129-L132) | 编译期类型谎言，运行时 `pinnedLinks[i].tags` 为 `undefined` |
+| 8 | 缺少旧 id → 新 id 映射表，pinnedLinks 可通过 id 精确关联却退化为 URL 模糊匹配 | [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113) | 同 URL 跨 collection 时 pinned 状态错误扩散；导出的 id/collectionId 完全浪费 |
+| 9 | Linkwarden 自有格式导入不恢复 collection `parentId`，父子层级丢失 | [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50) | 所有 collection 平铺为顶级，嵌套结构不可逆丢失 |
+| 10 | 导出 include 了 `rssSubscriptions`，但导入完全不处理 | [exportData.ts#L8-L9](apps/web/lib/api/controllers/migration/exportData.ts#L8-L9) vs 整个 [importFromLinkwarden.ts](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts) | 所有 RSS 订阅静默丢失 |
+| 11 | Collection 字段部分丢失（icon/iconWeight/isPublic/createdAt/updatedAt） | [importFromLinkwarden.ts#L34-L50](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L34-L50) | 自定义图标、公开状态、原始创建时间等不可逆丢失 |
+| 12 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
+| 13 | HTML 导入不使用事务，其他格式使用伪事务 | 各控制器 | HTML 导入中途异常抛到顶层（但也不回滚），其他 4 种异常被吞返回 200 |
+| 14 | 所有导入器均未做 URL 去重（与手动 postLink 的 `preventDuplicateLinks` 不一致） | 各控制器 | 重复导入或 URL 已存在时产生重复链接 |
