@@ -842,3 +842,291 @@ admin/background-jobs → 点击 regenerate_broken_links
 | 批量刷新和单条刷新除了条数还有什么区别？ | 批量 DELETE 先返回 200 再异步处理，单条 PUT 处理完后才返回；批量权限校验用 canDelete，单条用 canUpdate；批量不检查 URL 有效性（where 已过滤） |
 | allBroken 和 allAndRePreserve 的区别？ | allAndRePreserve 把所有链接的所有格式都置 null（且删文件），等价于全量刷新；allBroken 只把用户开启且当前为 unavailable 的那些字段置 null（不删文件），不影响已成功的格式 |
 | 让 Worker 重新处理一条链接的唯一手段是什么？ | **把 lastPreserved 改回 null**。Worker 的取任务条件 hardcode 为 `lastPreserved: null`，改其他字段都没用 |
+
+---
+
+## 十一、allBroken 重生成损坏归档的 preview 处理细节
+
+### 11.1 brokenArchives 为何会查到 preview = unavailable
+
+[preservation.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L67-L84)
+
+```typescript
+const brokenArchives = await prisma.link.findMany({
+  where: {
+    type: "url",
+    url: { not: null },
+    collection: { ownerId: user.id },
+    OR: [
+      { image: "unavailable" },
+      { pdf: "unavailable" },
+      { readable: "unavailable" },
+      { monolith: "unavailable" },
+      { preview: "unavailable" },   // ← preview 被纳入损坏判断
+    ],
+  },
+  // ...
+});
+```
+
+查询条件的 `OR` 数组包含了五个字段，其中就有 `{ preview: "unavailable" }`。这意味着：
+
+- 只要任一格式（image/pdf/readable/monolith/**preview**）是 `"unavailable"`，该链接就会被视为"损坏归档"而查出来。
+- 即使 image/pdf/readable/monolith 四个全部成功，**只有 preview 为 unavailable**，也会被这条查询捞出来。
+
+preview 为什么会变成 unavailable？有两条路径：
+
+**路径 1：skipPreservation 早期退出**（[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/archiveHandler.ts#L44-L61)）
+```typescript
+if (skipPreservation || (!link.url?.startsWith("http://") && !link.url?.startsWith("https://"))) {
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      lastPreserved: new Date().toISOString(),
+      readable: "unavailable",
+      image: "unavailable",
+      monolith: "unavailable",
+      pdf: "unavailable",
+      preview: "unavailable",   // ← 五个字段一起写 unavailable
+      indexVersion: null,
+    },
+  });
+  return;
+}
+```
+此时五个字段（包括 preview）会一起被写 unavailable。
+
+**路径 2：finally 兜底**（[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/archiveHandler.ts#L212-L224)）
+```typescript
+const finalLink = await prisma.link.findUnique({ where: { id: link.id } });
+if (finalLink) {
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      lastPreserved: new Date().toISOString(),
+      readable: !finalLink.readable ? "unavailable" : undefined,
+      image:    !finalLink.image    ? "unavailable" : undefined,
+      monolith: !finalLink.monolith ? "unavailable" : undefined,
+      pdf:      !finalLink.pdf      ? "unavailable" : undefined,
+      preview:  !finalLink.preview  ? "unavailable" : undefined,  // ← preview 单独判空
+      indexVersion: null,
+    },
+  });
+}
+```
+这里 preview 是**单独判断**的——`!finalLink.preview` 为 true 就写 unavailable。而 preview 的值是否被写入，取决于 `handleArchivePreview` 是否成功执行。
+
+### 11.2 handleArchivePreview 何时会失败导致 preview = unavailable
+
+[handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts#L17-L82)
+
+preview 生成有两条分支，都可能失败：
+
+**分支 1：尝试用 og:image 作为预览图**
+```typescript
+let ogImageUrl = await page.evaluate(() => {
+  const metaTag = document.querySelector('meta[property="og:image"]');
+  return metaTag ? (metaTag as any).content : null;
+});
+
+if (ogImageUrl) {
+  try {
+    await assertUrlIsSafeForServerSideFetch(ogImageUrl);  // SSRF 检查可能抛错
+    const imageResponse = await page.goto(ogImageUrl);      // 跳转可能失败
+    if (imageResponse && !link.preview?.startsWith("archive")) {
+      const buffer = await imageResponse.body();
+      previewGenerated = await generatePreview(buffer, link.collectionId, link.id);
+    }
+    await page.goBack();
+  } catch (error) {
+    if (!(error instanceof UnsafeUrlError)) {
+      throw error;  // 非 SSRF 错误向外抛，可能导致整个 archiveHandler 进入 catch
+    }
+    // 如果是 UnsafeUrlError，则静默继续，走分支 2
+  }
+}
+```
+
+**分支 2：og:image 不存在或失败，直接对页面截图**
+```typescript
+if (!previewGenerated && !link.preview?.startsWith("archive")) {
+  await page.screenshot({ type: "jpeg", quality: 20 })
+    .then(async (screenshot) => {
+      if (Buffer.byteLength(screenshot) > 1024 * 1024 * PREVIEW_MAX_BUFFER)
+        return console.log("Error generating preview: Buffer size exceeded");
+      // 写文件 + 写 DB
+      await createFile({ data: screenshot, filePath: `archives/preview/...` });
+      await prisma.link.update({
+        where: { id: link.id },
+        data: { preview: `archives/preview/${link.collectionId}/${link.id}.jpeg` },
+      });
+    });
+  // 注意：这里是 .then() 不是 await！
+  // 如果 screenshot 本身抛异常，Promise 被 reject，没有 .catch，最终 unhandled →
+  //    archiveHandler 的 catch 捕获 → finally 执行 → preview 仍为空 → 写 unavailable
+}
+```
+
+关键点：**`page.screenshot()` 没有 `await`，用的是 `.then()` 链式调用**。如果 screenshot 本身 reject（例如页面已关闭、浏览器断开），这个 Promise 的错误会冒泡到外层 Promise.race → archiveHandler catch → finally。此时 `finalLink.preview` 仍为 null，finally 就会写 `"unavailable"`。
+
+**而 preview 与其他四个格式不同之处**：它不受用户 `archivalSettings` 控制——不管用户有没有开启 archiveAsScreenshot/PDF，preview 都会无条件尝试生成（[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/worker/lib/archiveHandler.ts#L168-L169)）：
+```typescript
+// Preview —— 无条件执行！
+if (!link.preview) await handleArchivePreview(link, page);
+```
+
+其他四个格式都有条件判断，例如：
+```typescript
+// Readability —— 受 archiveAsReadable 控制
+if (archivalSettings.archiveAsReadable && !link.readable)
+  await handleReadability(content, link);
+
+// Screenshot/PDF —— 受 archiveAsScreenshot / archiveAsPDF 控制
+if ((archivalSettings.archiveAsScreenshot && !link.image) || ...)
+  await handleScreenshotAndPdf(link, page, archivalSettings);
+```
+
+这意味着 **preview 永远会尝试生成**，而且永远可能单独失败。
+
+### 11.3 needsReprocessing 为何不把 preview 纳入重排
+
+[preservation.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/pages/api/v1/worker/preservation.tsx#L127-L160)
+
+```typescript
+const needsReprocessing =
+  (link.image === "unavailable" && shouldArchive.archiveAsScreenshot) ||
+  (link.monolith === "unavailable" && shouldArchive.archiveAsMonolith) ||
+  (link.pdf === "unavailable" && shouldArchive.archiveAsPDF) ||
+  (link.readable === "unavailable" && shouldArchive.archiveAsReadable);
+// ↑ 只有 4 个字段，**没有 preview**
+```
+
+```typescript
+if (needsReprocessing) {
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      image:    shouldArchive.archiveAsScreenshot && link.image === "unavailable"    ? null : link.image,
+      pdf:      shouldArchive.archiveAsPDF && link.pdf === "unavailable"              ? null : link.pdf,
+      readable: shouldArchive.archiveAsReadable && link.readable === "unavailable"    ? null : link.readable,
+      monolith: shouldArchive.archiveAsMonolith && link.monolith === "unavailable"    ? null : link.monolith,
+      lastPreserved: null,
+      indexVersion: null,
+      // ↑ 依然没有 preview 字段
+    },
+  });
+}
+```
+
+`shouldArchive` 的类型是 `Omit<ArchivalSettings, "aiTag" | "archiveAsWaybackMachine">`，里面只有：
+- `archiveAsScreenshot`
+- `archiveAsMonolith`
+- `archiveAsPDF`
+- `archiveAsReadable`
+
+**完全没有 `archiveAsPreview` 这个概念。** 原因在 11.2 已经说明：preview 是无条件生成的，不受用户开关控制，所以 `ArchivalSettings` 里本来就没有它。
+
+这导致了如下不对称：
+
+| 字段 | brokenArchives OR 条件能捞出来？ | needsReprocessing 判断？ | update 里能置 null？ |
+|---|---|---|---|
+| image | ✅ | ✅ | ✅ |
+| pdf | ✅ | ✅ | ✅ |
+| readable | ✅ | ✅ | ✅ |
+| monolith | ✅ | ✅ | ✅ |
+| **preview** | ✅ | ❌ **没有** | ❌ **没有** |
+
+### 11.4 这个不对称对三态和前端轮询的影响
+
+#### 场景：只有 preview 失败，其余四个都成功
+
+假设一个链接经过 Worker 处理后状态为：
+```
+image: "archives/1/123.png"      (成功)
+pdf: "archives/1/123.pdf"         (成功)
+readable: "archives/1/123.html"   (成功)
+monolith: "archives/1/123.mhtml"  (成功)
+preview: "unavailable"            (失败)
+lastPreserved: "2026-06-08T10:00:00.000Z"
+```
+
+**1. brokenArchives 查询会把它捞出来**（OR 条件匹配 `preview: "unavailable"`）
+
+**2. needsReprocessing 计算为 false**
+- `link.image === "unavailable"` → false
+- `link.pdf === "unavailable"` → false
+- `link.readable === "unavailable"` → false
+- `link.monolith === "unavailable"` → false
+- 结果：false → **整个 if 分支跳过，不做任何事**
+
+**3. preview 永远停留在 "unavailable"**
+- 没有任何代码把它改回 `null`
+- `lastPreserved` 也保持非 null → Worker 不会重新取这条链接
+- 结果：**preview 永久为 unavailable，除非用户手动走其他刷新路径**
+
+#### 对三态状态的影响
+
+| 维度 | 值 | 含义 |
+|---|---|---|
+| Worker 取任务？ | ❌ lastPreserved ≠ null | 不会被重新处理 |
+| `formatAvailable(link, "preview")` | ❌ preview = "unavailable" | 认为该格式不可用 |
+| `isReady()` 判断 | ✅ preview 非空即可 | 认为"准备就绪" |
+| `atLeastOneFormatAvailable()` | ✅ image/pdf 等有真实路径 | 认为至少有一个可用 |
+| 详情页状态 | 走"全部完成"分支 | 看起来正常，只是预览图区域是灰色占位块 |
+| 前端列表轮询 | ❌ preview = "unavailable" | 轮询不启动 |
+
+**4. 前端轮询为什么不启动？**
+
+[Links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/Links.tsx#L405-L425) 和 [DashboardLinks.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/DashboardLinks.tsx#L110-L130) 轮询条件完全一致：
+
+```typescript
+if (
+  links?.some((e) =>
+    !e.preview?.startsWith("archives") && e.preview !== "unavailable"
+  )
+) {
+  interval = setInterval(..., 5000);
+}
+```
+
+轮询启动的充要条件：`preview` **既不是** `archives/` 开头的真实路径，**也不是** `"unavailable"`。
+
+当 preview = `"unavailable"` 时：
+- `!e.preview?.startsWith("archives")` → true
+- `e.preview !== "unavailable"` → **false**
+- AND → false → 轮询**不启动**
+
+这就是设计意图：`"unavailable"` 被视为"终态"，和真实路径一样不需要再轮询。但问题在于 allBroken 无法把它从终态拉回来。
+
+#### 前端 UI 上的表现（三态渲染）
+
+以 [LinkCard.tsx](file:///d:/fz/0601/solo-dogfeeding/code/99-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkCard.tsx#L98-L123) 为例，preview 三态分支：
+
+```tsx
+{formatAvailable(link, "preview") ? (
+  // 态 A：真实路径 → 显示预览图
+  <Image src={`/api/v1/archives/${link.id}?format=jpeg&preview=true...`} />
+) : link.preview === "unavailable" ? (
+  // 态 B：unavailable → 显示灰色空块（没有任何文字提示）
+  <div className={`bg-gray-50 ${imageHeightClass} bg-opacity-80`}></div>
+) : (
+  // 态 C：null → 显示骨架屏（loading）
+  <div className={`${imageHeightClass} bg-opacity-80 skeleton rounded-none`}></div>
+)}
+```
+
+用户看到的是：卡片顶部突然变成了一块安静的灰色区域，没有任何错误提示，也没有加载动画——和"用户本来就没开预览图"视觉上几乎无法区分。
+
+### 11.5 对比：其他刷新路径对 preview 的处理
+
+| 刷新 API | 是否把 preview 置 null？ | 是否把 lastPreserved 置 null？ |
+|---|---|---|
+| `PUT /api/v1/links/{id}/archive`（单条刷新） | ✅ 是 | ✅ 是 |
+| `DELETE /api/v1/links/archive`（已选链接批量） | ✅ 是 | ✅ 是 |
+| `DELETE /api/v1/worker/preservation` + action=allAndRePreserve | ✅ 是 | ✅ 是 |
+| `DELETE /api/v1/worker/preservation` + action=allBroken | ❌ **否** | ❌ 仅当 needsReprocessing=true 时才置 null |
+
+结论：
+- 单条刷新、批量已选刷新、全量刷新都会把 preview 改回 null → Worker 会重新生成 preview
+- **只有 allBroken 不管 preview**，导致"仅 preview 损坏"的链接无法被 allBroken 修复
+- 用户如果发现某条链接 preview 是灰色块，只能通过单条刷新、勾选后批量刷新、或 allAndRePreserve 全量重跑三条路径来修复
