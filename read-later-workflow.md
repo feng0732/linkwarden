@@ -243,7 +243,7 @@ case "pinned":
 
 ---
 
-## 三、排序（Sort）机制
+## 三、排序（Sort）机制深度分析
 
 ### 1. 支持的排序方式
 
@@ -258,7 +258,9 @@ export enum Sort {
 }
 ```
 
-### 2. 排序持久化
+**关键事实**：只有这 4 种确定性排序，**不存在"按相关性排序"选项**。Sort 枚举中没有定义 Relevance，前端下拉框（SortDropdown.tsx）也没有提供该选项。
+
+### 2. 排序持久化与默认值
 
 排序设置保存在 `localStorage` 中，见 [SortDropdown.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/components/SortDropdown.tsx#L26-L33)
 
@@ -268,11 +270,54 @@ useEffect(() => {
 }, [sortBy]);
 ```
 
-### 3. 后端排序实现
+前端默认值见 [links.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/packages/router/links.tsx#L27-L32)：
+```typescript
+const sort =
+  params.sort ??
+  (typeof window !== "undefined"
+    ? Number(window.localStorage.getItem("sortBy"))
+    : 0) ??
+  0;  // 默认兜底是 0，即 Sort.DateNewestFirst
+```
 
-#### 数据库直接查询（无 Meilisearch 时）
+### 3. 后端排序实现：三层排序架构
 
-见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L26-L30)
+排序实际上经历了**三层处理**，其中 Meilisearch 路径有两层排序，PostgreSQL 路径有一层，前端还有可选的客户端排序。
+
+#### 第一层：Meilisearch sort 参数（仅 Meilisearch 路径）
+
+见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L72-L81)
+
+```typescript
+const meiliResp = await meiliClient.index("links").search(meiliQuery, {
+  filter: meiliFilters,
+  attributesToRetrieve: ["id"],
+  limit,
+  offset,
+  sort:                                            // ← 第一层排序
+    query.sort === Sort.DateNewestFirst
+      ? ["id:desc"]
+      : query.sort === Sort.DateOldestFirst
+        ? ["id:asc"]
+        : query.sort === Sort.NameAZ
+          ? ["name:asc"]
+          : query.sort === Sort.NameZA
+            ? ["name:desc"]
+            : ["id:desc"],   // 所有分支都显式传了 sort，没有 undefined
+});
+```
+
+**重要结论**：
+- **所有 4 种排序方式都显式传了 `sort` 参数**，没有任何分支使用 Meilisearch 的默认相关性排序
+- Meilisearch 在显式指定 `sort` 时会完全按该规则排序，其内部的相关性评分机制不会生效
+- 索引的可排序字段配置见 [linkIndexing.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/worker/workers/linkIndexing.ts#L47-L49)：
+  ```typescript
+  await meiliClient.index("links").updateSortableAttributes(["id", "name"]);
+  ```
+
+#### 第二层：PostgreSQL ORDER BY（两条路径都有）
+
+见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L26-L30) 和 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L139)
 
 ```typescript
 let order: Order = { id: "desc" };
@@ -280,46 +325,44 @@ if (query.sort === Sort.DateNewestFirst) order = { id: "desc" };
 else if (query.sort === Sort.DateOldestFirst) order = { id: "asc" };
 else if (query.sort === Sort.NameAZ) order = { name: "asc" };
 else if (query.sort === Sort.NameZA) order = { name: "desc" };
+
+// ... 两处 findMany 调用都使用：
+orderBy: order,  // ← 第二层排序
 ```
 
-**注意**：日期排序使用 `id` 字段，因为 ID 是自增的，与创建时间正相关。
+**为什么 Meilisearch 路径还要在 PostgreSQL 再次排序？**
 
-#### Meilisearch 搜索引擎排序
+这不是 bug，而是必要的——Meilisearch 只返回了匹配的 `id` 列表，PostgreSQL 使用 `WHERE id IN (meiliIds)` 查询时，**IN 子句不保证返回顺序与传入 ID 列表一致**。因此即使 Meilisearch 已经按正确顺序返回了 ID，也必须用 `ORDER BY` 再次确保最终结果顺序正确。
 
-见 [linkIndexing.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/worker/workers/linkIndexing.ts#L47-L49)
+**两次排序规则完全一致**，所以最终顺序是确定的，不存在"覆盖"问题。
+
+#### 第三层：前端客户端排序（可选，useSort hook）
+
+见 [useSort.tsx](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/hooks/useSort.tsx)
 
 ```typescript
-await meiliClient
-  .index("links")
-  .updateSortableAttributes(["id", "name"]);
+useEffect(() => {
+  const dataArray = [...data];
+  if (sortBy === Sort.NameAZ)
+    setData(dataArray.sort((a, b) => a.name.localeCompare(b.name)));
+  else if (sortBy === Sort.NameZA)
+    setData(dataArray.sort((a, b) => b.name.localeCompare(a.name)));
+  else if (sortBy === Sort.DateNewestFirst)
+    setData(dataArray.sort((a, b) =>
+      new Date(b.createdAt as string).getTime() - new Date(a.createdAt as string).getTime()
+    ));
+  else if (sortBy === Sort.DateOldestFirst)
+    setData(dataArray.sort((a, b) =>
+      new Date(a.createdAt as string).getTime() - new Date(b.createdAt as string).getTime()
+    ));
+}, [sortBy, data]);
 ```
 
-搜索时的排序见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L72-L81)
+这层排序只对已加载到客户端内存的数据生效，主要用于：
+- 多页数据合并后的重新排序
+- 本地数据变更后的即时排序更新
 
-### 4. 关于"推荐排序"和"历史记录影响"
-
-**重要结论**：当前代码中**不存在**以下功能：
-
-- ❌ 基于用户阅读历史的智能推荐排序
-- ❌ 基于点击次数/访问频率的排序
-- ❌ "最近阅读"排序（只有"最近添加"）
-- ❌ 记录用户打开/阅读链接的历史的机制
-
-打开链接的逻辑（见 [openLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/client/openLink.ts)）只是简单跳转，没有记录任何行为数据：
-
-```typescript
-const openLink = (link, user, openModal) => {
-  if (user.linksRouteTo === LinksRouteTo.DETAILS) {
-    openModal();
-  } else {
-    const format = getFormatBasedOnPreference({ link, preference: user.linksRouteTo });
-    window.open(
-      format !== null ? `/preserved/${link?.id}?format=${format}` : link.url,
-      "_blank"
-    );
-  }
-};
-```
+**注意**：日期排序使用 `createdAt` 字段（JS Date），而后端使用 `id` 自增字段。由于 ID 自增与创建时间正相关，两者结果理论一致。
 
 ### 5. Dashboard 中的排序
 
@@ -543,13 +586,15 @@ if (meiliClient && query.searchQueryString)
    - 其他：url/name/collection/tag/before/after 等
    ↓
 3. 调用 Meilisearch 搜索，仅取回匹配的 link.id 列表（attributesToRetrieve: ["id"]）
+   - 显式指定 sort 参数（4种排序之一），Meilisearch 不使用相关性排序
    ↓
 4. 用 id 列表回查 PostgreSQL 获取完整数据：
    prisma.link.findMany({ where: { id: { in: meiliIds } }, ... })
    - 再次做权限校验（双保险）
    - include: tags, collection, pinnedBy（仅当前用户）
    ↓
-5. 排序：PostgreSQL orderBy（注意：Meilisearch 的排序结果会被二次排序覆盖）
+5. 排序：PostgreSQL ORDER BY（与 Meilisearch 使用完全相同的排序规则，
+   目的是修正 WHERE id IN (...) 不保证返回顺序的问题，不是覆盖）
    ↓
 6. 返回结果 + nextCursor（offset + limit 模式）
 ```
@@ -615,10 +660,11 @@ Meilisearch 中 `pinnedBy` 字段包含**所有**置顶了该链接的用户 ID�
 | 对比维度 | Meilisearch 路径 (A-1) | PostgreSQL 路径 (A-2, B) |
 |---------|----------------------|-------------------------|
 | 触发条件 | meiliClient 可用 + 有关键词 | 其他情况 |
-| 搜索能力 | 全文搜索 + 相关性排序 + 所有高级语法 | 简单 LIKE contains，**不支持高级语法** |
+| 搜索能力 | 全文搜索（Meilisearch 倒排索引）+ 所有高级语法 | 简单 LIKE contains，**不支持高级语法** |
+| 相关性排序 | ❌ 不存在。显式指定 sort 参数，Meilisearch 相关性不生效 | ❌ 不存在 |
 | 置顶过滤 | `pinnedBy = ${userId}`（Meilisearch 过滤） | `pinnedBy: { some: { id: userId } }`（Prisma） |
 | 权限过滤 | `collectionOwnerId=X OR collectionMemberIds=X`（预索引字段） | 联表查询 collection.ownerId 和 members |
-| 排序 | 1. Meilisearch sort 参数<br>2. **但 PostgreSQL orderBy 会覆盖** | 直接 PostgreSQL `ORDER BY` |
+| 排序机制 | **两层排序，规则一致**：<br>1. Meilisearch sort 参数（确定返回哪些 ID）<br>2. PostgreSQL ORDER BY（修正 IN 子句顺序不确定性） | 直接 PostgreSQL `ORDER BY`（一层排序） |
 | 分页 | offset/limit 模式，`nextCursor = offset + limit` | cursor 模式，`nextCursor = lastItem.id` |
 | 查询次数 | 2 次（Meilisearch + PostgreSQL 回查） | 1 次 |
 | 标签搜索权限 | 无额外过滤（Meilisearch 只存 tag 名称） | 对 tag.ownerId 额外做权限检查 |
@@ -756,6 +802,7 @@ const numberOfPinnedLinks = removedLink?.pinnedBy?.length
 ```
 前端请求 (sort, pinnedOnly, collectionId, searchQueryString)
   │  useLinks hook → GET /api/v1/search
+  │  sort 默认 = DateNewestFirst (id desc)，共 4 种排序，无相关性选项
   ▼
 API 路由验证用户身份 (verifyUser)
   │
@@ -766,13 +813,21 @@ API 路由验证用户身份 (verifyUser)
 Meilisearch 搜索路径           PostgreSQL 直接查询
   │  解析高级语法                  │  LIKE contains 模糊匹配
   │  权限过滤（预索引字段）         │  联表权限过滤
-  │  取匹配 id 列表                 │  直接 include tags/collection
+  │  sort: 显式指定 4 种之一        │  直接 include tags/collection
+  │  (无相关性排序)                 │
+  │  取匹配 id 列表                 │
   ▼                                   │
 PostgreSQL 回查完整数据 ◄────────────┘
   │  include.pinnedBy.where = { id: userId } ← 只返回当前用户置顶
-  │  orderBy 排序
+  │  orderBy: 与 Meilisearch 相同规则（修正 IN 子句顺序不确定性）
   ▼
 返回：{ data: { links: [...], nextCursor } }
+  │
+  ▼
+（可选）前端 useSort hook 客户端再排序
+  │  日期用 createdAt（后端用 id），理论一致
+  ▼
+最终列表展示
 ```
 
 ### 置顶操作流程
@@ -813,17 +868,18 @@ PostgreSQL 回查完整数据 ◄────────────┘
 2. **没有独立的"收藏"功能**：置顶承担了收藏的角色，但语义上可能不清晰
 3. **置顶状态只返回当前用户**：`pinnedBy` 数组中只有当前用户 ID，协作者之间看不到彼此的置顶（这是设计，但用户可能想知道"谁置顶了这个"）
 4. **没有阅读历史记录**：无法追踪用户是否打开/阅读过某个链接，也无法基于此排序
-5. **排序方式有限**：只有 4 种基础排序，没有"推荐"、"最近阅读"、"最常访问"等
-6. **Meilisearch 路径排序问题**：Meilisearch 返回的排序结果被 PostgreSQL 的 orderBy 二次排序覆盖（见 searchLinks.ts 第139行），可能导致搜索相关性失效
-7. **Meilisearch 索引的置顶延迟**：索引 worker 是异步的，置顶/取消置顶后立即搜索可能得到旧结果
-8. **两条路径搜索能力不对等**：PostgreSQL fallback 不支持高级搜索语法，但前端搜索框不提示这一点
+5. **排序方式有限**：只有 4 种基础排序（日期/名称），**完全没有"按相关性排序"选项**，也没有"推荐"、"最近阅读"、"最常访问"等
+6. **Meilisearch 能力未充分利用**：虽然集成了 Meilisearch，但代码显式指定 sort 参数导致其相关性评分机制完全不生效；用户无法享受搜索引擎的相关性排序优势
+7. **前后端排序字段不一致**：后端日期排序使用 `id` 自增字段，前端 useSort hook 使用 `createdAt` 字段；虽然理论一致，但极端情况下（如数据迁移、ID 重置）可能出现差异
+8. **Meilisearch 索引的置顶延迟**：索引 worker 是异步的，置顶/取消置顶后立即搜索可能得到旧结果
+9. **两条路径搜索能力不对等**：PostgreSQL fallback 不支持高级搜索语法，但前端搜索框不提示这一点
 
 ### 🔧 潜在改进方向
 
 1. 为 Link 增加 `status` 字段（如 UNREAD, READ, ARCHIVED）实现真正的阅读后状态
 2. 增加 `lastOpenedAt` 字段记录用户最后打开时间，支持"最近阅读"排序
 3. 区分"收藏"（Favorite）和"置顶"（Pin）两种语义
-4. 增加基于阅读行为的推荐排序算法
+4. **新增"按相关性排序"选项**：在 Sort 枚举中增加 Relevance 值，当选择该值时 Meilisearch 不传 sort 参数，让其按默认相关性排序；PostgreSQL 路径可使用全文搜索排名（如 PostgreSQL `ts_rank`）
 5. 让集合所有者可以查看成员的置顶/收藏情况（协作场景）
-6. 修复 Meilisearch 路径排序被 PostgreSQL 覆盖的问题，保证搜索相关性
+6. 统一前后端排序字段：后端日期排序也使用 `createdAt` 字段，避免极端情况下的不一致
 7. 在置顶/取消置顶后立即触发 Meilisearch 索引更新，或在应用层做补偿
