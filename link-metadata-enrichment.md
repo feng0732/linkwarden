@@ -17,7 +17,9 @@ Link 模型在 `packages/prisma/schema.prisma` 中定义，与元数据相关的
 | `metaDescription` | String? | 自动抓取（Worker） | 页面 `<meta name="description">` 内容，用于 AI 打标签，**不直接在 UI 显示** |
 | `preview` | String? | 自动生成 | 预览图文件路径，或 `"unavailable"` |
 | `image` | String? | 用户上传 / 自动截图 | 完整截图文件路径，或 `"unavailable"` |
-| `icon / iconWeight / color` | String? | 用户输入 | 用户自定义图标及样式 |
+| `icon` | String? | 用户输入 | 自定义 Phosphor 图标名；**仅此字段决定是否显示自定义图标（与 favicon 二选一）** |
+| `iconWeight` | String? | 用户输入 | 自定义图标粗细（`thin`/`light`/`regular`/`bold`/`fill`/`duotone`），默认 `"regular"` |
+| `color` | String? | 用户输入 | 自定义图标颜色（十六进制色值），默认主题主色 `--p` |
 | `type` | String | 自动检测 | `url` / `pdf` / `image` |
 | `lastPreserved` | DateTime? | 系统维护 | 上次归档处理时间戳，`null` 表示待处理 |
 | `indexVersion` | Int? | 系统维护 | 搜索索引版本号，`null` 表示待重建索引 |
@@ -106,18 +108,52 @@ return Boolean(link && link[format] && link[format] !== "unavailable");
 
 Favicon **不存入数据库**，通过 API 按需动态获取。
 
-### 4.2 前端触发流程
+### 4.2 LinkIcon 完整分支决策链
 
-`apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L49-L69` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L49-L69))
+`apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx))
+
+**⚠️ 核心事实**：只有 `link.icon` 一个字段控制"自定义图标 vs favicon"的分支选择。`iconWeight` 和 `color` 仅在自定义图标分支中作为样式参数使用，不参与分支判断。
+
+完整分支逻辑（代码 `#L39-L88`，[GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L39-L88)）：
 
 ```
-用户设置了自定义 icon/iconWeight/color ?
-   ├─ 是 → 显示 Phosphor 自定义图标
-   └─ 否 → 链接类型为 "url" ?
-              ├─ 是 → 请求 /api/v1/getFavicon?url={origin}
-              ├─ pdf → 显示 bi-file-earmark-pdf
-              └─ image → 显示 bi-file-earmark-image
+link.icon 有值（非空字符串）?
+   ├─ 是 → 分支 A：显示 Phosphor 自定义图标
+   │       ├─ icon 名：link.icon（如 "bookmark", "link" 等）
+   │       ├─ weight：link.iconWeight || "regular"   （默认 regular）
+   │       │         可选值：thin / light / regular / bold / fill / duotone
+   │       └─ color： link.color || oklchVariableToHex("--p")
+   │                  （默认主题主色 --p，从 oklch 变量转换为 hex）
+   │
+   └─ 否 → 进入自动分支
+            │
+            ├─ link.type === "url" && url 合法可解析为 URL?
+            │    └─ 是 → 分支 B：请求 favicon
+            │             GET /api/v1/getFavicon?url={origin}
+            │             加载完成前显示占位图标 bi-link-45deg
+            │
+            ├─ link.type === "pdf"?
+            │    └─ 是 → 分支 C：显示占位图标 bi-file-earmark-pdf
+            │
+            ├─ link.type === "image"?
+            │    └─ 是 → 分支 D：显示占位图标 bi-file-earmark-image
+            │
+            └─ 以上均不满足 → 分支 E：不渲染任何内容（undefined）
 ```
+
+**各分支代码定位**：
+
+| 分支 | 代码位置 | 说明 |
+|---|---|---|
+| A 自定义图标 | `#L39-L48` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L39-L48)) | 渲染 `<Icon>` 组件（Phosphor） |
+| B Favicon | `#L49-L70` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L49-L70)) | Next.js `<Image>` + `onLoad` 切换 opacity |
+| C PDF 占位 | `#L71-L75` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L71-L75)) | Bootstrap Icons bi-file-earmark-pdf |
+| D Image 占位 | `#L76-L80` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L76-L80)) | Bootstrap Icons bi-file-earmark-image |
+| E 不渲染 | `#L81-L88` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L81-L88)) | 注释掉的 Monolith 分支 + undefined |
+
+**使用 LinkIcon 的视图组件**：
+- Masonry 瀑布流：`apps/web/components/LinkViews/LinkComponents/LinkMasonry.tsx#L122` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkMasonry.tsx#L122))
+- List 列表：`apps/web/components/LinkViews/LinkComponents/LinkList.tsx#L93` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkList.tsx#L93))
 
 ### 4.3 Favicon API：两级缓存 + 双来源 Fallback
 
@@ -174,8 +210,9 @@ Cache-Control: public, max-age=3600, s-maxage=86400, stale-while-revalidate=6048
 - 浏览器缓存 **1 小时**（比成功短，便于尽快重试成功）
 - CDN 缓存 **1 天**
 
-**UI Fallback**：Favicon 加载完成前显示占位图标（`bi-link-45deg`），通过 `onLoad` + opacity 切换
+**UI Fallback**：Favicon 加载完成前显示占位图标（`bi-link-45deg`），通过 `onLoad` + state 切换 opacity
 `apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L31-L69` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L31-L69))
+（`faviconLoaded` state 在 `#L31` 声明，`onLoad` 在 `#L62` 触发，opacity 切换在 `#L57-L60`）
 
 ### 4.4 Favicon 缓存完整链路
 
@@ -365,16 +402,31 @@ Cache-Control: private, max-age=31536000, immutable
 
 ---
 
-## 六、用户手工字段优先级总结
+## 六、用户手工字段优先级与显示规则总结
 
-以下字段**永不被 Worker 覆盖**：
+以下字段**永不被 Worker 覆盖**，完全由用户控制：
 
-| 字段 | 优先级 |
-|---|---|
-| `name` | 用户输入 > 自动抓取标题 > URL |
-| `description` | 仅用户输入（Worker 写 metaDescription 到另一个字段） |
-| `icon / iconWeight / color` | 仅用户输入 |
-| `tags` | 用户输入 + AI 自动追加（aiTag 时） |
+| 字段 | 显示条件 / 优先级 | 默认值 | 代码证据 |
+|---|---|---|---|
+| `name` | 用户输入 > 自动抓取标题 > URL | — | [postLink.ts#L81-L88](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/lib/api/controllers/links/postLink.ts#L81-L88) |
+| `description` | 仅用户输入（Worker 写 metaDescription 到另一个字段，不展示） | 空字符串 `""` | [schema.prisma#L168](https://github.com/feng0732/linkwarden/blob/task-96/packages/prisma/schema.prisma#L168) |
+| `icon` | **仅此字段控制分支**：有值 → 显示自定义 Phosphor 图标；无值 → 进入自动分支（favicon/PDF/Image 占位） | `null`（DB 无默认值） | [LinkIcon.tsx#L39](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L39) |
+| `iconWeight` | 仅在 `link.icon` 有值时生效：Phosphor 图标粗细 | `"regular"` | [LinkIcon.tsx#L44](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L44) |
+| `color` | 仅在 `link.icon` 有值时生效：Phosphor 图标颜色 | 主题主色 `--p`（通过 `oklchVariableToHex` 转换） | [LinkIcon.tsx#L45](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkViews/LinkComponents/LinkIcon.tsx#L45) |
+| `tags` | 用户输入 + AI 自动追加（aiTag 时） | `[]` | — |
+
+**⚠️ 关键区分**：
+- `icon`：**分支控制字段**，决定走自定义图标还是自动图标分支
+- `iconWeight` / `color`：**样式参数**，仅在 `icon` 有值时才被读取，不参与分支选择
+
+**Prisma Schema 字段定义对比**：
+`packages/prisma/schema.prisma#L178-L180` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/packages/prisma/schema.prisma#L178-L180))
+```prisma
+icon            String?
+iconWeight      String?
+color           String?
+```
+三者均为 `String?`（可空），DB 层**均无默认值**（注意：Collection 模型的 `color` 有默认 `"#0ea5e9"`，但 Link 模型没有）。
 
 **当用户修改 URL 时**：
 `apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L150-L163` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L150-L163))
