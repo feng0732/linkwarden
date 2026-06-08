@@ -43,7 +43,7 @@ Linkwarden **没有细粒度的 OAuth scope**，所有 AccessToken 等效于该�
 |-------|------|----------|-----|
 | `preserved-format` | 归档内容（PDF/截图/Monolith/可读格式）的单次访问授权 | [createPreservedFormatUrl.ts](./apps/web/lib/api/preserved/createPreservedFormatUrl.ts#L6-L8) | 300 秒 (5 分钟) |
 
-该 scope 的 token 独立于用户会话，使用 `NEXTAUTH_SECRET` 签名，包含 `linkId`、`filePath`、`format`、`scope`、`iat`、`exp` 字段。
+该 scope 的 token 独立于用户会话，使用 `NEXTAUTH_SECRET` 签名，包含 `linkId`、`filePath`、`format`、`scope`、`iat`、`exp`、`jti`（`crypto.randomUUID()`，见 [createPreservedFormatUrl.ts#L66-L78](./apps/web/lib/api/preserved/createPreservedFormatUrl.ts#L66-L78)）字段。签发时**不写入 AccessToken 表**，也**无对应的撤销接口**。
 
 ### 1.4 Token 过期选项
 
@@ -221,13 +221,15 @@ await prisma.accessToken.update({
 | 浏览器 JWT Cookie | N/A | ✅ 包含 jti | ❌ 不写入 | ❌ 完全不受撤销列表影响（设计缺口） |
 | API Access Token | `false` | ✅ 包含 jti | ✅ 写入 | ✅ 下次调用立即失效（401） |
 | 移动端永久会话 (`POST /api/v1/session`) | `true` | ✅ 包含 jti | ✅ 写入 | ✅ 下次调用立即失效（401） |
-| Preserved-Format Token | N/A | ❌ 独立 JWT（无 jti） | ❌ 不写入 | ❌ 独立 JWT，5 分钟自然过期，无撤销机制 |
+| Preserved-Format Token | N/A | ✅ 包含 jti | ❌ 不写入 | ❌ 独立 JWT，5 分钟自然过期，无撤销接口 |
 
 > **关键修正**: 浏览器常规登录产生的 NextAuth JWT Cookie **不会**在 `AccessToken` 表中创建记录，这是其无法被撤销的根本原因。因此：
 > 1. `DELETE /api/v1/tokens/[id]` 无法撤销任何浏览器会话，因为该接口操作的是 AccessToken 表，而浏览器 JWT 在该表中没有对应记录
 > 2. `verifyToken` 的撤销查询是 `where: { token: token.jti, revoked: true }`（见 [verifyToken.ts#L24-L29](./apps/web/lib/api/verifyToken.ts#L24-L29)），对浏览器 JWT 而言该查询返回 `null`（无匹配记录），故撤销检查永远通过
 > 3. 浏览器会话只能通过 JWT 自身过期（30 天）或客户端 `signOut()` 清除 Cookie 来终止
 > 4. 前端登出使用 NextAuth 的 `signOut()` 函数（如 [ProfileDropdown.tsx](./apps/web/components/ProfileDropdown.tsx#L77)），仅清除客户端 Cookie，**不通知后端**删除任何会话记录
+
+> **补充：Preserved-Format Token 的验证路径**：该 token 的验证完全独立，不经过 `verifyToken`。[preserved/view.ts#L122-L129](./apps/web/pages/api/v1/preserved/view.ts#L122-L129) 仅通过 `decodePreservedFormatToken` 解码并检查 `scope`、`exp` 和签名有效性，**不查询 AccessToken 表**。因此即使将其 jti 写入 AccessToken 表并标记 revoked，也不会产生任何效果。
 
 ### 4.4 Token 列表可见性
 
@@ -382,5 +384,5 @@ NextAuth 提供 `signIn` callback（[[...nextauth].ts](./apps/web/pages/api/v1/a
 4. **无 API Rate Limiting**: 除邮件发送外，所有 API 端点无用户级或 IP 级频率限制
 5. **无操作审计日志**: 所有数据变更（link/collection/token/user）无持久化操作记录
 6. **Token 使用不追踪**: `lastUsedAt` 字段存在但从未写入，无法审计 token 使用
-7. **Preserved-Format Token 无撤销**: 5 分钟窗口内一旦签发无法撤回
+7. **Preserved-Format Token 无撤销能力**: 签发时显式生成 jti 但不写入 AccessToken 表，且无独立撤销接口；5 分钟窗口内一旦签发无法撤回，仅靠自身过期失效
 8. **调试日志泄露**: [verify-email.ts](./apps/web/pages/api/v1/auth/verify-email.ts#L74) 的 `console.log(emailInUse)` 会在生产日志中输出用户邮箱信息
