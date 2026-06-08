@@ -291,47 +291,189 @@ OR: [
 
 **注意**：虽然查询条件是 `OR: [{ username }, { email }]`，响应中不会直接返回 email 字段，但攻击者可通过"我用 email A 请求，返回了用户 B 的 username 和 name"这一事实反推 email A ↔ 用户 B 的对应关系，构成间接邮箱泄露。
 
-### 5.3 公开 Collection 字段裁剪
+### 5.3 公开 Collection 字段裁剪与 members 关联表权限暴露
 
-位于 [getPublicCollection.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/public/collections/getPublicCollection.ts#L10-L23)
+#### 5.3.1 Collection 本身字段
+
+公开 Collection API `/api/v1/public/collections/[id]` 的查询位于 [getPublicCollection.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/public/collections/getPublicCollection.ts#L3-L25)。由于使用的是 `findFirst` + `include` 而非显式 `select`，**Collection 模型的所有标量字段都会返回**：
+
+| Collection 字段 | 是否暴露 | 类型 | 备注 |
+|-----------------|---------|------|------|
+| `id` | ✅ | Int | |
+| `name` | ✅ | String | |
+| `description` | ✅ | String | |
+| `icon` | ✅ | String? | |
+| `iconWeight` | ✅ | String? | |
+| `color` | ✅ | String | |
+| `parentId` | ✅ | Int? | 可探测层级结构 |
+| `isPublic` | ✅ | Boolean | 直接暴露公开状态 |
+| `ownerId` | ✅ | Int | 暴露所有者用户 ID |
+| `createdById` | ✅ | Int? | 暴露创建者用户 ID |
+| `createdAt` | ✅ | DateTime | |
+| `updatedAt` | ✅ | DateTime | |
+
+不返回的关联字段（未显式 include）：`owner`、`parent`、`subCollections`、`links`、`rssSubscriptions`、`DashboardSection`、`createdBy`。
+
+#### 5.3.2 members 关联表（UsersAndCollections）完整字段暴露
 
 ```typescript
-members: {
-  include: {
-    user: {
-      select: {
-        username: true,
-        name: true,
-        image: true,
-        // ✅ 不包含 email、password 等敏感字段
+// getPublicCollection.ts 的 include 结构：
+include: {
+  members: {
+    include: {
+      user: {
+        select: {
+          username: true,
+          name: true,
+          image: true,
+          // ✅ 不包含 email、password 等敏感字段
+        },
       },
     },
   },
   _count: { select: { links: true } },
+},
 ```
+
+**Prisma 关键行为**：当使用 `include: { members: { include: { user: { select: ... } } } }` 时，`members` 关联表（即 `UsersAndCollections`）的**所有标量字段默认都会返回**，除非显式使用 `select` 或 `omit`。嵌套的 `include.user.select` 仅控制关联的 `user` 对象返回哪些字段，不影响 `members` 本身。
+
+根据 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/packages/prisma/schema.prisma#L151-L164)，`UsersAndCollections` 表的完整标量字段如下：
+
+| UsersAndCollections 字段 | 是否暴露给匿名用户 | 类型 | 安全影响 |
+|--------------------------|------------------|------|---------|
+| `userId` | ✅ | Int | 成员的用户 ID，可进一步查询公开用户 API 获取 username/name/头像 |
+| `collectionId` | ✅ | Int | 冗余信息（当前 Collection ID） |
+| **`canCreate`** | ✅ | Boolean | **暴露该成员是否有权在 Collection 中创建 Links** |
+| **`canUpdate`** | ✅ | Boolean | **暴露该成员是否有权更新 Collection 中的 Links** |
+| **`canDelete`** | ✅ | Boolean | **暴露该成员是否有权删除 Collection 中的 Links** |
+| `createdAt` | ✅ | DateTime | 成员加入时间元数据 |
+| `updatedAt` | ✅ | DateTime | 权限变更时间元数据 |
+| `user`（关联） | ✅（仅 username/name/image） | User 对象 | 见 select 白名单 |
+
+**权限字段暴露的安全影响**：
+
+1. **协作结构信息泄露**：匿名用户可以完整知道该公开 Collection 的所有协作者列表，以及每个协作者的具体权限级别（只读 / 可创建 / 可更新 / 可删除的组合）。这暴露了团队内部的角色分工。
+
+2. **用户 ID 批量泄露**：每个成员的 `userId` 都被暴露，可以批量调用 `/api/v1/public/users/{userId}` 获取更多用户信息。
+
+3. **无业务必要性**：匿名用户浏览公开 Collection 时，并不需要知道哪些成员拥有 `canCreate` / `canUpdate` / `canDelete` 权限——这些信息只对所有者和已认证的成员在管理界面有用。
+
+4. **与 Link 接口的一致性对比**：通过 Link 对象返回的 `collection` 字段（`include: { collection: true }`）**不包含 members**，因为 Link 查询中没有嵌套 include members。因此，两个公开入口（Collection 详情 vs Link 详情）暴露的信息粒度不一致——Collection 详情暴露更多。
+
+### 5.3.3 公开 Tags 接口字段暴露
+
+公开 Tags API `/api/v1/public/collections/tags` 位于 [tags/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/pages/api/v1/public/collections/tags/index.ts#L25-L43)，流程为：
+1. 校验 `collectionId` 对应的 Collection 是否 `isPublic === true`
+2. 调用 `getTags({ collectionId, query })`（不传 `userId`，走 collectionId 分支）
+
+`getTags` 的 collectionId 分支查询位于 [getTags.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/tags/getTags.ts#L107-L139)：
+
+```typescript
+const tags = await prisma.tag.findMany({
+  where: {
+    AND: [
+      ...(searchCondition ? [searchCondition] : []),
+      { links: { some: { collectionId } } },  // 仅返回该 Collection 下使用过的 Tag
+    ],
+  },
+  include: {
+    _count: { select: { links: true } },  // Tag 在该 Collection 中的链接数量
+  },
+  orderBy: [{ name: "asc" }, { id: "asc" }],
+});
+```
+
+**Prisma 关键行为**：`findMany` 不显式 `select` 时默认返回 Tag 模型所有标量字段，加上 `include` 的 `_count.links`。
+
+根据 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/packages/prisma/schema.prisma#L200-L218)，完整暴露的 Tag 字段如下：
+
+| Tag 字段 | 是否暴露给匿名用户 | 类型 | 安全影响 |
+|----------|------------------|------|---------|
+| `id` | ✅ | Int | Tag 主键，可被用于搜索等 |
+| `name` | ✅ | String | Tag 名称，正常公开内容 |
+| **`ownerId`** | ✅ | Int | **Tag 所有者的用户 ID，可进一步查询公开用户 API**。注意：Tag 可能被多个 Collection 共享使用，暴露 ownerId 可能关联出不属于当前 Collection 的用户信息 |
+| `archiveAsScreenshot` | ✅ | Boolean? | 该 Tag 的截图归档偏好 |
+| `archiveAsMonolith` | ✅ | Boolean? | 该 Tag 的 Monolith 归档偏好 |
+| `archiveAsPDF` | ✅ | Boolean? | 该 Tag 的 PDF 归档偏好 |
+| `archiveAsReadable` | ✅ | Boolean? | 该 Tag 的可读归档偏好 |
+| `archiveAsWaybackMachine` | ✅ | Boolean? | 该 Tag 的 Wayback Machine 归档偏好 |
+| `aiTag` | ✅ | Boolean? | 该 Tag 是否启用 AI 自动打标 |
+| `aiGenerated` | ✅ | Boolean | 该 Tag 是否由 AI 生成 |
+| `createdAt` | ✅ | DateTime | Tag 创建时间 |
+| `updatedAt` | ✅ | DateTime | Tag 更新时间 |
+| `_count.links` | ✅ | Int | 该 Tag 在当前 Collection 下关联的 Link 数量 |
+
+不返回的关联字段（未显式 include）：`links`、`owner`（但 `ownerId` 标量字段已暴露）。
+
+**Tag 字段暴露的安全影响**：
+
+1. **`ownerId` 暴露**：Tag 是用户级资源（`@@unique([name, ownerId])`，每个用户拥有独立的 Tag 命名空间）。当多个用户共享一个 Collection 时，该 Collection 下的 Links 可能关联了不同用户的 Tag。匿名用户通过公开 Tags API 可以枚举到**所有参与该 Collection 的用户 ID**（通过所有 Tag 的 `ownerId` 去重），比 Collection 的 members 列表可能更全面（members 只列明确添加的协作者，Tag ownerId 可能包含通过 Link 创建间接参与的用户）。
+
+2. **归档偏好和 AI 设置泄露**：每个 Tag 的 `archiveAs*` 系列和 `aiTag` / `aiGenerated` 设置被泄露，反映了该 Tag 所有者的使用习惯。
+
+3. **无业务必要性**：匿名用户浏览公开 Collection 的 Links 时只需要 Tag 的 `id` 和 `name`（以及 `_count.links` 用于展示计数），其他字段（ownerId、归档偏好、AI 设置）对匿名视图没有任何用途。
+
+4. **与 Link 接口的一致性对比**：Link 对象中 `include: { tags: true }` 返回的 Tag 字段与公开 Tags API 返回的字段**完全相同**（所有标量字段），所以两个入口在 Tag 暴露粒度上是一致的——均存在过度暴露问题。
 
 ### 5.4 字段暴露汇总
 
-| 字段 | 公开列表 | 公开单个 Link | 已登录 Link | 备注 |
-|------|----------|-----------|-----------|------|
+#### 5.4.1 Link 字段暴露（按匿名入口）
+
+| 字段 | 公开列表 (searchLinks) | 公开单个 Link | 已登录 Link | 备注 |
+|------|---------------------|-------------|-----------|------|
 | `id` | ✅ | ✅ | ✅ | |
 | `name` | ✅ | ✅ | ✅ | |
 | `url` | ✅ | ✅ | ✅ | |
 | `description` | ✅ | ✅ | ✅ | |
 | `type` | ✅ | ✅ | ✅ | |
 | `collectionId` | ✅ | ✅ | ✅ | |
-| `tags` | ✅ | ✅ | ✅ | |
-| `collection` (完整对象 | ✅ | ✅ | ✅ | |
+| `tags`（**所有标量字段**，见 5.4.3） | ✅ | ✅ | ✅ | 包含 Tag.ownerId 等 |
+| `collection`（**所有标量字段**，见 5.4.2） | ✅ | ✅ | ✅ | 不含 members |
 | `preview` | ✅ | ✅ | ✅ | 预览状态字符串 |
 | `image` | ✅ | ✅ | ✅ | 截图文件路径 |
 | `pdf` | ✅ | ✅ | ✅ | PDF 文件路径 |
 | `readable` | ✅ | ✅ | ✅ | Readable 内容路径 |
 | `monolith` | ✅ | ✅ | ✅ | Monolith 文件路径 |
-| `textContent` | ❌ 裁剪 | ⚠️ **未裁剪** | ⚠️ **未裁剪** | **潜在敏感：网页提取的网页正文
+| `textContent` | ❌ 裁剪 | ⚠️ **未裁剪** | ⚠️ **未裁剪** | **潜在敏感：网页提取的网页正文 |
 | `createdAt` | ✅ | ✅ | ✅ | |
 | `updatedAt` | ✅ | ✅ | ✅ | |
 | `pinnedBy` | ❌ | ❌ | ✅（仅当前用户） | |
-| `icon`/`color` 等 | ✅ | ✅ | ✅ | |
+
+#### 5.4.2 Collection 字段暴露（匿名入口对比）
+
+| Collection 字段 | Link 对象中 `include: { collection: true } | 公开 Collection 详情 API `/api/v1/public/collections/[id]` | 备注 |
+|-------------|--------------------------------------------|--------------------------------------------------------|------|
+| `id` | ✅ | ✅ | |
+| `name` | ✅ | ✅ | |
+| `description` | ✅ | ✅ | |
+| `icon` / `iconWeight` / `color` | ✅ | ✅ | |
+| `parentId` | ✅ | ✅ | 可探测层级结构 |
+| `isPublic` | ✅ | ✅ | 直接暴露公开状态 |
+| `ownerId` | ✅ | ✅ | 暴露所有者用户 ID |
+| `createdById` | ✅ | ✅ | 暴露创建者用户 ID |
+| `createdAt` / `updatedAt` | ✅ | ✅ | |
+| `members`（UsersAndCollections 全字段） | ❌ | ✅（含 canCreate/canUpdate/canDelete 权限字段 + user 关联） | **Collection 详情泄露更多** |
+| `_count.links` | ❌ | ✅ | 链接计数 |
+| `owner`（关联） | ❌ | ❌ | 需额外 include |
+| `links` | ❌ | ❌ | 需额外 include |
+
+**暴露差异**：公开 Collection 详情 API 比 Link 对象中返回的 collection 字段**多暴露了 members 关联表（含权限字段）和 `_count.links**。两个匿名入口信息粒度不一致。
+
+#### 5.4.3 Tag 字段暴露（匿名入口对比）
+
+| Tag 字段 | Link 对象中 `include: { tags: true }` | 公开 Tags API `/api/v1/public/collections/tags` | 备注 |
+|-----------|-------------------------------------|------------------------------------------------|------|
+| `id` | ✅ | ✅ | |
+| `name` | ✅ | ✅ | 正常公开内容 |
+| **`ownerId`** | ✅ | ✅ | **Tag 所有者用户 ID，可反查用户 |
+| `archiveAsScreenshot` / `archiveAsMonolith` / `archiveAsPDF` / `archiveAsReadable` / `archiveAsWaybackMachine` | ✅ | ✅ | 归档偏好设置 |
+| `aiTag` / `aiGenerated` | ✅ | ✅ | AI 打标相关设置 |
+| `createdAt` / `updatedAt` | ✅ | ✅ | 时间元数据 |
+| `_count.links` | ❌ | ✅ | 公开 Tags API 额外返回该 Collection 下的链接计数 |
+| `links`（关联） | ❌ | ❌ | 未 include |
+| `owner`（关联） | ❌ | ❌ | 未 include，但 ownerId 已暴露 |
+
+**暴露差异**：Link 对象中的 tags 与公开 Tags API 在标量字段上**完全一致（都返回所有标量字段）。公开 Tags API 额外返回 `_count.links` 计数。两者均存在过度暴露（ownerId、归档偏好、AI 设置）。
 
 ### 5.5 textContent 裁剪差异的安全边界
 
@@ -627,13 +769,14 @@ archives/preview/${collectionId}/${linkId}.jpeg
 
 1. ✅ 公开 Collection 的判定统一基于 `collection.isPublic` 数据库层面过滤
 2. ✅ User 信息采用白名单裁剪，不直接返回 email/password/emailVerified
-3. ✅ Collection members 仅暴露 username/name/image
+3. ✅ Collection members 关联的 User 对象仅暴露 username/name/image（通过嵌套 select 控制）
 4. ✅ Access Token 撤销每次查 DB，立即生效
 5. ✅ Preserved 短期 Token 5 分钟 TTL，no-store 缓存
 6. ✅ Monolith 在启用 USER_CONTENT_DOMAIN 时强制走短期 Token
 7. ✅ searchLinks 列表 API 裁剪 textContent
 8. ✅ Highlights（高亮）接口需要 verifyUser 认证，公开路由无法访问
 9. ✅ `private` Cache-Control 防止 CDN/代理缓存归档文件
+10. ✅ 公开 Tags API 仅返回指定 Collection 下使用过的 Tag，不会泄露其他 Collection 的 Tag
 
 ### 9.2 潜在风险点
 
@@ -641,10 +784,14 @@ archives/preview/${collectionId}/${linkId}.jpeg
 |------|------|------|---------|
 | 归档文件浏览器缓存 1 年 immutable | `/api/v1/archives/[linkId].ts` | 撤销公开后 1 年内浏览器仍可访问已缓存文件 | **高** |
 | 公开用户 API 支持按 email 查找导致用户枚举 | `/api/v1/public/users/[id].ts`、`getPublicUser.ts` | 可无速率限制地枚举系统用户邮箱，用于钓鱼/撞库前置侦察 | **高** |
-| 公开 Link 返回 collection.ownerId 造成信息关联泄露 | `public/links/linkId/getLinkById.ts`、`searchLinks.ts` | 暴露 Collection 所有者用户 ID，可进一步反向查询该用户的公开基础信息（username/name/头像），但**不能正方向从 ownerId 枚举该用户所有公开 Collection**（无对应 API） | **低** |
+| **公开 Collection 详情 API 暴露 members 权限字段** | `getPublicCollection.ts` | members 关联表（UsersAndCollections）所有标量字段默认返回，匿名用户可查看每个协作者的 `canCreate` / `canUpdate` / `canDelete` 权限级别及 `userId`，暴露团队内部角色分工和用户 ID | **中** |
+| **Tag.ownerId 在所有公开入口过度暴露** | `getTags.ts`、Link 查询 `include: { tags: true }` | Tag 是用户级资源，公开 Tags API 和 Link 中的 tags 均返回 `ownerId`，可枚举到所有参与该 Collection 的用户（比 members 列表可能更全面），并可进一步查询公开用户 API | **中** |
+| **Tag 归档偏好与 AI 设置过度暴露** | 同上 | 所有 Tag 的 `archiveAsScreenshot` / `archiveAsPDF` / `archiveAsMonolith` / `archiveAsReadable` / `archiveAsWaybackMachine` / `aiTag` / `aiGenerated` 字段均暴露，反映 Tag 所有者使用习惯，对匿名访问无业务必要性 | **低** |
 | 单 Link API 未裁剪 textContent | `public/links/linkId/getLinkById.ts` | 匿名用户可获取网页正文提取文本（含潜在 PII/版权内容），且与列表 API 策略不一致 | **中** |
+| 公开 Link 返回 collection.ownerId 造成信息关联泄露 | `public/links/linkId/getLinkById.ts`、`searchLinks.ts` | 暴露 Collection 所有者用户 ID，可进一步反向查询该用户的公开基础信息（username/name/头像），但**不能正方向从 ownerId 枚举该用户所有公开 Collection**（无对应 API） | **低** |
 | 公开 Link 返回 collection.parentId 可探测层级结构 | 同上 | 可用于发现父 Collection ID 及未公开的层级结构 | **低** |
 | 公开 Link 返回 collection.isPublic 可探测公开状态 | 同上 | 可直接确认 Collection 是否为公开状态 | **低** |
+| 公开入口信息粒度不一致 | `getPublicCollection.ts` vs Link 查询 | Collection 详情 API 比 Link 对象中的 collection 字段多暴露了 `members`（含权限字段）和 `_count.links`；各入口的字段裁剪策略不统一 | **低** |
 | 无下载速率/次数限制 | 所有 `/api/v1/archives/*` | 匿名用户可无限制下载，潜在带宽滥用 | **中** |
 | 前端 React Query 缓存不随 isPublic 变更自动失效 | `packages/router/*` | 关闭公开后前端仍显示旧数据直到刷新 | **低** |
 | Meilisearch 索引异步更新 | worker 索引延迟 | 搜索结果中仍可搜到刚关闭公开的 Links（分钟级窗口） | **低** |
