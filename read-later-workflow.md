@@ -655,17 +655,139 @@ Meilisearch 中 `pinnedBy` 字段包含**所有**置顶了该链接的用户 ID�
 - **不返回 pinnedBy**：因为没有 userId，`include.pinnedBy` 为 `undefined`
 - **单条公开链接查询**见 [getLinkById.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/public/links/linkId/getLinkById.ts)，完全不包含 `pinnedBy` 字段
 
-### 5. 两条路径的详细对比表
+### 5. 筛选条件的"两阶段应用"（Meilisearch 路径的关键问题）
+
+Meilisearch 路径最核心的设计特点是：**筛选条件被分裂到两个阶段应用**，这直接影响了分页数量和翻页行为。
+
+#### 第一阶段：Meilisearch 搜索时应用的筛选
+
+在调用 `meiliClient.index("links").search()` 时（见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L67-L82)），通过 `buildMeiliFilters` 构建的过滤器（见 [searchQueryBuilder.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/searchQueryBuilder.ts#L93-L207)）只包含：
+
+| 筛选类型 | Meilisearch 阶段是否应用 | 来源 |
+|---------|----------------------|------|
+| **权限过滤** | ✅ 是 | `(collectionOwnerId = X) OR (collectionMemberIds = X)` |
+| **搜索关键词修饰符** | ✅ 是 | 用户在搜索框输入的 `url:` `name:` `description:` `type:` `collection:` `pinned:` `public:` `before:` `after:` `tag:` 等高级语法 |
+| **普通搜索词** | ✅ 是 | `buildMeiliQuery` 拼接的全文检索字符串 |
+| **query.collectionId** | ❌ 否 | — |
+| **query.tagId** | ❌ 否 | — |
+| **query.pinnedOnly** | ❌ 否 | — |
+
+**注意**：
+- 搜索框输入 `pinned:true` 会在 Meilisearch 阶段过滤（高级语法）
+- 但通过 API 参数 `pinnedOnly=true`（如置顶页面）**不会**在 Meilisearch 阶段过滤
+- `collectionId`（按集合 ID 过滤）和 `tagId`（按标签 ID 过滤）完全不在 Meilisearch 阶段处理，因为 Meilisearch 索引中根本没有存储 `collectionId` 和 `tagId` 字段——只存了 `collectionName`（集合名称字符串）和 `tags`（标签名称数组）
+
+见 [linkIndexing.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/worker/workers/linkIndexing.ts#L133-L143) 索引时存储的字段：
+```typescript
+const docs = links.map((link) => ({
+  ...link,
+  collectionOwnerId: link.collection.ownerId,      // ✅ 有 ownerId
+  collectionMemberIds: link.collection.members.map((m) => m.userId),
+  collectionName: link.collection.name,            // ⚠️ 只有名称，没有 collectionId
+  tags: link.tags.map((t) => t.name),               // ⚠️ 只有标签名数组，没有 tagId
+  pinnedBy: link.pinnedBy.map((p) => p.id),
+  // ... collectionId、tagId 均未单独存储
+}));
+```
+
+#### 第二阶段：PostgreSQL 回查时才应用的筛选
+
+Meilisearch 返回匹配的 ID 列表后，在 `prisma.link.findMany` 的 `where` 中（见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L95-L125)）又追加了以下条件：
+
+```typescript
+where: {
+  id: { in: meiliIds },  // 限定 Meilisearch 返回的 ID
+  AND: [
+    // ... 权限过滤（双保险）
+    ...collectionCondition,   // ← query.collectionId 在这里！
+    {
+      OR: [
+        ...tagCondition,      // ← query.tagId 在这里！
+        { ...pinnedCondition }, // ← query.pinnedOnly 在这里！
+      ],
+    },
+  ],
+}
+```
+
+---
+
+### 6. 两阶段筛选对分页数量和翻页游标的影响
+
+这是整个设计中**最容易产生问题**的部分。
+
+#### 问题场景演示
+
+假设：
+- `paginationTakeCount = 50`
+- 用户在集合详情页（`collectionId=123`）中搜索关键词 `"react"`
+- Meilisearch 匹配到 1000 条含 `"react"` 的链接（分布在多个集合中）
+
+**执行流程**：
+
+```
+第 1 页（offset=0）：
+  Meilisearch 搜索 → 返回 50 个 ID（offset=0, limit=50）
+     ↓ 这 50 条来自所有集合，不全属于 collectionId=123
+  PostgreSQL 回查 + 应用 collectionId=123 过滤
+     ↓ 假设只有 12 条真正属于该集合
+  返回给前端：12 条链接
+  nextCursor = (meiliResp.hits.length === 50) ? 0 + 50 : null = 50
+     ↑ 问题：虽然只有 12 条，但只要 Meilisearch 返回了 50 条，就认为有下一页
+
+第 2 页（offset=50）：
+  Meilisearch 搜索 → 返回 50 个 ID（offset=50, limit=50）
+  PostgreSQL 回查 + collectionId=123 过滤
+     ↓ 假设只有 8 条真正属于该集合
+  返回给前端：8 条链接
+  nextCursor = 100
+
+... 后续若干页可能每页只有几条甚至 0 条
+```
+
+#### 问题总结
+
+| 问题 | 说明 | 代码位置 |
+|------|------|---------|
+| **每页数量不足** | Meilisearch 返回 limit（50）个 ID，但 PostgreSQL 二次过滤后可能远少于 50 条 | [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L95-L140) |
+| **nextCursor 判断错误** | `nextCursor` 基于 `meiliResp.hits.length === limit` 判断，而非基于最终返回的 `links.length`。即使回查后只剩 0 条，只要 Meilisearch 返回了 50 条，仍会告知前端"有下一页" | [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L142) |
+| **可能出现空页** | 极端情况下，某一页的 50 个 Meilisearch ID 全部不满足 collectionId/tagId/pinnedOnly 条件，导致返回 `links: []`，但 nextCursor 仍有值 | 同上 |
+| **用户体验** | 用户可能看到：第一页 12 条、第二页 8 条、第三页 0 条、第四页 15 条… 每页数量不稳定 | — |
+
+#### nextCursor 的计算逻辑对比
+
+见 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L142) vs [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/100-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L247-L250)：
+
+```typescript
+// Meilisearch 路径（A-1）：基于 Meilisearch 的 hits 数量
+const nextCursor = meiliResp.hits.length === limit ? offset + limit : null;
+
+// PostgreSQL 路径（A-2）：基于实际返回的 links 数量
+nextCursor:
+  links.length === paginationTakeCount
+    ? links[links.length - 1].id
+    : null,
+```
+
+---
+
+### 7. 两条路径的详细对比表（含分页与筛选）
 
 | 对比维度 | Meilisearch 路径 (A-1) | PostgreSQL 路径 (A-2, B) |
 |---------|----------------------|-------------------------|
 | 触发条件 | meiliClient 可用 + 有关键词 | 其他情况 |
 | 搜索能力 | 全文搜索（Meilisearch 倒排索引）+ 所有高级语法 | 简单 LIKE contains，**不支持高级语法** |
 | 相关性排序 | ❌ 不存在。显式指定 sort 参数，Meilisearch 相关性不生效 | ❌ 不存在 |
-| 置顶过滤 | `pinnedBy = ${userId}`（Meilisearch 过滤） | `pinnedBy: { some: { id: userId } }`（Prisma） |
-| 权限过滤 | `collectionOwnerId=X OR collectionMemberIds=X`（预索引字段） | 联表查询 collection.ownerId 和 members |
+| **权限过滤** | Meilisearch 阶段过滤 + PostgreSQL 回查双保险 | PostgreSQL 一次过滤 |
+| **collectionId/tagId/pinnedOnly** | ❌ 仅 PostgreSQL 回查阶段过滤（Meilisearch 阶段不处理） | ✅ 查询时一次过滤 |
+| **搜索高级语法（url:、tag: 等）** | ✅ Meilisearch 阶段过滤 | ❌ 不支持 |
+| 置顶过滤（高级语法 `pinned:`） | ✅ Meilisearch 阶段过滤 | ❌ 不支持 |
+| 置顶过滤（API 参数 `pinnedOnly`） | ❌ 仅 PostgreSQL 回查阶段 | ✅ 查询时一次过滤 |
 | 排序机制 | **两层排序，规则一致**：<br>1. Meilisearch sort 参数（确定返回哪些 ID）<br>2. PostgreSQL ORDER BY（修正 IN 子句顺序不确定性） | 直接 PostgreSQL `ORDER BY`（一层排序） |
-| 分页 | offset/limit 模式，`nextCursor = offset + limit` | cursor 模式，`nextCursor = lastItem.id` |
+| **分页模式** | offset/limit（基于数字偏移） | cursor-based（基于最后一条 ID） |
+| **nextCursor 判断依据** | `meiliResp.hits.length === limit`（Meilisearch 返回数量） | `links.length === takeCount`（最终返回数量） |
+| **每页数量稳定性** | ⚠️ 不稳定，二次过滤后可能远少于 limit | ✅ 稳定，最多返回 takeCount 条 |
+| **空页风险** | ⚠️ 有（二次过滤可能全部排除） | ❌ 无 |
 | 查询次数 | 2 次（Meilisearch + PostgreSQL 回查） | 1 次 |
 | 标签搜索权限 | 无额外过滤（Meilisearch 只存 tag 名称） | 对 tag.ownerId 额外做权限检查 |
 | 结果一致性 | 可能短暂不一致（索引有延迟） | 实时一致 |
@@ -800,26 +922,41 @@ const numberOfPinnedLinks = removedLink?.pinnedBy?.length
 ### 数据查询流程
 
 ```
-前端请求 (sort, pinnedOnly, collectionId, searchQueryString)
+前端请求 (sort, pinnedOnly, collectionId, tagId, searchQueryString)
   │  useLinks hook → GET /api/v1/search
   │  sort 默认 = DateNewestFirst (id desc)，共 4 种排序，无相关性选项
   ▼
 API 路由验证用户身份 (verifyUser)
   │
   ▼
-┌─ 有搜索词 且 Meilisearch 可用? ─┐
-│        Yes                        │        No
-▼                                   ▼
-Meilisearch 搜索路径           PostgreSQL 直接查询
-  │  解析高级语法                  │  LIKE contains 模糊匹配
-  │  权限过滤（预索引字段）         │  联表权限过滤
-  │  sort: 显式指定 4 种之一        │  直接 include tags/collection
-  │  (无相关性排序)                 │
-  │  取匹配 id 列表                 │
-  ▼                                   │
-PostgreSQL 回查完整数据 ◄────────────┘
-  │  include.pinnedBy.where = { id: userId } ← 只返回当前用户置顶
-  │  orderBy: 与 Meilisearch 相同规则（修正 IN 子句顺序不确定性）
+┌─ 有搜索词 且 Meilisearch 可用? ──────────────────────┐
+│        Yes                                               │        No
+▼                                                          ▼
+Meilisearch 搜索路径 (两阶段筛选)                    PostgreSQL 直接查询
+  │                                                          │
+  │ 第一阶段（在 Meilisearch 中）                            │  所有筛选一次性应用：
+  │  ✅ 权限过滤 (collectionOwnerId/MemberIds)               │  ✅ 权限过滤
+  │  ✅ 搜索高级语法 (url: name: pinned: tag: 等)            │  ✅ collectionId/tagId
+  │  ✅ 全文搜索关键词                                       │  ✅ pinnedOnly
+  │  ❌ collectionId / tagId (索引中无此字段)               │  ✅ 关键词模糊匹配
+  │  ❌ pinnedOnly 参数 (仅高级语法 pinned: 处理)            │  LIKE contains
+  │  sort: 显式指定 4 种之一                                  │
+  │  (无相关性排序)                                           │
+  │  offset/limit 分页 → 取 limit 个 ID                      │
+  ▼                                                          │
+PostgreSQL 回查完整数据 ◄───────────────────────────────────┘
+  │                                                          │
+  │ 第二阶段（PostgreSQL 回查时追加过滤）                      │  直接查询：
+  │  ✅ collectionId / tagId / pinnedOnly                     │  take + cursor 分页
+  │  ✅ 权限过滤（双保险）                                     │  orderBy 排序
+  │  include.pinnedBy.where = { id: userId }                  │
+  │  orderBy: 与 Meilisearch 相同规则（修正 IN 子句顺序）       │
+  │                                                          │
+  │ ⚠️  分页问题：                                              │
+  │   - Meilisearch 返回 50 个 ID                              │
+  │   - 二次过滤后可能只剩 5 条甚至 0 条                        │
+  │   - nextCursor = offset+50（按 Meilisearch 数量判断）       │
+  │   - 可能出现"有下一页但返回空"的情况                         │
   ▼
 返回：{ data: { links: [...], nextCursor } }
   │
@@ -862,7 +999,7 @@ PostgreSQL 回查完整数据 ◄────────────┘
 4. **Meilisearch 索引预存权限**：搜索时快速过滤，避免关联查询；同时 PostgreSQL 回查做了双保险
 5. **返回数据脱敏**：非所有者的更新响应不返回 pinnedBy；公开接口完全不返回 pinnedBy
 
-### ⚠️ 用户隔离不明显/可能混淆的地方
+### ⚠️ 设计缺陷与可能混淆的地方
 
 1. **没有"已读/未读"状态**：如果用户期望阅读后工作流（Read Later），只能通过置顶或集合间接实现
 2. **没有独立的"收藏"功能**：置顶承担了收藏的角色，但语义上可能不清晰
@@ -873,6 +1010,15 @@ PostgreSQL 回查完整数据 ◄────────────┘
 7. **前后端排序字段不一致**：后端日期排序使用 `id` 自增字段，前端 useSort hook 使用 `createdAt` 字段；虽然理论一致，但极端情况下（如数据迁移、ID 重置）可能出现差异
 8. **Meilisearch 索引的置顶延迟**：索引 worker 是异步的，置顶/取消置顶后立即搜索可能得到旧结果
 9. **两条路径搜索能力不对等**：PostgreSQL fallback 不支持高级搜索语法，但前端搜索框不提示这一点
+10. **⚠️ Meilisearch 路径筛选分裂导致分页异常（严重）**：
+    - `collectionId`、`tagId`、`pinnedOnly` 三个 API 参数只在 PostgreSQL 回查阶段过滤，不在 Meilisearch 阶段过滤
+    - 导致 Meilisearch 先取 50 个 ID，二次过滤后可能只剩几条甚至 0 条
+    - `nextCursor` 基于 Meilisearch 返回数量判断（`meiliResp.hits.length === limit`），而非最终返回数量，可能产生"有下一页但实际空页"的情况
+    - 根本原因：Meilisearch 索引未存储 `collectionId` 和 `tagId` 字段（只存了名称），无法按 ID 过滤
+11. **⚠️ 同一筛选的两种入口行为不一致**：
+    - 搜索框输入 `pinned:true`（高级语法）→ Meilisearch 阶段过滤，分页正常
+    - API 参数 `pinnedOnly=true`（如置顶页面）→ 仅 PostgreSQL 回查阶段过滤，分页异常
+    - `tag:` 高级语法（按标签名） vs `tagId` 参数（按标签 ID）同理
 
 ### 🔧 潜在改进方向
 
@@ -883,3 +1029,8 @@ PostgreSQL 回查完整数据 ◄────────────┘
 5. 让集合所有者可以查看成员的置顶/收藏情况（协作场景）
 6. 统一前后端排序字段：后端日期排序也使用 `createdAt` 字段，避免极端情况下的不一致
 7. 在置顶/取消置顶后立即触发 Meilisearch 索引更新，或在应用层做补偿
+8. **修复 Meilisearch 分页异常（高优先级）**：
+   - 方案 A：在 Meilisearch 索引中新增 `collectionId` 和 `tagId` 字段，并在 `buildMeiliFilters` 中处理 `query.collectionId`、`query.tagId`、`query.pinnedOnly` 参数，让所有筛选在 Meilisearch 阶段一次性完成
+   - 方案 B：将 `nextCursor` 改为基于最终 `links.length` 判断；或当二次过滤后数量不足时，循环查询 Meilisearch 下一批 ID 直到凑够 limit 条或无更多结果
+   - 方案 C：统一 `pinned:` 高级语法和 `pinnedOnly` 参数的处理路径，避免行为不一致
+9. 统一标签和集合的两种过滤入口（按 ID vs 按名称），消除用户体验差异
