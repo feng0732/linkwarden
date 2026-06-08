@@ -53,8 +53,29 @@ session: {
 - `signIn` 触发时：补全缺失的用户名
 
 #### `session` 回调（session 读取时触发）
-- 将 JWT 中的 `id` 注入 session.user
-- 每次读取 session 时校验订阅状态（Stripe 模式下）
+
+**源码证据**（`apps/web/pages/api/v1/auth/[...nextauth].ts#L1489-L1510`）：
+```typescript
+async session({ session, token }) {
+  session.user.id = token.id;
+
+  if (STRIPE_SECRET_KEY) {               // ← 仅 Stripe 模式下才会查库
+    const user = await prisma.user.findUnique({
+      where: { id: token.id },
+      include: { subscriptions: true, parentSubscription: true },
+    });
+    if (user) {                          // ← 用户不存在时静默跳过，不抛错、不返回 null
+      const subscribedUser = await verifySubscription(user);
+    }
+  }
+
+  return session;                         // ← 无论用户是否存在，都正常返回 session
+}
+```
+
+- 将 JWT 中的 `id` 注入 `session.user`
+- **仅在 Stripe 模式下**查库校验订阅状态；非 Stripe 模式下不做任何 DB 查询
+- **关键**：即使用户已删除（findUnique 返回 null），回调也不会拒绝 session、不会清空 session、不会抛错，始终 `return session`
 
 ### 2.4 移动端独立会话
 
@@ -470,7 +491,108 @@ if (token.jti) {
 
 ---
 
-### 6.7 认证收敛总结矩阵
+### 6.7 浏览器会话（NextAuth Cookie JWT）删除后的真实拦截路径
+
+账号删除后，浏览器端用户的 JWT Cookie 仍然有效（30 天过期前天然无法从服务端直接失效）。需要逐层对照代码澄清每一层是否主动拦截：
+
+#### 6.7.1 NextAuth session 回调：不主动拦截
+
+**代码证据**：`apps/web/pages/api/v1/auth/[...nextauth].ts#L1489-L1510`
+
+如 2.3 节源码所示，`session` 回调的行为：
+- 非 Stripe 模式：不查数据库，只做 `session.user.id = token.id` 后直接 `return session`
+- Stripe 模式：虽然调用了 `prisma.user.findUnique`，但 `if (user)` 条件未命中时**静默跳过**，不抛错、不清空 session、不返回 null
+- **结论**：session 回调无论用户是否存在，都会返回一个合法的 session 对象。useSession() 客户端状态始终判定为 `authenticated`
+
+#### 6.7.2 SSR 本地化查询（getServerSideProps）：不主动拦截
+
+**代码证据**：`apps/web/lib/client/getServerSideProps.ts#L7-L55`
+
+```typescript
+const getServerSideProps: GetServerSideProps = async (ctx) => {
+  const token = await getToken({ req: ctx.req });
+  if (token) {
+    const user = await prisma.user.findUnique({ where: { id: token.id } });
+    if (user) {
+      return { props: { ...serverSideTranslations(user.locale ?? "en", ["common"]) } };
+    }
+    // ← 用户不存在时：没有 return、没有 redirect、没有 destroy cookie，只是静默 fallthrough
+  }
+  // 回退到 accept-language 计算 locale，正常渲染页面
+  return { props: { ...serverSideTranslations(bestMatch ?? "en", ["common"]) } };
+};
+```
+
+- SSR 层虽然查了用户，但查不到时**既不 302 重定向也不清除 cookie**，只是 fallback 到浏览器 `Accept-Language` 决定页面语言
+- **结论**：SSR 层不会主动把已删除用户踢回登录页，页面正常渲染（只是语言不跟随用户偏好）
+
+#### 6.7.3 前端会话状态（useSession + AuthRedirect）：不主动拦截
+
+**代码证据**：`apps/web/layouts/AuthRedirect.tsx#L15-L91` + `apps/web/hooks/useInitialData.tsx`
+
+```typescript
+// AuthRedirect.tsx
+const { status } = useSession();           // ← status 只反映 JWT 是否有效
+const { data: user } = useUser();           // ← 单独 fetch /api/v1/users/{id}
+
+useEffect(() => {
+  const isLoggedIn = status === "authenticated";   // ← 只看 JWT，不看 useUser 结果
+  const isUnauthenticated = status === "unauthenticated";
+
+  // 订阅失效判断依赖 user，但 user 为 undefined（fetch 失败）时 hasInactiveSubscription 为 false
+  const hasInactiveSubscription = user?.id && !user?.subscription?.active && ...;
+
+  if (isLoggedIn && hasInactiveSubscription) redirectTo("/subscribe");
+  else if (isLoggedIn && !user?.name && user?.parentSubscriptionId) redirectTo("/member-onboarding");
+  else if (isLoggedIn && !isProtected(router.pathname)) redirectTo("/dashboard");
+  else if (isUnauthenticated && isProtected(router.pathname)) redirectTo("/login");
+  else setShouldRenderChildren(true);   // ← 用户删除时走这条分支，页面继续渲染
+}, [status, user, router.pathname]);
+```
+
+- `useSession().status === "authenticated"` 仅由 JWT 有效性决定，不感知用户删除
+- `useUser()` hook 调用 `/api/v1/users/{id}` 时，虽然接口会返回 404，但 AuthRedirect 的判断逻辑里**没有监听 `useUser().error` 或 `!user?.id` 来触发登出/重定向**
+- **结论**：用户删除后前端不会自动 signOut，`isLoggedIn` 仍为 true，路由守卫会放行，受保护路由页面会正常挂载
+
+#### 6.7.4 用户数据接口 / 业务 API：真正的拦截发生在这里
+
+虽然 session 层、SSR 层、前端路由层都不主动拦截，但页面一旦挂载后会立即发起业务数据请求，这些请求会在后端被拦截：
+
+**① 用户数据接口 `/api/v1/users/me` / `/api/v1/users/[id]`**
+
+代码证据：`apps/web/pages/api/v1/users/me.ts#L1-L19` + `apps/web/lib/api/controllers/users/userId/getUserById.ts#L5-L54`
+
+```typescript
+// me.ts
+const token = await verifyToken({ req });   // JWT 有效 → 通过
+const userId = token.id;
+const users = await getUserById(userId);    // ← prisma.user.findUnique 返回 null
+return res.status(404).json({ response: "User not found." });
+
+// 前端 useUser hook 收到 404：
+// packages/router/user.tsx#L41
+if (!response.ok) throw new Error("Failed to fetch user data.");
+// react-query 进入 error 状态，但 AuthRedirect 未监听此 error
+```
+
+**② 所有 verifyUser() 的业务 API（28 条，见 5.1 节）**
+
+`verifyUser()` 在 `apps/web/lib/api/verifyUser.ts` 中会调用 `prisma.user.findUnique({ id: userId })`，查不到时返回 404 并写入响应。前端页面渲染后发起的 `/v1/links`、`/v1/collections` 等请求全部 404/401。
+
+**③ 所有 verifyToken() + 后续 DB 查询的 API（6 条，见 5.2 节）**
+
+`verifyToken()` 通过但后续 `getUserById` / `resolveAccessibleArchive` / `prisma.user.findUnique` 等查询因数据级联删除而返回空 → 404/401。
+
+#### 6.7.5 前端可见效果
+
+用户删除后，持有未过期 JWT Cookie 的访问者会看到：
+1. 浏览器被放行进入受保护路由（AuthRedirect 不拦截）
+2. 页面白屏或报错（因为 useUser / 业务接口全部 404，前端组件依赖 user/collection 等数据渲染）
+3. 若用户手动调用 signOut() 清除 JWT，一切恢复正常
+
+---
+
+### 6.8 认证收敛总结矩阵
 
 | 攻击入口 | 用户删除后是否被拦截 | 拦截发生在哪一层 |
 |---------|---------------------|-----------------|
@@ -480,10 +602,24 @@ if (token.jti) {
 | 头像 /v1/avatar/[id] | ✅ 是 | 查 targetUser 不存在 → 400 + 文件已删除 |
 | 归档 GET /v1/archives/[linkId] | ✅ 是 | Collection 级联删除 → 401 + 文件已删除 |
 | Preserved Format Token | ⚠️ 不主动拦截 | Token 5 分钟自失效，与用户存在性无关 |
-| NextAuth Cookie JWT | ✅ 是 | 后续所有页面加载均调用 useSession → 服务端 session 回调查不到用户 |
-| 移动端 Bearer Token | ✅ 是 | 所有 API 调用后续均查 DB 实体 |
+| NextAuth session 回调 | ❌ 不拦截 | 始终 return session（非 Stripe 模式不查库；Stripe 模式查不到也静默跳过） |
+| SSR getServerSideProps | ❌ 不拦截 | 用户不存在时静默 fallback 语言，不重定向、不清 cookie |
+| 前端 useSession + AuthRedirect | ❌ 不拦截 | 仅看 JWT 有效性；未监听 useUser 错误触发登出 |
+| NextAuth Cookie JWT（整体） | ✅ 是（被动收敛） | 页面挂载后的**用户数据接口 / 业务 API 查询失败**，前端无可用数据 |
+| 移动端 Bearer Token | ✅ 是（被动收敛） | 所有 API 调用后续均查 DB 实体 → 404/401 |
 
-**最终结论复查**：账号删除后，数据库级级联删除 + 应用层事务文件清理 + 所有认证路由的后续 DB 查询兜底，构成三层收敛。除短期 Preserved Format Token（5 分钟自失效）外，所有入口均能被有效拦截，不存在实际可利用的持久化访问缺口。
+### 6.9 最终结论复查
+
+账号删除后的访问收敛由**四层被动机制**叠加完成，**没有任何一层在认证入口主动拒绝会话**：
+
+1. **数据库级**：Prisma `onDelete: Cascade` 级联删除所有关联实体（User/Collection/Link/AccessToken 等）
+2. **文件系统级**：`deleteUserById` 事务中 `removeFolder` / `removeFile` 物理删除归档文件和头像
+3. **API 数据层**：所有业务 API 在 verifyToken 通过后，都会进一步查询业务实体 → 因级联删除而返回空/404/401
+4. **前端被动失效**：页面渲染后所有业务请求失败，呈现白屏/错误状态（但不会自动登出）
+
+**核心校准点**：之前"session 回调查不到用户"、"useSession 服务端拦截"的描述不准确。真实情况是：session 回调、SSR、前端路由守卫**均不主动拦截已删除用户**，所有拦截都发生在"更下游"的用户数据查询和业务数据查询阶段。
+
+**风险结论不变**：除 Preserved Format Token（5 分钟自失效）外，不存在实际可利用的持久化数据访问缺口。但存在**用户体验缺口**：已删除用户的浏览器会话不会自动失效，需手动 signOut 或等待 JWT 30 天自然过期。
 
 ---
 
@@ -573,10 +709,13 @@ jwt({ token, user, trigger })
 ## 九、潜在改进点
 
 1. **用户删除时先批量标记 AccessToken.revoked=true**：在 deleteUserById 事务中，级联删除 AccessToken 之前先批量 `updateMany({ revoked: true })`，确保 verifyToken 层也能主动拦截（当前靠后续 DB 查询兜底）。
-2. **CSRF 显式校验**：对业务 API 的写操作（POST/PUT/DELETE）显式校验 CSRF token，不依赖 SameSite。
-3. **安全 Headers**：在 next.config 中配置 CSP、HSTS、X-Frame-Options 等安全响应头。
-4. **MFA 预留数据模型**：在 User 模型或独立表中预留 MFA 密钥、备份码、启用状态字段。
-5. **登录失败限流**：当前凭据登录无显式失败计数和锁定机制，存在暴力破解风险。
-6. **GET /v1/public/links/[id] 返回语义**：Link 不存在时应返回 404 而非 200 + null。
-7. **getPublicUser 增加 isPrivate 过滤**：公开用户信息接口应检查 User.isPrivate，尊重用户隐私设置。
-8. **Preserved Format Token 关联用户校验**：对于非公开集合的归档访问，短期 token 解码后应二次校验用户对该 collection 的权限（当前只校验 token 自身有效性和文件后缀）。
+2. **NextAuth session 回调增加用户存在性校验**：在 session 回调中 `prisma.user.findUnique` 返回 null 时，主动返回一个不含 user.id 的 session 或触发 signOut，让前端 `useSession().status` 能感知用户删除。
+3. **SSR getServerSideProps 增加用户不存在时的重定向**：查不到用户时 `return { redirect: { destination: "/login", permanent: false } }`，从服务端主动踢回登录页。
+4. **前端 AuthRedirect 监听 useUser 错误**：`useUser()` 返回 error 或 `!user?.id` 时调用 `signOut()` 清除 JWT，实现自动登出。
+5. **CSRF 显式校验**：对业务 API 的写操作（POST/PUT/DELETE）显式校验 CSRF token，不依赖 SameSite。
+6. **安全 Headers**：在 next.config 中配置 CSP、HSTS、X-Frame-Options 等安全响应头。
+7. **MFA 预留数据模型**：在 User 模型或独立表中预留 MFA 密钥、备份码、启用状态字段。
+8. **登录失败限流**：当前凭据登录无显式失败计数和锁定机制，存在暴力破解风险。
+9. **GET /v1/public/links/[id] 返回语义**：Link 不存在时应返回 404 而非 200 + null。
+10. **getPublicUser 增加 isPrivate 过滤**：公开用户信息接口应检查 User.isPrivate，尊重用户隐私设置。
+11. **Preserved Format Token 关联用户校验**：对于非公开集合的归档访问，短期 token 解码后应二次校验用户对该 collection 的权限（当前只校验 token 自身有效性和文件后缀）。
