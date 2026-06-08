@@ -203,9 +203,44 @@ type LocalSettings = {
 | `announcementId` | 最新公告版本号 |
 | `announcementMessage` | 公告消息 i18n key |
 
-### 4.2 邮件通知偏好
+### 4.2 促销邮件通知偏好
 
-用户模型中的 `acceptPromotionalEmails` 字段控制是否接收促销邮件，默认 `false`。
+促销邮件偏好字段为 `acceptPromotionalEmails`，默认值 `false`。该字段的生命周期存在设计缺口——**仅在注册时可设置，注册后无法通过任何官方 UI 修改**。
+
+#### 完整链路梳理：
+
+**1. 注册阶段（可设置）**
+
+- 注册表单 UI：[register.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/pages/register.tsx#L256-L292)
+  - 显示条件：`process.env.NEXT_PUBLIC_STRIPE` 为 true（即启用 Stripe 付费模式时才显示）
+  - 默认状态：`acceptPromotionalEmails: false`
+  - 控件类型：Checkbox，用户可主动勾选
+
+- Schema 校验：[schemaValidation.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/lib/schemaValidation.ts#L36-L58)
+  - `PostUserSchema` 中明确定义：`acceptPromotionalEmails: z.boolean().default(false)`
+
+- 数据入库：[postUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/api/controllers/users/postUser.ts#L84-L132)
+  ```typescript
+  acceptPromotionalEmails: acceptPromotionalEmails || false,
+  ```
+  注册时与 `dashboardSections` 默认布局一同写入数据库。
+
+**2. 账号设置阶段（不可修改）**
+
+- 账号设置页面：[account.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/pages/settings/account.tsx)
+  - UI 层面：**完全没有** 促销邮件偏好的 Checkbox 或其他控件
+  - 提交 payload：仅包含 `id, name, username, email, locale, image, isPrivate, password`
+  - 变更检测 `hasAccountChanges` 也不比较该字段
+
+- Schema 校验：[schemaValidation.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/lib/schemaValidation.ts#L60-L95)
+  - `UpdateUserSchema` 中 **未包含** `acceptPromotionalEmails` 字段（与 `PostUserSchema` 不对称）
+  - 即使通过 API 直接调用也会被 Zod Schema 过滤掉
+
+**3. 偏好设置页面（不可修改）**
+
+- 偏好设置页面 [preference.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/pages/settings/preference.tsx) 的四个区块（主题/AI/归档/链接）均不涉及该字段。
+
+**结论：** 用户一旦注册完成，除非直接操作数据库，否则没有任何官方途径可以修改促销邮件订阅状态。
 
 ---
 
@@ -366,14 +401,59 @@ new QueryClient({
 | `["dashboardData"]` | Dashboard 聚合数据 | `useUpdateDashboardLayout` 成功后 |
 | `["tokens"]` | 访问令牌列表 | 创建/撤销令牌后 |
 
-### 7.2 乐观更新模式
+### 7.2 用户偏好写入缓存行为全景
 
-所有写操作均采用 **Optimistic Update** 模式：
+并非所有写操作都完整实现了「乐观覆盖 → 失败回滚 → 失效刷新」三段式。以下是与用户设置直接相关的所有 Mutation 的详细行为对比：
 
-以 `useUpdateUserPreference` 为例：
-1. `onMutate`: 取消进行中的查询，直接用新数据覆盖缓存（UI 立即响应）
-2. `onError`: 回滚到 mutation 前的快照
-3. `onSuccess`: 用服务端返回的权威数据再次更新缓存，并设置 `data-theme` DOM 属性
+| Mutation | 所在文件 | 乐观覆盖 (onMutate) | 失败回滚 (onError) | 失效刷新 / 权威更新 (onSuccess) | 备注 |
+|----------|----------|---------------------|---------------------|--------------------------------|------|
+| `useUpdateUser` | [user.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/user.tsx#L57-L84) | ✅ 直接设置 `["user"]` 缓存 | ❌ **未实现** | ✅ `setQueryData(["user"])` 用服务端数据覆盖 | 无失败回滚，出错后 UI 停留在乐观数据 |
+| `useUpdateUserPreference` | [user.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/user.tsx#L86-L126) | ✅ 直接设置 `["user"]` 缓存 | ❌ **未实现** | ✅ `setQueryData(["user"])` + 设置 `data-theme` DOM | 同 `useUpdateUser`，无失败回滚 |
+| `useUpdateDashboardLayout` | [dashboardData.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/dashboardData.tsx#L37-L83) | ✅ 保存 `previousData` 快照并设置 `["user"]` | ✅ `setQueryData(["user"], context.previousData)` | ✅ `invalidateQueries(["user", "dashboardData"])` | **唯一完整实现三段式** 的用户设置 Mutation |
+| `useAddToken` | [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx#L22-L47) | ❌ **未实现** | ❌ **未实现** | ✅ `setQueryData(["tokens"])` 追加新令牌 | 纯被动更新，无乐观 |
+| `useRevokeToken` | [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx#L49-L69) | ❌ **未实现** | ❌ **未实现** | ✅ `setQueryData(["tokens"])` 过滤已撤销 | 纯被动更新，无乐观 |
+| `useUpsertTags` (归档标签) | [tags.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tags.tsx#L322-L345) | ❌ **未实现** | ❌ **未实现** | ✅ `invalidateQueries(["tags", "dashboardData"])` | 等待服务端响应后刷新 |
+| `useUpdateCollection` | [collections.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/collections.tsx#L141-L178) | ❌ 代码被注释禁用 | ❌ **未实现** | ✅ `setQueryData(["collections"])` 替换 | onMutate 有代码但整段注释掉 |
+
+#### 风险点总结：
+
+1. **`useUpdateUser` / `useUpdateUserPreference` 无失败回滚**：
+   - 如果 API 请求失败，React Query 缓存中的数据仍停留在乐观写入的状态
+   - 用户看到的 UI 与数据库实际状态不一致
+   - 必须刷新页面才能恢复正确数据
+
+2. **`useUpsertTags` 无乐观更新**：
+   - 用户在偏好设置页面修改归档标签规则后，需等待网络请求完成才会反映到 UI
+   - 响应慢时用户可能重复点击保存
+
+3. **令牌操作 `useAddToken` / `useRevokeToken` 无乐观 + 无回滚**：
+   - 撤销令牌后如果请求失败，列表不会自动还原
+
+#### 乐观更新标准三段式（以 `useUpdateDashboardLayout` 为范本）：
+
+```typescript
+// 第 1 段：onMutate —— 请求发出前立即乐观更新
+onMutate: async (newData) => {
+  await queryClient.cancelQueries({ queryKey: ["user"] });      // 取消进行中的请求避免覆盖
+  const previousData = queryClient.getQueryData(["user"]);      // 保存快照用于回滚
+  queryClient.setQueryData(["user"], (oldData: any) => ({
+    ...oldData,
+    dashboardSections: newData.filter(s => s.enabled).sort(/*...*/),
+  }));
+  return { previousData };                                      // 传给 onError 使用
+},
+
+// 第 2 段：onError —— 请求失败时回滚
+onError: (err, newData, context) => {
+  queryClient.setQueryData(["user"], context?.previousData);   // 恢复快照
+},
+
+// 第 3 段：onSuccess —— 请求成功后用权威数据刷新
+onSuccess: async () => {
+  await queryClient.invalidateQueries({ queryKey: ["user"] });          // 失效后自动重新拉取
+  await queryClient.invalidateQueries({ queryKey: ["dashboardData"] });
+},
+```
 
 ### 7.3 本地 localStorage 即时同步
 
@@ -460,3 +540,10 @@ new QueryClient({
 | [cache.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/mobile/lib/cache.ts) | 移动端缓存清理工具 |
 | [settings/index.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/mobile/app/(tabs)/settings/index.tsx) | 移动端设置页面 |
 | [access-tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/pages/settings/access-tokens.tsx) | Web 端访问令牌管理页面 |
+| [register.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/pages/register.tsx) | 注册页面（促销邮件偏好唯一入口） |
+| [account.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/pages/settings/account.tsx) | 账号设置页面（不含促销邮件偏好修改） |
+| [postUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/apps/web/lib/api/controllers/users/postUser.ts) | 用户创建控制器（写入 acceptPromotionalEmails + 默认 DashboardSections） |
+| [schemaValidation.ts](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/lib/schemaValidation.ts) | Zod Schema 校验（PostUserSchema 含 acceptPromotionalEmails，UpdateUserSchema 不含） |
+| [tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tokens.tsx) | useTokens/useAddToken/useRevokeToken Hooks |
+| [tags.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/tags.tsx) | useUpsertTags 等标签相关 Hooks |
+| [collections.tsx](file:///d:/fz/0601/solo-dogfeeding/code/98-linkwarden/packages/router/collections.tsx) | 收藏集 CRUD Hooks（含被注释的 onMutate） |
