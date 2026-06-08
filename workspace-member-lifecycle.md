@@ -20,7 +20,7 @@
 
 ### 1.1 用户与订阅的层级关系
 
-Linkwarden 的"工作区"通过 **Subscription（订阅）** 模型隐式实现，没有独立的 Workspace 表。
+Linkwarden 的"工作区"通过 **Subscription（订阅）模型隐式实现，没有独立的 Workspace 表。
 
 [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/packages/prisma/schema.prisma#L28-L75)、[schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/packages/prisma/schema.prisma#L220-L232)：
 
@@ -62,7 +62,7 @@ Subscription (owner = User A, quantity = 5)
 
 **重要**：Link 有两条独立的删除路径。如果 User A 在 User B 的 Collection 中创建了 Link：
 - User B 删号 → Collection 删除 → Link 通过 `collectionId` Cascade 被删
-- User A 删号 → Link 通过 `createdById` Cascade 也被删（即使 Collection 还在）
+- User A 删号 → Link 通过 `createdById` Cascade 也被删（即使 Collection 还在） |
 
 ---
 
@@ -130,7 +130,7 @@ deleteUserById(userId, body, isServerAdmin, queryId)
 **触发条件**：`!isServerAdmin && queryId !== userId && 操作者是订阅 Owner && queryId 是其 child user`
 
 **操作**：
-1. `prisma.user.update({ where: { id: findChild.id }, data: { parentSubscription: { disconnect: true } } })`
+1. `prisma.user.update({ where: { id: findChild.id }, data: { parentSubscription: { disconnect: true } }`)
    - 仅清空 child user 的 `parentSubscriptionId` 字段
    - **不删除用户账号**，也不删除其任何资源
 2. 若被移除成员 `emailVerified != null`（已验证邮箱）：
@@ -198,9 +198,9 @@ Transaction {
 
 ---
 
-## 3. 邀请流程
+## 3. 邀请流程与激活链路（深度核准）
 
-### 3.1 完整链路
+### 3.1 完整激活链路（含 emailVerified 写入时机）
 
 **入口**：[InviteModal.tsx](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/components/ModalContent/InviteModal.tsx)
 
@@ -229,33 +229,109 @@ Transaction {
     └── sendInvitationRequest() → 发邮件，链接含 token
     ▼
 步骤 4: 被邀请人点击邮件链接 /callback/email?token=...&email=...
-    │  NextAuth 内置 signIn callback
-    ├── 查 VerificationToken：token 存在且 expires > now
-    ├── 若 user.emailVerified === null（首次接受）：
-    │   ├── 统计已验证的 child users 数（同 parentSubscriptionId）
-    │   ├── 若 (已验证数 + 2) > quantity
-    │   │   └── updateSeats(stripeId, 已验证数 + 2)  ← 自动扩容
-    │   └── emailVerified 此时仍为 null
+    │
+    │  ╔══════════════════════════════════════════════════════════╗
+    │  ║  PrismaAdapter (@auth/prisma-adapter) 标准 Email Provider  ║
+    │  ║ 内部执行顺序（核心）：                                ║
+    │  ║                                                    ║
+    │  ║  ① adapter.useVerificationToken()                       ║
+    │  ║     → 删除并返回匹配的 token（expires > now 才成功）   ║
+    │  ║  ② adapter.getUserByEmail(identifier)               ║
+    │  ║     → 返回 user 对象（emailVerified 仍为 null）          ║
+    │  ║  ③ 调用 callbacks.signIn({ user, email })               ║
+    │  ║  ④ signIn callback 返回 true 后                          ║
+    │  ║     → adapter.updateUser({ emailVerified: new Date() })║
+    │  ║        ↑ 此处写入 emailVerified                    ║
+    │  ║  ⑤ 调用 callbacks.jwt(trigger="signIn")                   ║
+    │  ╚══════════════════════════════════════════════════════╝
+    │
+    │
+    ├── callbacks.signIn 执行时的状态（此时③）：
+    │   ├── user.emailVerified === null（步骤②查询结果）
+    │   ├── email.verificationRequest === undefined（点击链接不是发邮件）
+    │   └── 条件满足：检查 parentSubscriptionId → 扩容 seat（见 3.3）
+    │
+    ├── PrismaAdapter 在 signIn callback 返回 true 后：
+    │   └── 写入 emailVerified = new Date() ← ✅ 此处首次写入
+    │
+    ├── callbacks.jwt(trigger="signIn"）：
+    │   ├── token.id = user.id
+    │   └── 若 user.username 为空 → 自动生成 username
+    │   └── 不处理 emailVerified（仅 SSO signUp 时处理 emailVerified）
+    │
     └── 签发 JWT session，302 到 /member-onboarding
     ▼
 步骤 5: [member-onboarding.tsx] 用户填写 name + password
     │  PUT /api/v1/users/:id
     │  [updateUserById.ts]
+    ├── 此时数据库中 emailVerified 已经有值了（步骤④已写入）
     ├── isInvited = (name===null && parentSubscriptionId && !password)
     ├── 强制校验 password 必填
     ├── 更新 name、password（bcrypt hash）
-    └── ⚠️  emailVerified 在此处仍未被置为当前时间
+    └── 不更新 emailVerified（已经有值了，无需再写）
+    ▼
+步骤 6: 跳转 /dashboard，用户已完全激活
 ```
 
-### 3.2 邀请过期机制
+### 3.2 emailVerified 写入时机（核准总结）
 
-- **令牌有效期**：[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L141) `maxAge: 1200` → **20 分钟**
+| 场景 | 写入位置 | 触发时机 |
+|------|----------|----------|
+| SSO（Google/GitHub 等） | [[...nextauth].ts jwt callback](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1427-L1453) | trigger="signUp" 且 accounts.length > 0） |
+| 自注册 + Email Provider（id="email"） | **PrismaAdapter 内部**（@auth/prisma-adapter） | 点击邮件链接，signIn callback 返回 true 后 |
+| **被邀请 + 邀请邮件（id="invite"）** | **PrismaAdapter 内部**（同上） | 点击邀请邮件链接，signIn callback 返回 true 后 |
+| Admin 手动创建用户 | [postUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/lib/api/controllers/users/postUser.ts#L89) | isAdmin 时直接写入 |
+
+**关键核准结论**：
+- **PrismaAdapter 的 Email Provider（无论是 id="email" 或 id="invite"）**在**signIn callback 返回 true 后，在 adapter.updateUser({ emailVerified: new Date() })写入。
+- signIn callback 执行时读取到的 user.emailVerified 仍为 null——这是正确的，因为扩容判断正是在更新前的用户对象。
+- member-onboarding 页面提交时，数据库中 emailVerified **已经有值**，只需补写。
+
+### 3.3 Seat 自动扩容与激活对齐（核准）
+
+signIn callback 中的扩容逻辑 [[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1326-L1364)：
+
+```typescript
+if (!(user as User).emailVerified && !email?.verificationRequest) {
+  // 有 parentSubscriptionId → 扩容逻辑
+}
+```
+
+**触发条件拆解**：
+
+| 条件 | 含义 | 对齐结论 |
+|------|------|----------|
+| `!user.emailVerified | 用户 emailVerified 为 null | **首次**点击邀请链接才满足 |
+| `!email?.verificationRequest | 点击链接（不是"发送邮件"请求 | 排除 signIn("invite") 时 |
+
+**扩容触发时机**：**首次**点击邀请邮件链接时（此时 emailVerified 为 null，PrismaAdapter 写入前）。
+
+扩容计算公式：
+```
+已验证 child users 数 + 2（当前用户 + 订阅 Owner） > subscription.quantity
+→ 若超过 → updateSeats(stripeId, 已验证数 + 2)
+```
+
+**与激活与 seat 的对应关系**：
+
+| 用户状态 | emailVerified | 占 seat? | 说明 |
+|----------|--------------|----------|------|
+| 已创建，未点击邀请链接 | null | 否 | verifiedChildUsersCount 不统计 |
+| 已点击邀请链接（完成 onboarding） | 已写入 | **是** | PrismaAdapter 已写入 emailVerified |
+| 已点击但未完成 onboarding | 已写入 | **是** | emailVerified 已写入 |
+| 已完成 onboarding（name+password） | 已写入 | **是** | 正常激活状态 |
+
+**结论对齐**：Seat 计数完全以 `emailVerified != 为准，与 name/password 无关。用户一一点击邮件链接（emailVerified 写入成功 → 立即占一个 seat。
+
+### 3.4 邀请过期机制
+
+- **令牌有效期**：[[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L141) `maxAge: 1200` → **20 分钟 |
 - **过期校验**：`VerificationToken.expires > new Date()`，不满足返回 `"Invalid token."`
-- **限流**：5 分钟内同一邮箱最多 4 次发送请求
+- **限流**：5 分钟内同一邮箱最多 4 次发送请求 |
 
 ---
 
-## 4. 加入 / 激活状态判定
+## 4. 加入 / 激活状态判定（深度核准）
 
 ### 4.1 "待激活的被邀请用户"判定
 
@@ -268,14 +344,64 @@ const isInvited =
   && !user.password;             // 未设置密码
 ```
 
-### 4.2 各注册路径 emailVerified 的差异
+注意：isInvited 与 emailVerified 无关——即使用户点击了链接（emailVerified 已写入），只要 name==null && password==null && parentSubscriptionId 存在 → isInvited 仍为 true。
 
-| 路径 | emailVerified 何时被设置 | 代码位置 |
-|------|--------------------------|----------|
-| SSO（Google/GitHub 等） | signUp 时自动设为 `new Date()` | [[...nextauth].ts jwt callback](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1427-L1453) |
-| 自注册 + Email Provider | NextAuth 邮箱验证通过后设置 | 内置 |
-| **被邀请 + 邀请邮件** | **member-onboarding 设置密码时不自动设置**（潜在不一致） | [updateUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts#L185-L218) |
-| 凭证登录 | 强制要求 `emailVerified != null`，否则抛错 | [[...nextauth].ts CredentialsProvider](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L117-L119) |
+### 4.2 四种激活状态变化详解
+
+#### 状态 A：已创建用户（未点击邀请链接）
+
+| 字段 | 值 |
+|------|----|
+| emailVerified | null |
+| name | null |
+| password | null |
+| parentSubscriptionId | 订阅 ID |
+| isInvited | true |
+| 占 seat? | 否 |
+
+用户存在于 DB 中，但不能登录（无可用登录路径： |
+- Credentials Provider：password=null → 抛错 |
+- Email Provider（id=invite）→ 需要重新发送邮件 → token 20 分钟过期 |
+- 过期 token → "Invalid token." |
+
+#### 状态 B：已点击邀请链接（未完成 onboarding）
+
+| 字段 | 值 |
+|------|----|
+| emailVerified | new Date()（PrismaAdapter 写入） | 已写入 |
+| name | null |
+| password | null |
+| parentSubscriptionId | 订阅 ID |
+| isInvited | true |
+| 占 seat? | **是** |
+
+可用登录路径：
+- Email Provider（再次点击链接）→ signIn callback 中 emailVerified 已不为 null → **不再扩容 |
+- Credentials Provider：password=null → "Invalid credentials." → |
+
+#### 状态 C：完成 onboarding（name + password 已设置）
+
+| 字段 | 值 |
+|------|----|
+| emailVerified | 已写入 |
+| name | 已设置 |
+| password | bcrypt hash |
+| parentSubscriptionId | 订阅 ID |
+| isInvited | false |
+| 占 seat? | **是** |
+
+可用登录路径：
+- Credentials Provider：emailVerified != null → 通过；password bcrypt 校验 → 通过 |
+- Email Provider：正常登录 |
+
+### 4.3 各 Provider 对 emailVerified 的要求
+
+| Provider | emailVerified 要求 | 代码位置 |
+|----------|----------------|----------|
+| Credentials（密码） | `emailEnabled && !user.emailVerified` → 抛 "Email not verified." | [[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L117-L119) |
+| Email Provider（id=email / id=invite） | PrismaAdapter 验证 token 后自动写入 emailVerified | @auth/prisma-adapter） |
+| SSO Provider | jwt callback trigger="signUp" 时显式写入 | [[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1427-L1453) |
+| API verifyUser 中间件 | `NEXT_PUBLIC_EMAIL_PROVIDER && !user.emailVerified` → 401 | [verifyUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/lib/api/verifyUser.ts#L49-L58) |
 
 ---
 
@@ -381,7 +507,7 @@ User (Owner) 执行 prisma.user.delete
 
 | 时机 | 行为 | 代码 |
 |------|------|------|
-| 邀请成员首次接受（emailVerified 为 null 时 signIn） | 若已验证 child users + 2 > quantity → **自动扩容** updateSeats(stripeId, 新数量) | [[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1326-L1364) |
+| 邀请成员**首次**接受邀请（点击链接 signIn 时 emailVerified=null） | 已验证 child users + 2 > quantity → **自动扩容** updateSeats(stripeId, 新数量） | [[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1326-L1364) |
 | Owner 软移除成员 | 若成员 emailVerified → updateSeats(-1) | [deleteUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L93-L97) |
 | Child user 自删 | 若成员 emailVerified → updateSeats(-1) | [deleteUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/91-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L183-L192) |
 
@@ -430,7 +556,7 @@ User (Owner) 执行 prisma.user.delete
 
 ## 9. 统一状态迁移图
 
-### 9.1 用户（被邀请成员）生命周期
+### 9.1 用户（被邀请成员）生命周期（核准版）
 
 ```
                           ┌───────────────────────────┐
@@ -440,45 +566,65 @@ User (Owner) 执行 prisma.user.delete
                                         │   invite=true
                                         ▼
                           ┌───────────────────────────┐
-                          │   [已创建 / 未验证]        │
-                          │  emailVerified = null     │
-                          │  name = null              │
-                          │  password = null          │
-                          │  parentSubscriptionId = X │
+                          │  [已创建/未点击链接]      │
+                          │  emailVerified = null   │  状态 A
+                          │  name = null          │  不占 seat
+                          │  password = null      │
+                          │  parentSubscriptionId=X│
                           └─────────────┬─────────────┘
                                         │
               ┌─────────────────────────┼─────────────────────────┐
               │                         │                         │
               │ 20min 内点击邮件         │ 令牌过期/未点击         │ Owner 提前软移除
-              │ signIn("invite")        │                         │ disconnect
+              │  PrismaAdapter 写入       │                         │ disconnect
+              │  emailVerified=new Date() │                         │
+              │  自动扩容 seats(如需）│                         │
               ▼                         ▼                         ▼
     ┌────────────────────┐   ┌────────────────────┐    ┌────────────────────┐
-    │ [待 Onboarding]    │   │ [僵尸账号]          │    │ [独立用户]          │
-    │ 自动扩容 seats     │   │ 仍在 DB 中，无法登录 │    │ parentSubscriptionId│
-    │ → /member-onboarding│   │                     │    │   = NULL            │
-    └─────────┬──────────┘   └────────────────────┘    └─────────┬──────────┘
-              │                                                  │
-              │ 设置 name + password                             │ 可自行注册订阅
-              │ PUT /api/v1/users/:id                            │
-              ▼                                                  ▼
-    ┌────────────────────┐                              ┌────────────────────┐
-    │ [已激活成员]        │                              │ [独立用户]          │
-    │ name != null       │                              │ 账号保留，资源保留 │
-    │ password != null   │◄─────────────────────────────┤ 从订阅断开关联      │
-    │ parentSubscription │   Owner 软移除（disconnect）  └────────────────────┘
-    │   .id = X          │
+    │ [已点击/未完成    │   │ [僵尸账号]          │    │ [独立用户]          │
+    │  onboarding]     │   │ 仍在 DB 中         │    │ parentSubscriptionId│
+    │ emailVerified 已 │   │ emailVerified=null │    │   = NULL            │
+    │ 写入             │   │ name=null         │    │ 不占 seat           │
+    │ name=null        │   │ password=null     │    │                     │
+    │ password=null     │   │ 无法通过 Credentials  │    │ 可自行注册订阅       │
+    │ isInvited=true   │   │ 登录              │    └────────────────────┘
+    │ 占 1 seat        │   │                     │
+    └─────────┬──────────┘   └────────────────────┘
+              │
+              │ 填写 name + password
+              │ PUT /api/v1/users/:id
+              │  (updateUserById
+              ▼
+    ┌────────────────────┐
+    │ [完全激活]         │ 状态 C
+    │ emailVerified 已写入 │ 占 1 seat
+    │ name != null       │ 正常使用所有 Provider
+    │ password != null   │ 所有 API 调用通过
+    │ parentSubscription│
+    │   .id = X        │
     └─────────┬──────────┘
               │
      ┌────────┴────────┐
      │                 │
-     │ 自删             │ Owner 硬删除自己（删 Subscription，
-     │ prisma.user.delete │  SET NULL 所有 child users）
-     ▼                 ▼
-┌────────────┐  ┌──────────────────────────┐
-│  [已删除]   │  │ [独立用户（Subscription  │
-│ CASCADE 删除│  │  已不存在）]              │
-│ 所有关联资源 │  │ parentSubscriptionId=NULL│
-└────────────┘  └──────────────────────────┘
+     │ 自删             │ Owner 软移除
+     │ prisma.user.delete │ disconnect（disconnect: parentSubscription
+     ▼                 │
+┌────────────┐          │
+│  [已删除]   │          ▼
+│ CASCADE 删除│  ┌────────────────────┐
+│ 所有关联资源 │  │ [独立用户]          │
+└────────────┘  │ 账号保留，资源保留 │
+              │ 从订阅断开关联      │
+              │ 从订阅断开      │
+              └────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────┐
+    │  边界状态补充：                                        │
+    │  ● 状态 A → 过期 token → 仍停留状态 A（不占 seat）  │
+    │  ● 状态 B → 再次点链接 → 停留状态 B（emailVerified   │
+    │    已不为 null → 不再触发扩容                    │
+    │  ● Owner 硬删除自己 → 触发 SET NULL 所有 child users│
+    └──────────────────────────────────────────────────────────┘
 ```
 
 ### 9.2 订阅 Owner 生命周期
@@ -529,4 +675,22 @@ User (Owner) 执行 prisma.user.delete
 └─────────┘  └──────────┘
 
 额外限制：同一邮箱 5 分钟内最多 4 个令牌（防滥用）
+```
+
+### 9.4 Seat 计数与激活状态对齐总结
+
+```
+emailVerified 写入（null）
+        │
+        │ PrismaAdapter 在用户点击邀请邮件链接、signIn callback 返回 true 后写入
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│  emailVerified != null  ⇔ 占 1 个 seat
+└─────────────────────────────────────────────────────────────┘
+        │
+        ├── 首次点击 → verifiedChildUsersCount + 2 > quantity → 自动扩容
+        │
+        ├── name / password 是否设置不影响 seat 计数
+        │
+        └── 移除/自删时 emailVerified != null → updateSeats(-1)
 ```
