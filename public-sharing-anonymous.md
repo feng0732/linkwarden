@@ -185,15 +185,35 @@ include: { tags: true, collection: true, pinnedBy: { select: { id: true } }
 - `members`（UsersAndCollections[]）—— 但单独的 getPublicCollection API 会返回成员信息
 - `links`、`subCollections`、`rssSubscriptions`、`DashboardSection`
 
-**信息关联攻击链**：
+**信息关联泄露链（修正：ownerId 不能直接用作 collectionId）**：
+
+首先需要明确：`/api/v1/public/collections/links` 端点要求的 `collectionId` 参数是 **Collection 表的主键 ID**，不是用户 ID。在 [searchLinks.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/controllers/search/searchLinks.ts#L41-L49) 中，过滤条件强制为：
+
+```typescript
+collectionCondition.push({
+  collection: {
+    id: query.collectionId,   // 精确匹配 Collection.id
+    ...(publicOnly ? { isPublic: true } : {}),  // 同时必须公开
+  },
+});
+```
+
+并且在 [/api/v1/public/collections/links/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/pages/api/v1/public/collections/links/index.ts#L25-L29) 中，不传 `collectionId` 直接返回 400。
+
+**因此，将 `ownerId=42` 直接作为 `collectionId=42` 传入，只有当系统中恰好存在 `id=42` 且 `isPublic=true` 的 Collection 时才会命中，纯属巧合，不构成有效的枚举手段。**
+
+当前系统中不存在可以直接按 `ownerId` 过滤并列出某用户所有公开 Collection 的公开 API。Meilisearch 搜索在 `publicOnly=true` 模式下也仅强制 `collectionIsPublic = true`，不支持 `collectionOwnerId` 过滤（详见 [searchQueryBuilder.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/searchQueryBuilder.ts#L102-L104)）。
+
+正确的信息关联泄露路径为：
 ```
 匿名请求 /api/v1/public/links/{linkId}
-    → 获取 collection.ownerId = 42
+    → 获取 collection.ownerId = 42（User 表主键）
     → 请求 /api/v1/public/users/42
-        → 获取该用户的 username、name、头像、归档偏好设置
-    → 请求 /api/v1/public/collections/links?collectionId=42（可能存在其他公开 Collection）
-        → 枚举该用户的所有公开内容
+        → 获取该用户的 id、name、username、image、归档偏好设置
+        → （到此为止，无法直接进一步枚举该用户的所有公开 Collection）
 ```
+
+即：ownerId 的泄露仅支持**从单个公开 Link 反向关联出其所有者用户的基础公开信息**，不能正方向从用户 ID 枚举其所有公开内容。
 
 ### 5.2 公开 User 字段裁剪与按 email 查找的安全影响
 
@@ -334,56 +354,74 @@ const articleText = article?.textContent
 - 经过清洗（去多余空格、换行符、可选长度限制 `TEXT_CONTENT_LIMIT
 - 可能包含：新闻全文、博客文章正文、产品描述、用户评论等网页可见文本
 
-**textContent 与 readable 字段的区别**：
+#### 5.5.1.1 textContent 与 readable 的同源关系
+
+两者均在 Worker 的同一流程中生成，见 [handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts#L20-L58)：
+
+```typescript
+const article = new Readability(dom.window.document).parse();  // 同一次 Readability 解析
+// articleText → 存入 Link.textContent（纯文本
+// JSON.stringify(article) → 写入 archives/{collectionId}/{linkId}_readability.json（readable 字段存储路径
+```
+
+因此 `textContent` 和 `readable` 是**同源数据**，只是提取的粒度和存储介质不同。
+
+**textContent 与 readable 字段在公开归档边界下的对比**：
 
 | 维度 | `textContent` | `readable` |
 |------|--------------|-----------|
 | 存储位置 | Postgres Link 表字段 | 文件系统 JSON 文件 |
-| 存储路径 | N/A（直接读库 | `archives/{collectionId}/{linkId}_readability.json |
-| 内容格式 | 纯文本字符串 | JSON（含 HTML 内容、标题、作者、元数据） |
-| 获取方式 | `/api/v1/public/links/{id}` API 直接返回 | `/api/v1/archives/{linkId}?format=readability` 接口单独获取 |
-| HTTP 缓存 | API 默认 API 响应（依赖 API 端缓存 | `max-age=31536000, immutable |
-| 列表 API | ❌ 已裁剪 | ✅ 返回文件路径（可进一步获取 |
-| 单 Link API | ⚠️ 未裁剪 | ✅ 返回文件路径（可进一步获取 |
+| 存储值 | 纯文本字符串（清洗后正文） | 路径字符串：`archives/{collectionId}/{linkId}_readability.json` |
+| 实际内容 | `article.textContent`（纯文本） | `JSON.stringify(article)`，含 HTML content、title、byline、siteName、excerpt、dir、lang 等 |
+| 匿名访问条件 | Link 所属 `collection.isPublic === true`（在公开 Link API 的 where 条件中判定） | 同左：`resolveAccessibleArchive` 要求 `collection.isPublic === true`（三者 OR 条件之一） |
+| 匿名访问权限等级 | **完全相同**：都要求 Collection 公开 | **完全相同**：都要求 Collection 公开 |
+| 获取方式 | `/api/v1/public/links/{id}` 直接随 Link 对象返回 | `/api/v1/archives/{linkId}?format=3`（ArchivedFormat.readability = 3） |
+| HTTP 缓存 | 标准 API 响应，无特殊缓存头 | `Cache-Control: private, max-age=31536000, immutable` |
+| 列表 API 返回 | ❌ 已裁剪（`omit: { textContent: true }`） | ✅ 返回 readable 路径字符串 |
+| 单 Link API 返回 | ⚠️ 未裁剪 | ✅ 返回 readable 路径字符串 |
+
+**关键边界说明**：两者的匿名访问判定条件**完全等价**——都要求 Link 所属 Collection 的 `isPublic === true`。readable 不是 textContent 的"绕过通道"，而是同一公开权限等级下的两个不同数据形态。
 
 #### 5.5.2 裁剪不一致造成的安全边界差异
 
-两个端点的权限相同，但返回粒度差异造成了**安全边界不一致：
+两个 Link API 的访问权限完全相同（均要求 Collection 公开），但返回粒度差异造成了**同一权限等级下安全策略不一致**：
 
 ```
-攻击者视角：
+攻击者视角（匿名用户，Collection 已公开）：
   ┌───────────────────────────────────────────────────────┐
-  │  GET /api/v1/public/collections/links           │
-  │   (分页列表  ← textContent: true（已裁剪
-  │  │
-  │  │   看不到网页正文，但能看到 readable 字段：
-  │  │   readable: "archives/42/123_readability.json"
-  │  │
-  │  │   + 换一个端点
-  │  ▼
-  │  GET /api/v1/public/links/123
-  │   (单 Link ← textContent: "完整网页正文内容..."（未裁剪
-  │  └───────────────────────────────────────────────────────┘
+  │  GET /api/v1/public/collections/links?collectionId=X  │
+  │   (分页列表)  ← omit: { textContent: true }            │
+  │  │                                                     │
+  │  │   看不到 textContent，但能看到 readable 路径：      │
+  │  │   readable: "archives/42/123_readability.json"     │
+  │  │   （readable 可通过归档 API 单独获取，权限相同）     │
+  │  │                                                     │
+  │  │   换端点 → GET /api/v1/public/links/123             │
+  │  ▼                                                     │
+  │   (单 Link) ← textContent: "完整网页正文..."（未裁剪） │
+  └───────────────────────────────────────────────────────┘
 ```
 
 **安全影响分析**：
 
-1. **防御深度不同**：
-   - 列表 API（searchLinks）出于性能考虑裁剪 textContent（大量 textContent 体积可能较大
-   - 单 Link API 未做同样处理，两个端点安全策略不统
+1. **同一权限等级策略不一致**：
+   - 列表 API（searchLinks）出于性能考虑裁剪 textContent（大量 textContent 可能增加响应体积
+   - 单 Link API 未做同样处理，两者安全策略不统一
 
-2. **绕过方式：**
+2. **textContent 获取方式**：
    - 攻击者只需遍历所有 linkId（例如从 1 开始递增），逐个请求单 Link API，即可获取所有公开 Link 的 textContent
    - 列表裁剪形同虚设，列表看不到但详情页可以看到
 
-3. **textContent 可能包含的敏感内容：
-   - 付费墙后的文章正文（用户原本是通过 Readability 提取时可能提取到完整正文
+3. **textContent 可能包含的敏感内容**：
+   - 付费墙后的文章正文（Readability 提取时可能绕过前端付费限制提取到完整正文）
    - 内部知识库页面内容
    - 含个人身份信息（PII）：姓名、邮箱、电话等
    - 版权受保护的文本内容
 
-4. **与 readable 文件的双重获取**：
-   - 即使 textContent 被裁剪，攻击者仍可通过 readable 字段的文件路径通过 `/api/v1/archives/{linkId}?format=readability` 获取**富文本（含 HTML 的完整 Readability JSON 输出，包含比 textContent 更完整的内容（含 HTML 标记、标题、作者、站点名、excerpt、dir、lang 等元数据
+4. **textContent 与 readable 的关系（修正：非双重绕过，而是同源双形态）**：
+   - 两者都要求 Collection 公开，权限等价，不存在"一个可以绕过另一个"的关系
+   - 区别在于数据完整度：readable 返回的 JSON 中 `article.content` 是带 HTML 标记的完整内容，比 textContent 更丰富（含标题 `article.title`、作者 `article.byline`、站点 `article.siteName`、摘要 `article.excerpt` 等元数据
+   - 因此，**即使统一将 textContent 从所有公开 API 中裁掉，匿名用户仍可通过 readable 字段的路径访问归档 API 获得更完整的内容**——但这不属于漏洞，而是与 textContent 同一权限等级下的预期行为（Collection 已公开意味着其归档内容也应对匿名用户可见
 
 #### 5.5.3 textContent 的用途
 
@@ -551,26 +589,35 @@ archives/preview/${collectionId}/${linkId}.jpeg
 
 ### 8.3 暴露的文件路径模式
 
-| 格式 | 路径模式 |
-|------|---------|
-| 预览 JPEG | `archives/preview/{collectionId}/{linkId}.jpeg` |
-| 截图 PNG/JPEG | `archives/{collectionId}/{linkId}.png / .jpeg` |
-| PDF | `archives/{collectionId}/{linkId}.pdf` |
-| Monolith | `archives/{collectionId}/{linkId}.html` |
-| Readable | `archives/{collectionId}/{linkId}.json` |
+根据 [getSuffixFromFormat.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/shared/getSuffixFromFormat.ts) 中的格式后缀映射：
+
+| 格式 | ArchivedFormat 枚举值 | 路径模式 |
+|------|----------------------|---------|
+| 预览 JPEG | N/A（preview 参数单独处理） | `archives/preview/{collectionId}/{linkId}.jpeg` |
+| 截图 PNG | `png = 0` | `archives/{collectionId}/{linkId}.png` |
+| 截图 JPEG | `jpeg = 1` | `archives/{collectionId}/{linkId}.jpeg` |
+| PDF | `pdf = 2` | `archives/{collectionId}/{linkId}.pdf` |
+| **Readability（可读 JSON）** | `readability = 3` | `archives/{collectionId}/{linkId}_readability.json`（**修正：不是 .json，是 _readability.json**） |
+| Monolith（完整网页 HTML） | `monolith = 4` | `archives/{collectionId}/{linkId}.html` |
 
 文件路径可通过 Link 对象的 `image`、`pdf`、`monolith`、`readable` 字段直接获得，这些字段在公开 Link API 中完整暴露。
 
-### 8.4 textContent 暴露风险
+### 8.4 textContent 与 readable 的边界说明
 
-**`textContent` 是 Link 模型存储的网页正文提取文本。在 `/api/v1/public/links/[id]`（单 Link API **未做 omit**，匿名用户可直接获取。这可能包含：
-- 网页完整正文
-- 敏感文本内容
-- 作者信息
+**textContent**：
+- Link 模型中存储的网页正文提取纯文本
+- 在 `/api/v1/public/links/[id]`（单 Link API）未做 `omit`，匿名用户可直接获取
+- 在 `/api/v1/public/collections/links`（列表 API）已通过 `omit: { textContent: true }` 裁剪
+- 同一权限等级下两个端点策略不一致
 
-而 Link 列表 API（searchLinks）中已通过 `omit: { textContent: true }` 做了裁剪。
+**readable**：
+- 存储路径字符串 `archives/{collectionId}/{linkId}_readability.json`
+- 实际内容通过 `/api/v1/archives/{linkId}?format=3` 获取
+- 匿名访问条件与 textContent **完全等价**：要求 Collection.isPublic === true（在 [resolveAccessibleArchive.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts#L38-L42) 的 OR 条件中判定）
+- 返回内容比 textContent 更丰富：Readability 完整 JSON（含 HTML content、title、byline、siteName、excerpt、dir、lang 等）
+- 但 readable 返回更丰富内容**不属于漏洞**，而是 Collection 公开后归档内容对匿名用户可见的预期行为
 
-**不一致风险**：同一条 Link，列表看不到 textContent，详情可以。
+**两者同源**：均在 [handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/90-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts#L20-L58) 的同一流程中生成，不存在"readable 是 textContent 绕过通道"的关系。
 
 ---
 
@@ -594,7 +641,7 @@ archives/preview/${collectionId}/${linkId}.jpeg
 |------|------|------|---------|
 | 归档文件浏览器缓存 1 年 immutable | `/api/v1/archives/[linkId].ts` | 撤销公开后 1 年内浏览器仍可访问已缓存文件 | **高** |
 | 公开用户 API 支持按 email 查找导致用户枚举 | `/api/v1/public/users/[id].ts`、`getPublicUser.ts` | 可无速率限制地枚举系统用户邮箱，用于钓鱼/撞库前置侦察 | **高** |
-| 公开 Link 返回 collection.ownerId 造成信息关联泄露链 | `public/links/linkId/getLinkById.ts`、`searchLinks.ts` | 暴露 Collection 所有者用户 ID，可进一步查询公开用户信息并枚举该用户所有公开内容 | **中** |
+| 公开 Link 返回 collection.ownerId 造成信息关联泄露 | `public/links/linkId/getLinkById.ts`、`searchLinks.ts` | 暴露 Collection 所有者用户 ID，可进一步反向查询该用户的公开基础信息（username/name/头像），但**不能正方向从 ownerId 枚举该用户所有公开 Collection**（无对应 API） | **低** |
 | 单 Link API 未裁剪 textContent | `public/links/linkId/getLinkById.ts` | 匿名用户可获取网页正文提取文本（含潜在 PII/版权内容），且与列表 API 策略不一致 | **中** |
 | 公开 Link 返回 collection.parentId 可探测层级结构 | 同上 | 可用于发现父 Collection ID 及未公开的层级结构 | **低** |
 | 公开 Link 返回 collection.isPublic 可探测公开状态 | 同上 | 可直接确认 Collection 是否为公开状态 | **低** |
@@ -602,7 +649,7 @@ archives/preview/${collectionId}/${linkId}.jpeg
 | 前端 React Query 缓存不随 isPublic 变更自动失效 | `packages/router/*` | 关闭公开后前端仍显示旧数据直到刷新 | **低** |
 | Meilisearch 索引异步更新 | worker 索引延迟 | 搜索结果中仍可搜到刚关闭公开的 Links（分钟级窗口） | **低** |
 | User.isPrivate 字段未被公开用户 API 校验 | `getPublicUser.ts` | 标记为私有的用户其公开 Collection 仍可被访问，isPrivate 形同虚设 | **低** |
-| textContent 裁剪与 readable 文件路径暴露形成双重获取 | `searchLinks.ts` vs `getLinkById.ts` vs `/api/v1/archives` | 即使 textContent 被裁剪，仍可通过 readable 字段获取更完整的富文本内容 | **中** |
+| textContent 与 readable 同源双形态但权限等价 | `handleReadability.ts`、`resolveAccessibleArchive.ts` | 两者均在同一 Readability 流程中生成，匿名访问都要求 Collection.isPublic=true（权限等价）。readable 返回更完整的 HTML+元数据是同一公开权限下的预期行为，不属于绕过。真正的问题是 textContent 在单 Link API 未裁剪导致策略不一致 | **中** |
 
 ### 9.3 架构图示
 
