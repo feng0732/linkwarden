@@ -8,10 +8,10 @@
 
 **关键文件：**
 
-- API 路由入口：[migration/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/pages/api/v1/migration/index.ts)
-- 前端 UI 入口：[ImportDropdown.tsx](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/components/ImportDropdown.tsx)
-- 前端上传处理：[importBookmarks.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/client/importBookmarks.ts)
-- 类型定义：[global.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/packages/types/global.ts#L139-L145)
+- API 路由入口：[migration/index.ts](apps/web/pages/api/v1/migration/index.ts)
+- 前端 UI 入口：[ImportDropdown.tsx](apps/web/components/ImportDropdown.tsx)
+- 前端上传处理：[importBookmarks.ts](apps/web/lib/client/importBookmarks.ts)
+- 类型定义：[global.ts](packages/types/global.ts#L139-L145)
 
 **支持的导入格式（MigrationFormat 枚举）：**
 
@@ -25,11 +25,11 @@ pocket     = 4  → Pocket CSV 导出
 
 **调用流程（代码顺序）：**
 
-1. 用户点击 [ImportDropdown.tsx](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/components/ImportDropdown.tsx#L54-L77) 下拉菜单选择格式，触发隐藏 `<input type="file">`
-2. 文件选择后调用 [importBookmarks.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/client/importBookmarks.ts#L23-L97) 的 `importBookmarks(e, format)`
+1. 用户点击 [ImportDropdown.tsx](apps/web/components/ImportDropdown.tsx#L54-L77) 下拉菜单选择格式，触发隐藏 `<input type="file">`
+2. 文件选择后调用 [importBookmarks.ts](apps/web/lib/client/importBookmarks.ts#L23-L97) 的 `importBookmarks(e, format)`
 3. 前端 `FileReader` 读取文件内容（Omnivore 走 `readAsArrayBuffer` + JSZip 解压，其余走 `readAsText`）
 4. 以 `POST /api/v1/migration` 发送 `{ format, data }` 给后端
-5. 路由 [migration/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/pages/api/v1/migration/index.ts#L61-L101) 根据 `format` 分发到具体导入控制器
+5. 路由 [migration/index.ts](apps/web/pages/api/v1/migration/index.ts#L61-L101) 根据 `format` 分发到具体导入控制器
 6. GET `/api/v1/migration` 走导出分支，返回 backup.json 下载
 
 ---
@@ -38,29 +38,29 @@ pocket     = 4  → Pocket CSV 导出
 
 ### 2.1 HTML 书签导入（最复杂，含文件夹嵌套）
 
-**控制器：** [importFromHTMLFile.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts)
+**控制器：** [importFromHTMLFile.ts](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts)
 
 **执行顺序：**
 
-1. **DOM 清洗** ([L14-L21](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L14-L21))：用 JSDOM 解析后，将 `<meta>`、`<META>`、`<P>` 标签的 outerHTML 替换为 innerHTML（消除干扰标签）。
+1. **DOM 清洗** ([L14-L21](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L14-L21))：用 JSDOM 解析后，将 `<meta>`、`<META>`、`<P>` 标签的 outerHTML 替换为 innerHTML（消除干扰标签）。
 
-2. **容量预检** ([L22-L32](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L22-L32))：统计所有 `<A>` 标签数量，调用 `hasPassedLimit(userId, totalImports)` 校验是否超出订阅配额，超出直接返回 400。
+2. **容量预检** ([L22-L32](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L22-L32))：统计所有 `<A>` 标签数量，调用 `hasPassedLimit(userId, totalImports)` 校验是否超出订阅配额，超出直接返回 400。
 
-3. **Himalaya 解析为 AST** ([L34](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L34))：`parse(document.documentElement.outerHTML)` 把 HTML 转成 Node 树。
+3. **Himalaya 解析为 AST** ([L34](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L34))：`parse(document.documentElement.outerHTML)` 把 HTML 转成 Node 树。
 
-4. **DD 节点重构** — `processNodes()` ([L262-L300](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L262-L300))：
+4. **DD 节点重构** — `processNodes()` ([L262-L300](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L262-L300))：
    - 遍历找到所有 `<DL>`
    - 若某个 `<DT>` 的下一个兄弟是 `<DD>`（描述），且 `<DT>` 内含 `<A>`，则把 `<DD>` 移入 `<A>` 的 children，然后从 `<DL>` 中删除原 `<DD>`
    - 这样后续递归时描述文本可以和链接一起被捕获
 
-5. **递归处理** — `processBookmarks(userId, data, parentCollectionId?)` ([L47-L151](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L47-L151))：
+5. **递归处理** — `processBookmarks(userId, data, parentCollectionId?)` ([L47-L151](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L47-L151))：
    - 遇到 `<DT><H3>名称</H3>` → 创建/查找 collection，递归传入新的 `parentCollectionId`
    - 遇到 `<DT><A HREF="...">` → 解析 URL、名称、tags（属性 `tags` 按逗号分割）、`ADD_DATE`（Unix 秒转 Date）、`<DD>` 描述 → 调用 `createLink`
    - 若无 `parentCollectionId`（根级链接），先创建/复用名为 "Imports" 的 collection
 
 ### 2.2 Linkwarden 自有格式导入
 
-**控制器：** [importFromLinkwarden.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts)
+**控制器：** [importFromLinkwarden.ts](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts)
 
 - `JSON.parse(rawData)` 为 `Backup` 类型
 - 统计 `data.collections[*].links.length` 做容量预检
@@ -69,7 +69,7 @@ pocket     = 4  → Pocket CSV 导出
 
 ### 2.3 Pocket 导入（CSV）
 
-**控制器：** [importFromPocket.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts)
+**控制器：** [importFromPocket.ts](apps/web/lib/api/controllers/migration/importFromPocket.ts)
 
 - PapaParse 解析 CSV（`header: true`），过滤掉无 `url` 的行
 - 所有链接放入新建的 "Imports" collection
@@ -81,7 +81,7 @@ pocket     = 4  → Pocket CSV 导出
 
 ### 2.4 Wallabag 导入（JSON）
 
-**控制器：** [importFromWallabag.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromWallabag.ts)
+**控制器：** [importFromWallabag.ts](apps/web/lib/api/controllers/migration/importFromWallabag.ts)
 
 - 过滤无 `url` 的条目
 - 所有链接放入新建的 "Imports" collection
@@ -94,8 +94,8 @@ pocket     = 4  → Pocket CSV 导出
 
 ### 2.5 Omnivore 导入（ZIP 内 JSON）
 
-**控制器：** [importFromOmnivore.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromOmnivore.ts)
-**前端 ZIP 预处理：** [importBookmarks.ts#processOmnivoreZipFile](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/client/importBookmarks.ts#L5-L21)
+**控制器：** [importFromOmnivore.ts](apps/web/lib/api/controllers/migration/importFromOmnivore.ts)
+**前端 ZIP 预处理：** [importBookmarks.ts#processOmnivoreZipFile](apps/web/lib/client/importBookmarks.ts#L5-L21)
 
 - 前端先解压 zip，读取所有 `metadata_*` 文件，合并 flatten 成单个数组
 - 后端过滤无 `url` 的条目
@@ -113,7 +113,7 @@ pocket     = 4  → Pocket CSV 导出
 
 ### 3.1 HTML 导入：同名 collection 复用（支持父子层级）
 
-**函数：** `createCollection(userId, collectionName, parentId?)` ([importFromHTMLFile.ts#L153-L198](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L153-L198))
+**函数：** `createCollection(userId, collectionName, parentId?)` ([importFromHTMLFile.ts#L153-L198](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L153-L198))
 
 ```
 查找条件: { parentId, name: collectionName(trim+slice 254), ownerId: userId }
@@ -144,7 +144,7 @@ pocket     = 4  → Pocket CSV 导出
 
 ### 4.1 统一机制：`connectOrCreate` + `name_ownerId` 复合唯一键
 
-所有导入控制器（以及常规 [postLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/links/postLink.ts#L120-L137)）都采用相同模式：
+所有导入控制器（以及常规 [postLink.ts](apps/web/lib/api/controllers/links/postLink.ts#L120-L137)）都采用相同模式：
 
 ```javascript
 tags: {
@@ -169,14 +169,14 @@ tags: {
 
 | 导入器 | where 条件（查找已有 tag） | create 时（新建 tag） | 顺序一致？ |
 |--------|--------------------------|---------------------|-----------|
-| [HTML](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L216) | `tag.trim()` — L241 | `tag.trim()` — L246 | ✅ 一致 |
-| [Linkwarden](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L82-L97) | `tag.name?.slice(0, 49)` — L85 **（只 slice，不 trim）** | `tag.name?.trim().slice(0, 49)` — L90 | ❌ **不一致** |
-| [Pocket](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L79-L91) | `tag?.slice(0, 50).trim()` — L83 | `tag?.slice(0, 50).trim()` — L88 | ✅ 一致 |
-| [Wallabag](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromWallabag.ts#L99-L114) | `tag?.trim().slice(0, 49)` — L102 | `tag?.trim().slice(0, 49)` — L107 | ✅ 一致 |
-| [Omnivore](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L89-L104) | `label?.trim().slice(0, 49)` — L92 | `label?.trim().slice(0, 49)` — L97 | ✅ 一致 |
-| [postLink](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/links/postLink.ts#L120-L137) | `tag.name.trim()` — L124 | `tag.name.trim()` — L129 | ✅ 一致（无 slice） |
+| [HTML](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L216) | `tag.trim()` — L241 | `tag.trim()` — L246 | ✅ 一致 |
+| [Linkwarden](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L82-L97) | `tag.name?.slice(0, 49)` — L85 **（只 slice，不 trim）** | `tag.name?.trim().slice(0, 49)` — L90 | ❌ **不一致** |
+| [Pocket](apps/web/lib/api/controllers/migration/importFromPocket.ts#L79-L91) | `tag?.slice(0, 50).trim()` — L83 | `tag?.slice(0, 50).trim()` — L88 | ✅ 一致 |
+| [Wallabag](apps/web/lib/api/controllers/migration/importFromWallabag.ts#L99-L114) | `tag?.trim().slice(0, 49)` — L102 | `tag?.trim().slice(0, 49)` — L107 | ✅ 一致 |
+| [Omnivore](apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L89-L104) | `label?.trim().slice(0, 49)` — L92 | `label?.trim().slice(0, 49)` — L97 | ✅ 一致 |
+| [postLink](apps/web/lib/api/controllers/links/postLink.ts#L120-L137) | `tag.name.trim()` — L124 | `tag.name.trim()` — L129 | ✅ 一致（无 slice） |
 
-**补充：HTML 导入有预处理步骤** [importFromHTMLFile.ts#L216](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L216)：
+**补充：HTML 导入有预处理步骤** [importFromHTMLFile.ts#L216](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L216)：
 
 ```javascript
 tags = tags?.map((tag) => tag.trim().slice(0, 49));  // 预处理：先 trim 再 slice
@@ -186,7 +186,7 @@ tags = tags?.map((tag) => tag.trim().slice(0, 49));  // 预处理：先 trim 再
 
 **不一致的风险分析 — Linkwarden 导入器：**
 
-在 [importFromLinkwarden.ts#L82-L97](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L82-L97)：
+在 [importFromLinkwarden.ts#L82-L97](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L82-L97)：
 
 ```javascript
 tags: {
@@ -215,7 +215,7 @@ tags: {
 
 **Pocket 导入器的顺序注意：**
 
-在 [importFromPocket.ts#L79-L91](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L79-L91)：
+在 [importFromPocket.ts#L79-L91](apps/web/lib/api/controllers/migration/importFromPocket.ts#L79-L91)：
 
 ```javascript
 name: tag?.slice(0, 50).trim()  // 先 slice 再 trim
@@ -239,7 +239,7 @@ name: tag?.slice(0, 50).trim()  // 先 slice 再 trim
 
 ### 5.1 手动新建链接的去重（`preventDuplicateLinks`）
 
-**位置：** [postLink.ts#L47-L67](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/links/postLink.ts#L47-L67)
+**位置：** [postLink.ts#L47-L67](apps/web/lib/api/controllers/links/postLink.ts#L47-L67)
 
 仅当用户设置 `preventDuplicateLinks = true` 时生效：
 1. URL `trim` 并去掉末尾 `/`
@@ -251,7 +251,7 @@ name: tag?.slice(0, 50).trim()  // 先 slice 再 trim
 
 **所有导入控制器均未启用 URL 去重检查。** 具体行为：
 
-- HTML 导入的 `createLink()` ([importFromHTMLFile.ts#L200-L260](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L200-L260)) 直接 `prisma.link.create`，没有 `findFirst` 查重
+- HTML 导入的 `createLink()` ([importFromHTMLFile.ts#L200-L260](apps/web/lib/api/controllers/migration/importFromHTMLFile.ts#L200-L260)) 直接 `prisma.link.create`，没有 `findFirst` 查重
 - Linkwarden / Pocket / Wallabag / Omnivore 的导入同样直接 `prisma.link.create`
 - 因此：
   - 导入相同文件两次 → 产生重复链接
@@ -285,7 +285,7 @@ try { new URL(url.trim()); } catch (e) { return/continue; }
 
 ### 6.1 导出控制器
 
-**位置：** [exportData.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/exportData.ts)
+**位置：** [exportData.ts](apps/web/lib/api/controllers/migration/exportData.ts)
 
 查询语句：
 ```javascript
@@ -319,7 +319,7 @@ Content-Disposition: attachment; filename=backup.json
 
 ### 6.2 导出类型定义
 
-**位置：** [global.ts#Backup](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/packages/types/global.ts#L125-L132)
+**位置：** [global.ts#Backup](packages/types/global.ts#L125-L132)
 
 ```typescript
 interface CollectionIncludingLinks extends Collection {
@@ -380,7 +380,7 @@ interface Backup extends Omit<User, "password" | "id"> {
 
 ### 7.1 前端进度反馈
 
-**文件：** [importBookmarks.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/client/importBookmarks.ts)
+**文件：** [importBookmarks.ts](apps/web/lib/client/importBookmarks.ts)
 
 使用 `react-hot-toast` 的三步反馈：
 
@@ -398,7 +398,7 @@ interface Backup extends Omit<User, "password" | "id"> {
 
 ### 7.2 后端整体失败（请求级）
 
-在 [migration/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/pages/api/v1/migration/index.ts) 中：
+在 [migration/index.ts](apps/web/pages/api/v1/migration/index.ts) 中：
 
 | 场景 | HTTP 状态 | 响应消息 |
 |------|----------|---------|
@@ -422,14 +422,14 @@ interface Backup extends Omit<User, "password" | "id"> {
 | 格式 | 是否包裹事务 | 超时 | catch 行为 | 最终返回 |
 |------|------------|------|-----------|---------|
 | HTML | **否** | - | 无 | 逐条创建，若中途异常抛到顶层 |
-| [Linkwarden](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
-| [Pocket](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L105) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
-| [Wallabag](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromWallabag.ts#L123) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
-| [Omnivore](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L113-L116) | 是 | 30s | `console.error + throw err` 重抛 | 失败时 500 |
+| [Linkwarden](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
+| [Pocket](apps/web/lib/api/controllers/migration/importFromPocket.ts#L105) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
+| [Wallabag](apps/web/lib/api/controllers/migration/importFromWallabag.ts#L123) | 是 | 30s | `console.log(err)` 吞掉 | **始终 200** |
+| [Omnivore](apps/web/lib/api/controllers/migration/importFromOmnivore.ts#L113-L116) | 是 | 30s | `console.error + throw err` 重抛 | 失败时 500 |
 
 #### 7.4.2 路径一：事务整体回滚但返回 200（假阳性）
 
-以 [importFromLinkwarden.ts#L119-L121](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119-L121) 为例：
+以 [importFromLinkwarden.ts#L119-L121](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119-L121) 为例：
 
 ```javascript
 await prisma
@@ -456,7 +456,7 @@ Pocket 和 Wallabag 导入器存在完全相同的问题。
 
 #### 7.4.3 路径二：Linkwarden pinnedLinks 异步更新未等待
 
-**代码位置：** [importFromLinkwarden.ts#L101-L113](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113)
+**代码位置：** [importFromLinkwarden.ts#L101-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L101-L113)
 
 ```javascript
 // Import pinnedLinks
@@ -496,13 +496,13 @@ data?.pinnedLinks.forEach(async (pinnedLink) => {    // ⚠️ forEach + async �
 
 #### 7.4.4 路径三：pinnedLinks URL 匹配不一致
 
-pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 link.url 在创建时经过了 `trim().slice(0, 2047)` 处理 [importFromLinkwarden.ts#L66](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66)。
+pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 link.url 在创建时经过了 `trim().slice(0, 2047)` 处理 [importFromLinkwarden.ts#L66](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66)。
 
 如果备份中 `pinnedLinks[i].url` 含有前后空格或长度超过 2047，而对应 link 创建时被规范化了，则 `===` 比较失败，pinned 状态不会被设置——即使 URL 本质相同。
 
 ### 7.5 容量校验细节
 
-**函数：** [hasPassedLimit(userId, numberOfImports)](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/packages/lib/verifyCapacity.ts#L8-L109)
+**函数：** [hasPassedLimit(userId, numberOfImports)](packages/lib/verifyCapacity.ts#L8-L109)
 
 执行顺序：
 1. 未启用 Stripe：`MAX_LINKS_PER_USER`（默认 30000）- (现有链接数 + 待导入数) < 0
@@ -518,7 +518,7 @@ pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 
 
 ## 8. 测试覆盖
 
-**文件：** [importFromHTMLFile.test.ts](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromHTMLFile.test.ts)
+**文件：** [importFromHTMLFile.test.ts](apps/web/lib/api/controllers/migration/importFromHTMLFile.test.ts)
 
 已覆盖的测试场景（vitest + 真实 Prisma）：
 
@@ -537,10 +537,10 @@ pinnedLinks 通过 URL 精确匹配（`pinnedLink.url === newLink.url`），但 
 
 | # | 问题 | 位置 | 影响 |
 |---|------|------|------|
-| 1 | Linkwarden 导入 where 中 tag 只 `slice` 不 `trim`，create 中 `trim().slice()` | [importFromLinkwarden.ts#L85 vs L90](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L85-L90) | 带空格 tag 名触发唯一约束冲突 → 事务回滚 + 假 200 |
-| 2 | Linkwarden/Pocket/Wallabag 事务 catch 吞异常，始终返回 200 | [importFromLinkwarden.ts#L119](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) 等 | 事务整体回滚但前端显示成功（假阳性） |
-| 3 | Linkwarden pinnedLinks 使用 `forEach(async)`，无 await | [importFromLinkwarden.ts#L102-L113](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L102-L113) | pinned 状态可能部分/全部丢失，或产生未处理 Promise 拒绝 |
-| 4 | pinnedLinks URL 精确匹配，未与 link 创建时的 `trim().slice()` 对齐 | [importFromLinkwarden.ts#L66 vs L103](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66-L103) | URL 含空格/超长时 pinned 状态无法匹配 |
-| 5 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](file:///d:/fz/0601/solo-dogfeeding/code/89-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
+| 1 | Linkwarden 导入 where 中 tag 只 `slice` 不 `trim`，create 中 `trim().slice()` | [importFromLinkwarden.ts#L85 vs L90](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L85-L90) | 带空格 tag 名触发唯一约束冲突 → 事务回滚 + 假 200 |
+| 2 | Linkwarden/Pocket/Wallabag 事务 catch 吞异常，始终返回 200 | [importFromLinkwarden.ts#L119](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L119) 等 | 事务整体回滚但前端显示成功（假阳性） |
+| 3 | Linkwarden pinnedLinks 使用 `forEach(async)`，无 await | [importFromLinkwarden.ts#L102-L113](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L102-L113) | pinned 状态可能部分/全部丢失，或产生未处理 Promise 拒绝 |
+| 4 | pinnedLinks URL 精确匹配，未与 link 创建时的 `trim().slice()` 对齐 | [importFromLinkwarden.ts#L66 vs L103](apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L66-L103) | URL 含空格/超长时 pinned 状态无法匹配 |
+| 5 | Pocket 导入 tag 先 `slice(0,50)` 再 `trim()`，其他多数先 `trim()` 再 `slice()` | [importFromPocket.ts#L83](apps/web/lib/api/controllers/migration/importFromPocket.ts#L83) | 边界情况 tag 名称截断结果不一致 |
 | 6 | HTML 导入不使用事务，其他格式使用事务 | 各控制器 | HTML 导入中途异常会留下部分已入库的数据，其他格式全回滚 |
 | 7 | 所有导入器均未做 URL 去重（与手动 postLink 的 `preventDuplicateLinks` 不一致） | 各控制器 | 重复导入或 URL 已存在时产生重复链接 |
