@@ -402,7 +402,7 @@ Cache-Control: private, max-age=31536000, immutable
 
 ---
 
-## 六、用户手工字段优先级与显示规则总结
+## 六、用户手工字段优先级与 URL 修改时的两层实现差异
 
 以下字段**永不被 Worker 覆盖**，完全由用户控制：
 
@@ -428,11 +428,107 @@ color           String?
 ```
 三者均为 `String?`（可空），DB 层**均无默认值**（注意：Collection 模型的 `color` 有默认 `"#0ea5e9"`，但 Link 模型没有）。
 
-**当用户修改 URL 时**：
+---
+
+### 6.1 用户修改 URL：前端层——完整对象提交
+
+**Web 端 `LinkDetails.tsx`** 和 **移动端 `EditLinkSheet.tsx`** 均采用「**完整对象提交**」策略：
+
+1. **状态初始化**：把 `activeLink` 完整对象复制到本地 state
+   - Web：`apps/web/components/LinkDetails.tsx#L58-L63` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkDetails.tsx#L58-L63))
+   - 移动端：`apps/mobile/components/ActionSheets/EditLinkSheet.tsx#L43-L45` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/mobile/components/ActionSheets/EditLinkSheet.tsx#L43-L45))
+
+2. **增量更新**：所有 `onChange` 都用对象展开 `setLink({ ...link, name: text })` 保留其他字段原值
+   - 即使只改 URL，state 里始终保留 `name`、`description`、`icon`、`iconWeight`、`color`、`tags`、`collection` 等所有字段
+
+3. **提交**：直接把整个 `link` 对象序列化为 JSON 请求体
+   - `packages/router/links.tsx#L565-L578` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/packages/router/links.tsx#L565-L578))
+   - `body: JSON.stringify(link)` —— 完整对象，包括 `preview`、`image`、`pdf` 等归档字段（虽然后端会过滤掉）
+
+4. **⚠️ IconPopover reset 的特殊处理**：重置自定义图标时，前端设的是空字符串 `""` 而非 `null`
+   - `apps/web/components/LinkDetails.tsx#L261-L268` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/components/LinkDetails.tsx#L261-L268))
+   ```js
+   reset={() =>
+     setLink({
+       ...link,
+       color: "",        // ← 空字符串，非 null
+       icon: "",         // ← 空字符串，非 null
+       iconWeight: "",   // ← 空字符串，非 null
+     })
+   }
+   ```
+
+---
+
+### 6.2 用户修改 URL：后端层——按请求体重写字段 + 覆盖策略不一致
+
+后端 `updateLinkById` 接收请求体后，**不做 merge（不读 DB 旧值再合并）**，而是按请求体中的字段直接覆盖写 DB，但**不同字段的覆盖策略不一致**：
+
 `apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L150-L163` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/apps/web/lib/api/controllers/links/linkId/updateLinkById.ts#L150-L163))
 
-- ✅ **保留**：`name`、`description`、`icon`、`iconWeight`、`color`、`tags`
-- ❌ **清空**（触发重新处理）：`image`、`pdf`、`readable`、`monolith`、**`preview`**、`lastPreserved`、`indexVersion`
+```js
+data: {
+  name:         data.name || "",                       // ① 兜底：null/undefined → 写 ""
+  url:          data.url,                              // ② 直接用请求体，无兜底
+  description:  data.description || "",                // ① 兜底：null/undefined → 写 ""
+  icon:         data.icon,                             // ② 直接用请求体，无兜底
+  iconWeight:   data.iconWeight,                       // ② 直接用请求体，无兜底
+  color:        data.color,                            // ② 直接用请求体，无兜底
+  image:        oldLink?.url !== data.url ? null : undefined,  // ③ URL 变更 → 清空
+  pdf:          oldLink?.url !== data.url ? null : undefined,  // ③
+  readable:     oldLink?.url !== data.url ? null : undefined,  // ③
+  monolith:     oldLink?.url !== data.url ? null : undefined,  // ③
+  preview:      oldLink?.url !== data.url ? null : undefined,  // ③
+  lastPreserved:oldLink?.url !== data.url ? null : undefined,  // ③
+  indexVersion: null,                                  // ④ 无条件清空（强制重建搜索索引）
+  // ...
+}
+```
+
+三种覆盖策略总结：
+
+| 策略 | 字段 | 行为 |
+|---|---|---|
+| **① 兜底写空字符串** | `name`、`description` | 请求体为 `null/undefined` 时，强制写 `""`（空字符串）到 DB |
+| **② 直接透传请求体** | `url`、`icon`、`iconWeight`、`color` | 请求体里是什么就写什么（`""`、`null`、有效值均可），**不做归一化** |
+| **③ URL 变更才清空** | `image`、`pdf`、`readable`、`monolith`、`preview`、`lastPreserved` | `oldLink.url !== data.url` 时写 `null` 触发重新归档；否则 `undefined`（Prisma 不更新） |
+| **④ 无条件清空** | `indexVersion` | 任何更新都写 `null`，强制下次重建搜索索引 |
+
+---
+
+### 6.3 两层实现的偏差与潜在问题
+
+#### ⚠️ 偏差 1：`icon/iconWeight/color` 的 DB 值可能是 `null` 或 `""`，未归一化
+
+| 场景 | 请求体值 | DB 最终存的值 |
+|---|---|---|
+| 用户从未设置过自定义图标 | `null`（DB 原始值，前端完整对象透传） | `null` |
+| 用户在 IconPopover 点了 Reset | `""`（前端 `reset()` 显式设置） | `""` |
+| 用户从未设置过自定义图标但前端 state 丢失了该字段 | `undefined`（如果 zod 允许） | `undefined` → Prisma 不更新，保留旧值 |
+
+**实际运行效果**：LinkIcon 判断用 `link.icon ?`（truthy 检查），`null` 和 `""` 都是 falsy，UI 行为一致。但 DB 中同时存在两种"空"状态，数据不够干净。
+
+#### ⚠️ 偏差 2：`name/description` 与 `icon/iconWeight/color` 的兜底策略不一致
+
+- `name`、`description`：`|| ""` 兜底，请求体 `null/undefined` → DB 写 `""`
+- `icon`、`iconWeight`、`color`：无兜底，请求体 `null` → DB 写 `null`
+
+如果第三方客户端调用 API 时传 `icon: null`，DB 会存 `null`；传 `icon: ""`，DB 存 `""`。不统一。
+
+#### ⚠️ 偏差 3：前端提交的归档字段被 zod 全部丢弃
+
+前端提交的完整对象里包含了 `preview`、`image`、`pdf`、`readable`、`monolith`、`lastPreserved`、`indexVersion` 等字段，但 `UpdateLinkSchema` 里没有定义这些字段，zod 默认用 strip 模式过滤掉了（不写入 `data` 对象），最终由后端显式决定这些字段怎么写（策略③和④）。
+
+`packages/lib/schemaValidation.ts#L150-L177` ([GitHub](https://github.com/feng0732/linkwarden/blob/task-96/packages/lib/schemaValidation.ts#L150-L177))
+
+#### ✅ 用户手工字段的"保留"实际上是两层共同保证的结果
+
+| 字段 | 为什么修改 URL 时不会丢失 | 层级 |
+|---|---|---|
+| `name` / `description` | 前端完整对象提交带了原值 → 后端 `\|\| ""` 兜底（若原值被意外丢失也会被置空） | 前端为主 |
+| `icon` / `iconWeight` / `color` | 前端完整对象提交带了原值 → 后端直接透传写 DB（**完全依赖前端带值，后端不兜底**） | 前端唯一保障 |
+| `tags` / `collection` | 前端完整对象提交带了原值，后端做 connectOrCreate / connect | 前后端共同 |
+| `indexVersion` | 任何更新都强制清空为 `null`，不属于用户字段 | 后端强制 |
 
 ---
 
