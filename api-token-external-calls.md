@@ -237,33 +237,55 @@ await prisma.accessToken.update({
 
 ## 5. Rate Limit 实现代码事实
 
-### 5.1 已实现的限流
+### 5.1 三处显式限流（基于数据库计数 + 时间窗口）
 
-整个代码库中存在**三处**显式限流逻辑，均基于数据库计数 + 时间窗口：
+整个代码库中存在**三处**显式限流逻辑，均在请求入口处通过数据库计数判断并返回 "Too many requests" 错误。
 
-#### (1) 邮箱验证邮件限流
+#### (1) 邮箱 Magic Link 登录限流
 
-位置：[[...nextauth].ts](./apps/web/pages/api/v1/auth/[...nextauth].ts#L142-L154) 的 Email Provider `sendVerificationRequest` 中
+位置：[[...nextauth].ts#L142-L154](./apps/web/pages/api/v1/auth/[...nextauth].ts#L142-L154)，EmailProvider `id: "email"` 的 `sendVerificationRequest`
 
 ```typescript
-const recentVerificationRequestsCount = await prisma.verificationToken.count({
-  where: {
-    identifier,
-    createdAt: {
-      gt: new Date(new Date().getTime() - 1000 * 60 * 5), // 5 分钟窗口
+const recentVerificationRequestsCount =
+  await prisma.verificationToken.count({
+    where: {
+      identifier,
+      createdAt: {
+        gt: new Date(new Date().getTime() - 1000 * 60 * 5), // 5 minutes
+      },
     },
-  },
-});
+  });
 
 if (recentVerificationRequestsCount >= 4)
   throw Error("Too many requests. Please try again later.");
 ```
 
-**规则**: 同一邮箱 5 分钟内最多发送 4 封验证邮件，超出即拒绝。对 "email"（登录 magic link）和 "invite"（邀请）两个 provider 独立生效。
+**规则**: 同一邮箱 5 分钟内最多发送 4 封 Magic Link 登录邮件，超出即拒绝。
 
-#### (2) 忘记密码邮件限流
+#### (2) 邀请邮件限流
 
-位置：[forgot-password.ts](./apps/web/pages/api/v1/auth/forgot-password.ts#L29-L43)
+位置：[[...nextauth].ts#L192-L203](./apps/web/pages/api/v1/auth/[...nextauth].ts#L192-L203)，EmailProvider `id: "invite"` 的 `sendVerificationRequest`
+
+```typescript
+const recentVerificationRequestsCount =
+  await prisma.verificationToken.count({
+    where: {
+      identifier,
+      createdAt: {
+        gt: new Date(new Date().getTime() - 1000 * 60 * 5), // 5 minutes
+      },
+    },
+  });
+
+if (recentVerificationRequestsCount >= 4)
+  throw Error("Too many requests. Please try again later.");
+```
+
+**规则**: 同一邮箱 5 分钟内最多发送 4 封邀请邮件，超出即拒绝。与 Magic Link 限流逻辑相同，但使用独立的 EmailProvider 实例，计数互不影响。
+
+#### (3) 忘记密码邮件限流
+
+位置：[forgot-password.ts#L29-L43](./apps/web/pages/api/v1/auth/forgot-password.ts#L29-L43)
 
 ```typescript
 const recentPasswordRequestsCount = await prisma.passwordResetToken.count({
@@ -275,6 +297,7 @@ const recentPasswordRequestsCount = await prisma.passwordResetToken.count({
   },
 });
 
+// Rate limit password reset requests
 if (recentPasswordRequestsCount >= 3) {
   return res.status(400).json({
     response: "Too many requests. Please try again later.",
@@ -282,13 +305,19 @@ if (recentPasswordRequestsCount >= 3) {
 }
 ```
 
-**规则**: 同一邮箱 5 分钟内最多请求 3 次密码重置邮件。
+**规则**: 同一邮箱 5 分钟内最多请求 3 次密码重置邮件，超出即拒绝。计数表为 `passwordResetToken`，与 `verificationToken` 独立。
 
-#### (3) 重置密码 Token 消费限流（隐式）
+### 5.2 reset-password 清理旧 token（非限流）
 
-位置：[reset-password.ts](./apps/web/pages/api/v1/auth/reset-password.ts#L71-L78)
+位置：[reset-password.ts#L61-L78](./apps/web/pages/api/v1/auth/reset-password.ts#L61-L78)
 
 ```typescript
+// 将当前使用的 token 置为过期
+await prisma.passwordResetToken.update({
+  where: { token },
+  data: { expires: new Date() },
+});
+
 // Delete tokens older than 5 minutes
 await prisma.passwordResetToken.deleteMany({
   where: {
@@ -300,15 +329,22 @@ await prisma.passwordResetToken.deleteMany({
 });
 ```
 
-**规则**: 重置密码成功后，清理该邮箱 5 分钟以前的所有 passwordResetToken。这不是限流，但客观上限制了同一时间窗口内有效 token 的数量上限。重置密码 token 自身有效期为 24 小时（见 [sendPasswordResetRequest.ts](./apps/web/lib/api/sendPasswordResetRequest.ts#L14-L20)）。
+**性质说明**：这段代码**不是限流**，理由如下：
+1. 仅在密码重置**成功后**执行，不是请求入口处的频率检查
+2. 操作是**删除已超过 5 分钟的旧 token**，不阻止任何新请求
+3. 不返回 "Too many requests" 或任何拒绝响应
+4. 实际作用是数据库垃圾回收，减少过期 token 堆积
 
-### 5.2 Rate Limit 汇总表
+重置密码 token 自身有效期为 24 小时（见 [sendPasswordResetRequest.ts#L14-L20](./apps/web/lib/api/sendPasswordResetRequest.ts#L14-L20)）。
+
+### 5.3 Rate Limit 汇总表
 
 | 维度 | 是否有 Rate Limit | 限流规则 | 实现位置 |
 |------|------------------|---------|---------|
-| 邮箱验证/邀请邮件发送 | ✅ 有 | 5 分钟 ≤ 4 封/邮箱 | `[...nextauth].ts` L142-154 |
-| 忘记密码邮件发送 | ✅ 有 | 5 分钟 ≤ 3 次/邮箱 | `forgot-password.ts` L29-43 |
-| 密码重置 token 消费 | ⚠️ 隐式 | 成功后清理 5 分钟前的旧 token | `reset-password.ts` L71-78 |
+| 邮箱 Magic Link 登录邮件 | ✅ 有 | 5 分钟 ≤ 4 封/邮箱 | `[...nextauth].ts` L142-154 |
+| 邀请邮件 | ✅ 有 | 5 分钟 ≤ 4 封/邮箱 | `[...nextauth].ts` L192-203 |
+| 忘记密码邮件 | ✅ 有 | 5 分钟 ≤ 3 次/邮箱 | `forgot-password.ts` L29-43 |
+| 密码重置成功后清理旧 token | ❌ 非限流 | 垃圾回收：删除 5 分钟前的旧 token | `reset-password.ts` L61-L78 |
 | 登录失败 (brute force) | ❌ 无 | — | — |
 | API 调用频率 (per user) | ❌ 无 | — | — |
 | 邮箱变更请求 | ❌ 无 | — | — |
@@ -317,11 +353,11 @@ await prisma.passwordResetToken.deleteMany({
 | 公共 API 匿名访问 | ❌ 无 | — | — |
 | 搜索 API | ❌ 无 | — | — |
 
-### 5.3 邮箱变更（无限流）
+### 5.4 邮箱变更（无限流）
 
-[updateUserById.ts](./apps/web/lib/api/controllers/users/userId/updateUserById.ts#L104-L135) 中调用 `sendChangeEmailVerificationRequest` 发送邮箱变更验证邮件，但**无任何频率限制**，可被无限调用。
+[updateUserById.ts#L130-L134](./apps/web/lib/api/controllers/users/userId/updateUserById.ts#L130-L134) 中调用 `sendChangeEmailVerificationRequest` 发送邮箱变更验证邮件，但**无任何频率限制**，可被无限调用。
 
-### 5.4 相关容量限制（非 Rate Limit）
+### 5.5 相关容量限制（非 Rate Limit）
 
 虽无时间窗口限流，但存在以下硬限制：
 
@@ -329,7 +365,7 @@ await prisma.passwordResetToken.deleteMany({
 - **分页大小**: `PAGINATION_TAKE_COUNT` 环境变量，默认 50 条/页
 - **文件上传**: `NEXT_PUBLIC_MAX_FILE_BUFFER` 环境变量，默认 10MB
 - **Token 名称长度**: 最多 50 字符（schema 验证）
-- **头像大小**: 1.5MB（硬编码于 [updateUserById.ts](./apps/web/lib/api/controllers/users/userId/updateUserById.ts#L88-L93)）
+- **头像大小**: 1.5MB（硬编码于 [updateUserById.ts#L88-L93](./apps/web/lib/api/controllers/users/userId/updateUserById.ts#L88-L93)）
 
 ## 6. 审计记录代码事实
 
