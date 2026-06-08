@@ -112,33 +112,125 @@ verifyUser({ req, res }) 流程：
 ```
 
 **使用 verifyUser 的 API 端点（30+ 个）包括：**
-- `/api/v1/users/*`、`/api/v1/links/*`（含 POST、PUT、DELETE）、`/api/v1/collections/*`
+- `/api/v1/users/*` GET/PUT/DELETE（不含 POST 注册和 GET /me）
+- `/api/v1/links/*`（所有 POST/PUT/DELETE/GET）
+- `/api/v1/collections/*`（不含 public 路径）
 - `/api/v1/tags/*`、`/api/v1/highlights/*`、`/api/v1/rss/*`
 - `/api/v1/archives/index.ts`（上传新归档）、`/api/v1/archives/[linkId].ts` POST（更新归档）
 - `/api/v1/dashboard/*`、`/api/v1/search/*`、`/api/v1/migration/*`
 - `/api/v1/tokens/*`、`/api/v1/worker/*` 等
 
-### 3.3 verifyToken 与 verifyUser 的关键区别
+### 3.3 四种鉴权函数的订阅检查对比
 
-| 维度 | verifyToken | verifyUser |
-|------|-------------|------------|
-| 校验内容 | JWT token 有效性、过期、撤销状态 | verifyToken + username + emailVerified + **订阅有效性** |
-| 订阅检查 | ❌ 不检查 | ✅ 启用 Stripe 时检查 verifySubscription() |
-| 返回值 | JWT token 对象或错误字符串 | User 对象（含 subscriptions、parentSubscription）或 null |
-| 失败返回 | 不直接返回 HTTP，由调用方处理 | 直接返回 401 JSON 响应 |
+系统中存在四种独立的鉴权函数，订阅检查行为各不相同：
 
-**verifyToken** 定义于 [verifyToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyToken.ts#L9-L36)，仅做 token 层面的会话校验，**完全不涉及订阅状态**。
+| 鉴权函数 | 调用方 | 是否检查订阅 | 检查方式 | 检查完整性 |
+|----------|--------|-------------|----------|-----------|
+| **verifyUser** | 大部分 v1 API | ✅ 是 | verifySubscription() 完整调用 | ⭐⭐⭐⭐⭐ 完整（含试用期、父订阅、过期时间、Stripe 同步） |
+| **verifyByCredentials** | POST /api/v1/session | ✅ 是 | verifySubscription() 完整调用 | ⭐⭐⭐⭐⭐ 同上 |
+| **isAuthenticatedRequest** | POST /api/v1/users（带 invite） | ⚠️ 部分 | 仅判断 `!user.subscriptions` | ⭐ 不完整（不检查 parentSubscription、active、periodEnd、试用期） |
+| **verifyToken** | GET archives、GET preserved/token、GET /users/me、GET avatar | ❌ 否 | 无 | 不检查 |
+| **getToken（next-auth）** | GET/POST /api/v1/payment | ❌ 否 | 无 | 不检查 |
 
-### 3.4 不经过订阅校验的 API 路径
+---
 
-以下路径不调用 `verifyUser`，在订阅降级后仍可访问（前提是满足自身鉴权条件）：
+#### verifyByCredentials：凭证校验中的完整订阅检查
+
+位置 [verifyByCredentials.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyByCredentials.ts#L15-L64)
+
+```typescript
+// 密码匹配成功后，启用 Stripe 时执行完整订阅检查
+if (STRIPE_SECRET_KEY) {
+  const subscribedUser = await verifySubscription(user);
+  if (!subscribedUser) {
+    return null;  // 订阅失效 → 凭证校验失败
+  }
+}
+```
+
+**关键结论：`POST /api/v1/session` （创建 API Token）虽然不调用 `verifyUser`，但通过 `verifyByCredentials` 执行了**完整的** `verifySubscription` 检查。非订阅用户无法通过用户名密码创建 API Session。**
+
+---
+
+#### isAuthenticatedRequest：有缺陷的简化订阅检查
+
+位置 [isAuthenticatedRequest.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/isAuthenticatedRequest.ts#L35-L48)
+
+```typescript
+const findUser = await prisma.user.findFirst({
+  where: { id: userId },
+  include: { subscriptions: true },  // 未 include parentSubscription！
+});
+
+if (STRIPE_SECRET_KEY && findUser && !findUser?.subscriptions) {
+  return null;  // 仅有 subscriptions 记录的判断
+}
+```
+
+**检查缺陷：**
+1. ❌ 未检查 `parentSubscription`（子用户身份会被错误拦截）
+2. ❌ 未检查 `subscription.active` 状态
+3. ❌ 未检查 `currentPeriodEnd` 过期时间
+4. ❌ 未处理试用期逻辑
+5. ❌ 未尝试从 Stripe 同步最新状态
+
+**调用方：** `POST /api/v1/users` 仅当请求包含 `invite` 参数（管理员邀请成员）时使用。
+
+---
+
+#### verifyToken：纯会话校验，完全不检查订阅
+
+**verifyToken** 定义于 [verifyToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyToken.ts#L9-L36)，仅做 token 层面的会话校验：
+- JWT token 是否存在
+- token 是否过期（`token.exp < Date.now() / 1000`）
+- token 是否已被撤销（`accessToken.revoked = true`）
+
+**完全不涉及订阅状态**。使用该函数的路径在订阅降级后，只要会话有效即可继续访问。
+
+---
+
+### 3.4 三类 API 路径的订阅检查分类
+
+根据是否执行订阅检查以及检查的完整性，将所有 API 路径分为三类：
+
+---
+
+#### 第一类：完整订阅检查（经过 verifyUser 或 verifyByCredentials）
+
+| API 路径 | HTTP 方法 | 检查方式 | 降级后能否访问 |
+|----------|-----------|----------|----------------|
+| `/api/v1/users/*`（GET/PUT/DELETE） | 多种 | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/links/*` | 所有 | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/collections/*`（除 public） | 多种 | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/tags/*`、`/api/v1/highlights/*` | 多种 | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/rss/*` | GET/POST/DELETE | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/archives/*`（POST 上传/更新） | POST | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/dashboard/*`、`/api/v1/search/*` | GET | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/migration/*` | POST | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/tokens/*` | GET/POST/DELETE | verifyUser | ❌ 401 非订阅者 |
+| `/api/v1/worker/*` | GET | verifyUser | ❌ 401 非订阅者 |
+| **`/api/v1/session`** | **POST** | **verifyByCredentials → verifySubscription** | ❌ **凭证校验失败（返回 "Invalid credentials"）** |
+
+---
+
+#### 第二类：部分订阅检查（仅 isAuthenticatedRequest）
+
+| API 路径 | HTTP 方法 | 检查方式 | 降级后行为 |
+|----------|-----------|----------|------------|
+| `/api/v1/users`（带 `invite` 参数） | POST | isAuthenticatedRequest | ⚠️ **有缺陷**：子用户可能被误拦截，仅检查 `!user.subscriptions`，不检查 active、过期、试用期 |
+
+---
+
+#### 第三类：完全不检查订阅
 
 | API 路径 | HTTP 方法 | 鉴权方式 | 降级后能否访问 | 说明 |
 |----------|-----------|----------|----------------|------|
-| `/api/v1/archives/[linkId]` | **GET** | verifyToken + resolveAccessibleArchive | ✅ 可以 | 归档读取，不检查订阅 |
-| `/api/v1/preserved/token` | GET | verifyToken + resolveAccessibleArchive | ✅ 可以 | 获取归档临时访问 URL |
-| `/api/v1/preserved/view` | GET | 独立 JWT token（短期签名） | ✅ 可以 | 通过签名 token 直接读归档文件 |
-| `/api/v1/avatar/[id]` | GET | verifyToken（可选） | ✅ 可以 | 读取任意用户头像 |
+| **`GET /api/v1/archives/[linkId]`** | GET | verifyToken + resolveAccessibleArchive | ✅ 可以 | 归档读取，仅受集合权限限制 |
+| **`GET /api/v1/preserved/token`** | GET | verifyToken + resolveAccessibleArchive | ✅ 可以 | 获取归档临时访问 URL |
+| **`GET /api/v1/preserved/view`** | GET | 独立 JWT token（短期签名） | ✅ 可以 | 通过签名 token 直接读归档文件 |
+| **`GET /api/v1/users/me`** | GET | verifyToken | ✅ 可以 | 获取当前用户信息（含 subscription 状态供前端判断） |
+| **`GET /api/v1/avatar/[id]`** | GET | verifyToken（可选） | ✅ 可以 | 读取任意用户头像 |
+| **`GET/POST /api/v1/payment`** | GET/POST | getToken（JWT 有效性） | ✅ 可以 | Stripe 支付结账（必须允许非订阅者访问以完成购买） |
 | `/api/v1/public/collections/[id]` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开集合元数据 |
 | `/api/v1/public/collections/links` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开集合下的链接列表 |
 | `/api/v1/public/collections/tags` | GET | 无（仅检查 isPublic） | ✅ 可以 | 读取公开集合下的标签 |
@@ -147,9 +239,19 @@ verifyUser({ req, res }) 流程：
 | `/api/v1/config` | GET | 无 | ✅ 可以 | 获取实例配置（AI、文件大小等） |
 | `/api/v1/logins` | GET | 无 | ✅ 可以 | 获取登录方式列表 |
 | `/api/v1/getFavicon` | GET | 无 | ✅ 可以 | 代理获取网站 favicon |
-| `/api/v1/session` | POST | 用户名密码校验 | ✅ 可以 | 创建 API Token（供外部集成） |
-| `/api/v1/auth/*` | 多种 | NextAuth 内部 | ✅ 可以 | 登录、注册、忘记密码、邮箱验证 |
-| `/api/v1/webhook` | POST | Stripe 签名校验 | ✅ 可以 | Stripe Webhook（必须始终可用） |
+| `/api/v1/users`（注册，无 invite） | POST | 无 | ✅ 可以 | 新用户注册 |
+| `/api/v1/auth/forgot-password` | POST | 无（邮箱校验） | ✅ 可以 | 发送密码重置邮件 |
+| `/api/v1/auth/verify-email` | POST | 无（token 校验） | ✅ 可以 | 邮箱验证 |
+| `/api/v1/auth/reset-password` | POST | 无（token 校验） | ✅ 可以 | 密码重置 |
+| `/api/v1/auth/[...nextauth]`（Web 登录） | POST | NextAuth Credentials authorize | ✅ 可以登录 | 仅检查密码和邮箱验证，不检查订阅（登录后 API 调用会被 verifyUser 拦截） |
+| `/api/v1/webhook` | POST | Stripe 签名校验 | ✅ 可以 | Stripe Webhook（必须始终可用以接收订阅变更事件） |
+
+**⚠️ 关于 NextAuth Web 登录的重要说明：**
+
+NextAuth Credentials Provider 的 `authorize` 函数（[auth/[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L90-L130)）**仅校验密码和邮箱验证状态，不检查订阅**。这意味着订阅已降级的用户仍可成功登录 Web 界面，但登录后：
+1. 前端 `AuthRedirect` 会立即将其重定向至 `/subscribe`
+2. 所有调用 `verifyUser` 的 API 请求会返回 401
+3. 但用户仍可通过第三类 API 访问归档文件等不受订阅保护的资源
 
 ### 3.5 归档读取权限判定（resolveAccessibleArchive）
 
@@ -528,34 +630,45 @@ HTTP 401
 
 **⚠️ 重要修正：并非所有 `/api/v1/*` 都经过 verifyUser。**
 
-降级后仍可正常调用的 API（不经过订阅校验）：
+降级后仍可正常调用的 API（不经过订阅校验或校验仅在凭证阶段）：
 
 | API | 行为 |
 |-----|------|
 | `GET /api/v1/archives/[linkId]` | ✅ 正常返回归档文件（受集合权限控制） |
 | `GET /api/v1/preserved/token` | ✅ 正常返回归档临时 URL |
 | `GET /api/v1/preserved/view?token=...` | ✅ 正常返回归档文件（独立签名 token） |
+| `GET /api/v1/users/me` | ✅ 正常返回用户信息（含 subscription 状态） |
 | `GET /api/v1/avatar/[id]` | ✅ 正常返回头像文件 |
+| `GET/POST /api/v1/payment` | ✅ 正常可用（Stripe 支付必须允许非订阅者访问） |
 | `GET /api/v1/public/*` | ✅ 正常返回公开集合/链接/用户数据 |
 | `GET /api/v1/config` | ✅ 正常返回实例配置 |
 | `GET /api/v1/logins` | ✅ 正常返回登录方式列表 |
 | `GET /api/v1/getFavicon` | ✅ 正常代理 favicon |
-| `POST /api/v1/session` | ✅ 正常创建 API Token |
+| `POST /api/v1/users`（无 invite 注册） | ✅ 新用户注册正常可用 |
+| `POST /api/v1/auth/forgot-password` | ✅ 正常发送密码重置邮件 |
+| `POST /api/v1/auth/verify-email` | ✅ 邮箱验证正常可用 |
+| `POST /api/v1/auth/reset-password` | ✅ 密码重置正常可用 |
+| `POST /api/v1/auth/[...nextauth]`（Web 登录） | ✅ 登录正常成功（后续 API 调用被拦截） |
 | `POST /api/v1/webhook` | ✅ Stripe Webhook 始终可用 |
-| `/api/v1/auth/*` | ✅ 登录、注册、邮箱验证正常可用 |
+| **`POST /api/v1/session`** | **❌ 凭证校验失败**（通过 verifyByCredentials → verifySubscription 完整检查订阅） |
 
-降级后被拦截的 API（经过 verifyUser）：
+**⚠️ 重要修正：`POST /api/v1/session`（创建 API Token）在降级后无法使用。** 该接口通过 `verifyByCredentials` 调用了完整的 `verifySubscription`，订阅失效会返回 `Invalid credentials` 错误，与密码错误相同。
+
+降级后被拦截的 API（经过 verifyUser 完整检查）：
 
 | API | 行为 |
 |-----|------|
-| `/api/v1/users/*`（除 public） | ❌ 401 非订阅者 |
-| `/api/v1/links/*`（POST/PUT/DELETE） | ❌ 401 非订阅者 |
+| `/api/v1/users/*`（GET/PUT/DELETE，除 /me 和注册） | ❌ 401 非订阅者 |
+| `/api/v1/links/*`（所有方法） | ❌ 401 非订阅者 |
 | `/api/v1/collections/*`（除 public） | ❌ 401 非订阅者 |
 | `/api/v1/tags/*`、`/api/v1/highlights/*` | ❌ 401 非订阅者 |
 | `/api/v1/rss/*` | ❌ 401 非订阅者 |
 | `POST /api/v1/archives/*`（上传/更新归档） | ❌ 401 非订阅者 |
 | `/api/v1/dashboard/*`、`/api/v1/search/*` | ❌ 401 非订阅者 |
 | `/api/v1/migration/*`（数据导入） | ❌ 401 非订阅者 |
+| `/api/v1/tokens/*`（Token 管理） | ❌ 401 非订阅者 |
+| `/api/v1/worker/*` | ❌ 401 非订阅者（且需管理员） |
+| `/api/v1/users`（带 `invite` 参数邀请成员） | ⚠️ 可能被拦截（isAuthenticatedRequest 简化检查有缺陷） |
 
 #### 第三层：Worker 后台任务停止处理
 
@@ -630,6 +743,10 @@ where: {
 |------|------------|---------------------|----------------|
 | **私有归档文件** | GET `/api/v1/archives/[linkId]` | ❌ 否（verifyToken + 集合权限） | ✅ 会话有效 + 集合权限 |
 | **公开归档文件** | GET `/api/v1/archives/[linkId]` | ❌ 否 | ✅ 任何人（通过 isPublic） |
+| **归档临时 URL** | GET `/api/v1/preserved/token` | ❌ 否（verifyToken + 集合权限） | ✅ 会话有效 + 集合权限 |
+| **归档签名访问** | GET `/api/v1/preserved/view?token=...` | ❌ 否（独立签名 token） | ✅ 签名 token 有效即可 |
+| **当前用户信息** | GET `/api/v1/users/me` | ❌ 否（仅 verifyToken） | ✅ 会话有效即可 |
+| **支付结账** | GET/POST `/api/v1/payment` | ❌ 否（仅 getToken） | ✅ 会话有效即可 |
 | **私有链接元数据** | GET `/api/v1/links/[id]`、GET `/api/v1/links` | ✅ 是 | ❌ 401 非订阅者 |
 | **公开链接元数据** | GET `/api/v1/public/links/[id]` | ❌ 否 | ✅ 任何人 |
 | **私有集合数据** | GET `/api/v1/collections/[id]` | ✅ 是 | ❌ 401 非订阅者 |
@@ -643,9 +760,11 @@ where: {
 
 | 场景 | 错误信息 | HTTP 状态码 |
 |------|----------|------------|
-| **非订阅者（全局 API 拦截）** | `You are not a subscriber, feel free to reach out to us at support@linkwarden.app if you think this is an issue.` | 401 |
+| **非订阅者（verifyUser 全局拦截）** | `You are not a subscriber, feel free to reach out to us at support@linkwarden.app if you think this is an issue.` | 401 |
+| **非订阅者（verifyByCredentials 创建 Session）** | `Invalid credentials. You might need to reset your password if you're sure you already signed up with the current username/email.` | 400 |
 | **链接数超限（hasPassedLimit）** | `Your subscription has reached the maximum number of links allowed.` | 400 |
 | **归档链接数超限（verifyLinkLimit）** | `Each collection owner can only have a maximum of ${MAX_LINKS_PER_USER} Links.` | 400 |
+| **归档集合无权限** | `You don't have access to this collection.` | 401 |
 | **RSS 订阅超限** | `You have reached the limit of ${RSS_SUBSCRIPTION_LIMIT_PER_USER} RSS subscriptions.` | 403 |
 | **文件大小超限** | `Sorry, we couldn't process your file. Please ensure it doesn't exceed ${maxMB}MB.` | 400 |
 | **文件类型不支持** | `Sorry, we couldn't process your file. Please ensure it's in [${allowedTypes}] format and doesn't exceed ${maxMB}MB.` | 400 |
@@ -662,14 +781,21 @@ where: {
 | 模块 | 文件路径 |
 |------|----------|
 | 数据模型 | [schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/packages/prisma/schema.prisma) |
-| 全局 API 订阅拦截 | [verifyUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyUser.ts) |
-| 订阅有效性判定 | [verifySubscription.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/verifySubscription.ts) |
+| 全局 API 订阅拦截（完整） | [verifyUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyUser.ts) |
+| 凭证校验中的订阅检查（完整） | [verifyByCredentials.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyByCredentials.ts) |
+| 简化订阅检查（有缺陷） | [isAuthenticatedRequest.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/isAuthenticatedRequest.ts) |
+| 纯会话校验（无订阅检查） | [verifyToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/verifyToken.ts) |
+| 订阅有效性判定（核心） | [verifySubscription.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/verifySubscription.ts) |
 | Stripe 远程查询订阅 | [checkSubscriptionByEmail.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/checkSubscriptionByEmail.ts) |
 | 完整配额检查（链接/席位） | [verifyCapacity.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/packages/lib/verifyCapacity.ts) |
+| 归档权限判定（无订阅检查） | [resolveAccessibleArchive.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts) |
+| 归档读取 API（GET，无订阅检查） | [archives/[linkId].ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/archives/%5BlinkId%5D.ts) |
+| 获取当前用户（无订阅检查） | [users/me.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/users/me.ts) |
+| 支付结账（无订阅检查） | [payment/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/payment/index.ts) |
 | 订阅变更处理 | [handleSubscription.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/handleSubscription.ts) |
 | Stripe Webhook 端点 | [webhook/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/webhook/index.ts) |
 | Stripe 席位更新 | [updateSeats.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/stripe/updateSeats.ts) |
-| 支付结账 | [paymentCheckout.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/paymentCheckout.ts) |
+| 支付结账流程 | [paymentCheckout.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/paymentCheckout.ts) |
 | 获取用户（含订阅状态） | [getUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/controllers/users/userId/getUserById.ts) |
 | 创建新链接 | [postLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/lib/api/controllers/links/postLink.ts) |
 | 归档上传（含简化配额检查） | [archives/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/92-linkwarden/apps/web/pages/api/v1/archives/index.ts) |
