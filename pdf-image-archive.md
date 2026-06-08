@@ -152,15 +152,78 @@ format → suffix 的映射在 `apps/web/lib/shared/getSuffixFromFormat.ts`。
 | 字段 | 类型 | 含义 | 状态值（三态） |
 |---|---|---|---|
 | `type` | String | 链接类型 | `url` / `pdf` / `image` |
-| `preview` | String? | 缩略图路径 | `null`（待生成/队列中）/ 路径字符串（成功）/ `"unavailable"`（失败或不支持） |
+| `preview` | String? | 缩略图路径（仅用于前端判定是否展示） | `null`（待生成/队列中）/ 路径字符串（成功）/ `"unavailable"`（失败或不支持） |
 | `image` | String? | 截图路径 | 同上 |
 | `pdf` | String? | PDF 路径 | 同上 |
 | `monolith` | String? | HTML 归档路径 | 同上 |
 | `readable` | String? | Readability JSON 路径 | 同上 |
 | `metaDescription` | String? | 页面 meta description（截取前 500 字符） | — |
-| `lastPreserved` | DateTime? | 最近一次归档时间戳 | `null`（待处理，会被 worker 拾取）/ 时间戳（已处理完成，无论成败） |
+| `lastPreserved` | DateTime? | 最近一次归档时间戳 | `null`（待处理，会被 worker 拾取的必要条件之一）/ 时间戳（已处理完成，无论成败） |
 | `indexVersion` | Int? | 搜索索引版本 | 归档完成后置 null 触发重新索引 |
-| `clientSide` | Boolean | 是否为用户手动上传 | 重跑时会被重置为 false |
+| `clientSide` | Boolean | 是否为用户手动上传（纯标记，Worker 不读取此字段） | 创建 Link 时默认 false；手动上传文件后置 true；手动重跑（PUT /archive）重置为 false |
+| `url` | String? | 原始 URL | 非 null → Worker 可参与调度；null → 用户纯上传文件，无原始链接，Worker 永远不处理 |
+
+### 4.4 两条手动上传路径的全链路对比
+
+系统存在两条手动上传路径，它们对 `url`、`lastPreserved`、`clientSide`、`preview` 四个关键字段的处理存在本质差异，也决定了 Worker 是否会后续接管。
+
+#### 路径一：新建上传（UploadFileModal → useUploadFile）
+
+用户从顶部导航 "Upload File" 入口（`apps/web/components/ModalContent/UploadFileModal.tsx`）上传一个 PDF/PNG/JPG 来创建 Link。前端 Hook `packages/router/links.tsx` L940-L977 实现为**两步串行调用**：
+
+```
+Step 1: POST /api/v1/links（创建 Link 记录，不包含文件）
+  └─ 后端: apps/web/lib/api/controllers/links/postLink.ts
+Step 2: POST /api/v1/archives/{newLinkId}?format={format}（上传真实文件）
+  └─ 后端: apps/web/pages/api/v1/archives/[linkId].ts
+```
+
+**Step 1 字段状态（postLink.ts）：**
+- `url` → **null**（上传文件场景不传 url 参数，L106 `url: link.url?.trim() || null`）
+- `type` → 由前端根据文件 MIME 推断（`getLinkTypeFromFormat`）
+- `lastPreserved` → **保持 null**（L138 `!shouldPreserveUrl && link.url` 条件：url 为 falsy，条件整体为 false，不会提前写入 unavailable）
+- `image/pdf/monolith/readable/preview` → **全部 null**
+- `clientSide` → 默认 false
+
+**Step 2 字段状态（archives/[linkId].ts POST）：**
+- 真正写文件到 `archives/{collectionId}/{linkId}{suffix}`
+- 若上传图片（isImage=true）：L247-L251 调用 `generatePreview`，由其内部决定写 preview 路径/"unavailable"/留 null（异常 catch 分支不兜底，永久 null）
+- 若上传 PDF（isPDF=true）：L265 `preview: "unavailable"` 强制写
+- L277 `clientSide: true` 标记为手动上传
+- `lastPreserved` → **不碰，保持 null**（但 Worker 也不会处理，因为 url=null）
+
+**Worker 是否接管？ ❌ 不会。** Worker 待处理条件（`apps/worker/lib/getLinkBatchFairly.ts` L36-L37）：
+```typescript
+{ url: { not: null }, lastPreserved: null }
+```
+新建上传的 Link `url=null`，被永久排除在 Worker 调度范围之外。
+
+#### 路径二：已有链接上传（PreservedFormatRow → POST archives/[linkId]）
+
+用户在 Link 详情页手动上传归档文件来替换 Worker 自动生成的内容（或填补 Worker 未生成的格式）。只有一个 API 调用：`POST /api/v1/archives/{linkId}?format={format}&preview={true|false}`（同一路由 `apps/web/pages/api/v1/archives/[linkId].ts` POST 分支）。
+
+**字段状态：**
+- `url` → 非 null（已有 Link，Worker 之前处理过或正待处理）
+- 上传图片 → `generatePreview` 同上
+- 上传 PDF → `preview: "unavailable"` 同上
+- `clientSide: true`（会覆盖之前的 false）
+- `lastPreserved` → 不碰，保持原值
+- `image/pdf/monolith` → 对应格式写入路径
+
+**Worker 是否接管？ ⚠️ 视 `lastPreserved` 和 `url` 而定。**
+- 如果上传前该 Link `lastPreserved` 为时间戳（已处理过）→ Worker 不会再拾取
+- 如果上传前该 Link `lastPreserved` 为 null（仍在队列中）→ Worker 仍会调度并**覆盖**用户手动上传的内容（因为 archiveHandler 中 L122 `if (linkType === "image" && !link.image)` 或 L125 `if (linkType === "pdf" && !link.pdf)` 条件可能已被用户上传满足为 false，但 HTML 类型仍会继续处理）。这是一个潜在的冲突：用户上传后如果 Worker 尚未完成，则自动归档会再次写入同名文件覆盖用户上传。
+
+#### 两条路径字段对比表
+
+| 字段 | 新建上传（Step1+Step2） | 已有链接上传 |
+|---|---|---|
+| `url` | null | 非 null（保留原值） |
+| `lastPreserved` | Step1: null → Step2: 不变（仍 null） | 不碰，保持原值 |
+| `clientSide` | Step1: false → Step2: true | 直接写 true |
+| `preview`（图片） | generatePreview 内部决定（路径/"unavailable"/永久 null） | 同上 |
+| `preview`（PDF） | 强制 "unavailable" | 强制 "unavailable" |
+| Worker 会否接管 | ❌ url=null 永远不调度 | ⚠️ 取决于 lastPreserved：null=可能接管覆盖；时间戳=不再接管 |
 
 ---
 
@@ -325,7 +388,45 @@ link.preview === "unavailable"               → 渲染 404 "Format not availabl
 
 跳转兜底：`packages/lib/getFormatBasedOnPreference.ts` 中如果目标格式值为 null 或 `"unavailable"`，返回 null，前端回退到原始 URL。
 
-### 5.8 现有缺陷汇总
+### 5.8 前端缩略图展示路径的关键纠正：DB 字段 ≠ 文件路径
+
+**一个极易混淆的设计：`link.preview` 字段存储的值**只用于**前端三态判定**（是否展示 <Image> 组件），**不用于实际文件读取的路径拼接**。真正读取文件时走的是**约定路径**而非 DB 存储值。
+
+**LinkCard 缩略图展示链路**（`apps/web/components/LinkViews/LinkComponents/LinkCard.tsx` L101-L124）：
+
+```tsx
+{formatAvailable(link, "preview") ? (
+  <Image
+    src={`/api/v1/archives/${link.id}?format=${ArchivedFormat.jpeg}&preview=true&updatedAt=${link.updatedAt}`}
+    ...
+  />
+) : link.preview === "unavailable" ? (
+  <div className="bg-gray-50 ..."></div>  // 灰色占位
+) : (
+  <div className="skeleton ..."></div>      // loading 骨架
+)}
+```
+
+**请求实际文件的后端路由**（`apps/web/pages/api/v1/archives/[linkId].ts` L85-L128 `handleGet`）：
+1. 解析 query：`linkId`、`format`、`preview=true|false`
+2. 调 `resolveAccessibleArchive` 做权限校验并拼接物理路径
+
+**路径拼接逻辑**（`apps/web/lib/api/archives/resolveAccessibleArchive.ts` L70-L72）：
+```typescript
+const filePath = isPreview
+  ? `archives/preview/${collection.id}/${linkId}.jpeg`
+  : `archives/${collection.id}/${linkId + suffix}`;
+```
+
+核心结论：
+- **preview 文件路径完全由约定生成**：`archives/preview/{collectionId}/{linkId}.jpeg`，固定为 jpeg 格式，不依赖 DB 中 `link.preview` 存储的字符串
+- **非 preview 文件路径同理**：`archives/{collectionId}/{linkId}{suffix}`，suffix 由 format 参数查表得到（`apps/web/lib/shared/getSuffixFromFormat.ts`）
+- `link.preview` DB 字段**唯一作用**是供 `formatAvailable(link, "preview")` 判定——值是否存在且 ≠ "unavailable"
+- 副作用：如果 someone 手动把 `link.preview` 改成了一个随意字符串但磁盘上文件不存在，`formatAvailable` 会判定为 true，前端会发起请求，后端 `readFile` 会返回 404，此时 `<Image>` 的 `onError` 会隐藏该元素（LinkCard L110-L113）
+
+同理，`image`/`pdf`/`monolith`/`readable` 等其他归档字段也只用于判定存在性，实际访问路径由 `format` 和 `linkId` 约定拼接。
+
+### 5.9 现有缺陷汇总
 
 | 缺陷 | 影响 | 触发场景 |
 |---|---|---|
@@ -333,6 +434,7 @@ link.preview === "unavailable"               → 渲染 404 "Format not availabl
 | allBroken 不处理 preview 单独失败 | preview 永远 unavailable，除非手动单链接重跑 | 缩略图生成挂了但截图/PDF 都好 |
 | og:image 超限后 fallback 可能做无用功 | generatePreview 已写 "unavailable"，fallback 仍再截图一次 | og:image 是超大图且压缩后仍超限 |
 | finally 收敛无法区分失败原因 | 用户看不到是"解码失败"还是"文件超限"还是"网络错误" | 所有 worker 失败路径 |
+| 已有链接上传与 Worker 并发冲突 | 用户上传的文件可能被尚未完成的 Worker 归档覆盖 | 用户在 Worker 处理中的链接上手动上传归档 |
 
 ---
 
@@ -486,7 +588,16 @@ Monolith 格式有额外限制：如果配置了 `NEXT_PUBLIC_USER_CONTENT_DOMAI
 4. 取完后更新这些用户的 `lastPickedAt = now`
 5. 批次大小由 `ARCHIVE_TAKE_COUNT` 控制（默认 5 条）
 
-待处理链接的判定条件：`url != null AND lastPreserved = null`。
+**待处理链接的判定条件（L36-L37 baseLinkWhere）**：
+```typescript
+{ url: { not: null }, lastPreserved: null }
+```
+
+关键含义：
+- **`url != null` 是硬门槛**：用户通过 UploadFileModal 新建上传的 Link（url=null）永远不会被 Worker 调度，完全依赖客户端上传完成。这也是新建上传路径与已有链接上传路径的本质分界线。
+- **`clientSide` 字段完全不参与 Worker 调度判定**：在 `apps/worker/` 整个目录下搜索不到任何 `clientSide` 引用，该字段只是前端/API 层的一个纯标记，用于区分"自动归档生成"与"用户手动上传"，不影响调度。
+- 已有链接上手动上传（clientSide 被置为 true）后，如果 `lastPreserved` 仍为 null 且 `url != null`，Worker **仍会调度**，可能覆盖用户上传的文件。
+- `type` 字段也不参与调度筛选，调度后由 `determineLinkType` 和 `linkType` 再做分流。
 
 ### 9.2 并发与浏览器生命周期
 
