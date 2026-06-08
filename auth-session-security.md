@@ -2,16 +2,16 @@
 
 ## 一、整体架构概览
 
-Linkwarden 采用 **Next.js + NextAuth.js (next-auth v4)** 作为认证框架，数据库使用 PostgreSQL + Prisma ORM。整体认证体系分为多个层次，核心文件分布如下：
+Linkwarden 采用 **Next.js + NextAuth.js (next-auth v4)** 作为认证框架，数据库使用 PostgreSQL + Prisma ORM。整体认证体系分为多个层次，核心文件（仓库相对路径）分布如下：
 
-| 层次 | 关键文件（仓库相对路径） |
+| 层次 | 关键文件 |
 |------|---------|
-| NextAuth 主配置 | [apps/web/pages/api/v1/auth/[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/auth/[...nextauth].ts) |
-| Token 校验层 | [apps/web/lib/api/verifyToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/verifyToken.ts) |
-| 用户校验层 | [apps/web/lib/api/verifyUser.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/verifyUser.ts) |
-| 请求认证层 | [apps/web/lib/api/isAuthenticatedRequest.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/isAuthenticatedRequest.ts) |
-| 凭据校验 | [apps/web/lib/api/verifyByCredentials.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/verifyByCredentials.ts) |
-| 数据模型 | [packages/prisma/schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/packages/prisma/schema.prisma) |
+| NextAuth 主配置 | `apps/web/pages/api/v1/auth/[...nextauth].ts` |
+| Token 校验层 | `apps/web/lib/api/verifyToken.ts` |
+| 用户校验层 | `apps/web/lib/api/verifyUser.ts` |
+| 请求认证层 | `apps/web/lib/api/isAuthenticatedRequest.ts` |
+| 凭据校验 | `apps/web/lib/api/verifyByCredentials.ts` |
+| 数据模型 | `packages/prisma/schema.prisma` |
 
 ---
 
@@ -22,7 +22,7 @@ Linkwarden 采用 **Next.js + NextAuth.js (next-auth v4)** 作为认证框架，
 NextAuth 配置采用 **JWT 策略**（非数据库 session），有效期 30 天：
 
 ```typescript
-// apps/web/pages/api/v1/auth/[...nextauth].ts#L1316-L1319
+// apps/web/pages/api/v1/auth/[...nextauth].ts
 session: {
   strategy: "jwt",
   maxAge: 30 * 24 * 60 * 60, // 30 days
@@ -39,7 +39,7 @@ session: {
 
 ### 2.3 认证流程与关键回调
 
-在 [apps/web/pages/api/v1/auth/[...nextauth].ts#L1325-L1511](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/auth/[...nextauth].ts#L1325-L1511) 中定义了三个核心回调：
+在 `apps/web/pages/api/v1/auth/[...nextauth].ts` 中定义了三个核心回调：
 
 #### `signIn` 回调（登录时触发）
 - 校验用户邮箱验证状态
@@ -60,8 +60,8 @@ session: {
 
 移动端不使用 NextAuth cookie 机制，而是通过独立 API 创建长期会话 token：
 
-- 入口 API：[apps/web/pages/api/v1/session/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/session/index.ts)
-- 创建逻辑：[apps/web/lib/api/controllers/session/createSession.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/session/createSession.ts)
+- 入口 API：`apps/web/pages/api/v1/session/index.ts`
+- 创建逻辑：`apps/web/lib/api/controllers/session/createSession.ts`
 - 有效期：200 年（模拟永久），标记 `isSession: true`
 - 移动端存储：使用 `expo-secure-store` 加密存储 token 和 instance URL
 - 移动端认证请求：通过 `Authorization: Bearer <token>` 头发送
@@ -85,7 +85,7 @@ session: {
 
 ### 3.2 API Access Token 生命周期
 
-创建入口：[apps/web/pages/api/v1/tokens/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/tokens/index.ts) → [apps/web/lib/api/controllers/tokens/postToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/tokens/postToken.ts)
+创建入口：`apps/web/pages/api/v1/tokens/index.ts` → `apps/web/lib/api/controllers/tokens/postToken.ts`
 
 创建流程：
 1. 校验 token 名称唯一性（同用户下未撤销的 token 不能重名）
@@ -94,7 +94,7 @@ session: {
 4. 存储 JTI（而非完整 token）到 `AccessToken` 表，关联 `userId`
 5. 仅在创建时返回完整 JWT 给用户（此后不可再获取明文）
 
-撤销入口：[apps/web/pages/api/v1/tokens/[id].ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/tokens/[id].ts) → [apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts)
+撤销入口：`apps/web/pages/api/v1/tokens/[id].ts` → `apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts`
 
 撤销方式：**软删除**，将 `revoked` 字段设为 `true`（而非物理删除），便于审计。
 
@@ -102,8 +102,8 @@ session: {
 
 用于保护用户归档内容（快照、PDF 等），实现文件在独立域名上的安全短期访问：
 
-- 创建：[apps/web/lib/api/preserved/createPreservedFormatUrl.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/preserved/createPreservedFormatUrl.ts)
-- 校验：[apps/web/pages/api/v1/preserved/view.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/preserved/view.ts)
+- 创建：`apps/web/lib/api/preserved/createPreservedFormatUrl.ts`
+- 校验：`apps/web/pages/api/v1/preserved/view.ts`
 - 核心安全设计：
   - 必须通过 `NEXT_PUBLIC_USER_CONTENT_DOMAIN` 配置的独立域名访问
   - 宿主头校验：`getRequestHost()` 验证请求 Host 匹配配置域名，防止 Host Header 攻击
@@ -117,14 +117,14 @@ session: {
 
 ### 4.1 敏感操作的密码二次校验
 
-在 [apps/web/lib/api/controllers/users/userId/updateUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts) 和 [apps/web/lib/api/controllers/users/userId/deleteUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts) 中，敏感操作强制要求密码验证：
+在 `apps/web/lib/api/controllers/users/userId/updateUserById.ts` 和 `apps/web/lib/api/controllers/users/userId/deleteUserById.ts` 中，敏感操作强制要求密码验证：
 
 | 操作 | 密码校验方式 | 代码位置 |
 |-----|-------------|---------|
-| **修改邮箱** | `bcrypt.compareSync(data.password, user.password)` | [apps/web/lib/api/controllers/users/userId/updateUserById.ts#L104-L134](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts#L104-L134) |
-| **修改密码** | 校验旧密码 + 新密码 ≥8 字符 + 新旧不可相同 | [apps/web/lib/api/controllers/users/userId/updateUserById.ts#L139-L166](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts#L139-L166) |
-| **删除账号** | 必须验证当前密码（SSO 用户需先设密码） | [apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L39-L60](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L39-L60) |
-| **管理员删除子用户** | 无需密码，但需校验父子订阅关系 | [apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L61-L104](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L61-L104) |
+| **修改邮箱** | `bcrypt.compareSync(data.password, user.password)` | `apps/web/lib/api/controllers/users/userId/updateUserById.ts#L104-L134` |
+| **修改密码** | 校验旧密码 + 新密码 ≥8 字符 + 新旧不可相同 | `apps/web/lib/api/controllers/users/userId/updateUserById.ts#L139-L166` |
+| **删除账号** | 必须验证当前密码（SSO 用户需先设密码） | `apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L39-L60` |
+| **管理员删除子用户** | 无需密码，但需校验父子订阅关系 | `apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L61-L104` |
 
 **注意**：OAuth/SSO 登录用户默认无密码，执行上述操作前必须通过"忘记密码"流程设置密码，否则直接拒绝。
 
@@ -139,9 +139,9 @@ session: {
 
 | 操作 | 限制 | 窗口 | 代码位置 |
 |-----|------|------|---------|
-| 邮箱验证请求 | ≤ 4 次 | 5 分钟 | [apps/web/pages/api/v1/auth/[...nextauth].ts#L143-L154](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/auth/[...nextauth].ts#L143-L154) |
-| 邀请邮件请求 | ≤ 4 次 | 5 分钟 | [apps/web/pages/api/v1/auth/[...nextauth].ts#L192-L203](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/auth/[...nextauth].ts#L192-L203) |
-| 密码重置请求 | ≤ 3 次 | 5 分钟 | [apps/web/pages/api/v1/auth/forgot-password.ts#L29-L43](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/auth/forgot-password.ts#L29-L43) |
+| 邮箱验证请求 | ≤ 4 次 | 5 分钟 | `apps/web/pages/api/v1/auth/[...nextauth].ts#L143-L154` |
+| 邀请邮件请求 | ≤ 4 次 | 5 分钟 | `apps/web/pages/api/v1/auth/[...nextauth].ts#L192-L203` |
+| 密码重置请求 | ≤ 3 次 | 5 分钟 | `apps/web/pages/api/v1/auth/forgot-password.ts#L29-L43` |
 
 ### 4.4 请求认证分层
 
@@ -224,7 +224,7 @@ session: {
 
 ---
 
-## 六、账号删除后的访问收敛（详细边界分析）
+## 六、账号删除后的访问收敛（详细边界分析与代码证据）
 
 ### 6.1 数据库级级联删除
 
@@ -240,11 +240,11 @@ Subscription     @relation(..., onDelete: Cascade)
 ...
 ```
 
-级联删除涉及的全部模型：`Account`、`Collection`、`Tag`、`Link`、`Highlight`、`UsersAndCollections`、`AccessToken`、`Subscription`、`RssSubscription`、`DashboardSection`、`WhitelistedUser`、`AppMigration(无关联)` 等。
+级联删除涉及的全部模型：`Account`、`Collection`、`Tag`、`Link`、`Highlight`、`UsersAndCollections`、`AccessToken`、`Subscription`、`RssSubscription`、`DashboardSection`、`WhitelistedUser` 等。
 
 ### 6.2 应用级事务删除
 
-在 [apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L107-L205](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L107-L205) 中，使用 Prisma `$transaction`（20秒超时）执行以下清理：
+`apps/web/lib/api/controllers/users/userId/deleteUserById.ts#L107-L205` 中使用 Prisma `$transaction`（20秒超时）执行以下清理：
 
 1. **搜索索引清理**：从 Meilisearch 删除所有用户链接文档
 2. **文件系统清理**：
@@ -255,24 +255,43 @@ Subscription     @relation(..., onDelete: Cascade)
    - 可选项发送取消原因邮件
 4. **用户记录删除**：最后 `prisma.user.delete()`
 
+---
+
 ### 6.3 归档读取（GET /v1/archives/[linkId]）拦截边界
 
-**代码位置**：[apps/web/pages/api/v1/archives/[linkId].ts#L85-L128](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/archives/[linkId].ts#L85-L128)
+**代码证据**：`apps/web/pages/api/v1/archives/[linkId].ts#L85-L128`
 
-**调用链**：
+**调用链源码证据**：
+```typescript
+// apps/web/pages/api/v1/archives/[linkId].ts
+async function handleGet(req: NextApiRequest, res: NextApiResponse) {
+  const linkId = Number(req.query.linkId);
+  const format = Number(req.query.format);
+  const isPreview = Boolean(req.query.preview);
+
+  // Verify token => If present, get user ID
+  const token = await verifyToken({ req });          // 第一步：只做 token 校验
+  const userId = typeof token === "string" ? undefined : token?.id;
+
+  const resolvedArchive = await resolveAccessibleArchive({  // 第二步：查 DB 权限
+    linkId, format, isPreview, userId,
+  });
+  // ...
+}
 ```
-verifyToken() → 可选获取 userId
-  → resolveAccessibleArchive()
-      → prisma.collection.findFirst({
-           where: {
-             links: { some: { id: linkId } },
-             OR: [
-               { ownerId: userId || -1 },        // 私有：所有者
-               { members: { some: { userId } } }, // 私有：成员
-               { isPublic: true }                 // 公开集合
-             ]
-           }
-         })
+
+`resolveAccessibleArchive` 内部查询（见 `apps/web/lib/api/archives/resolveAccessibleArchive.ts`）：
+```typescript
+prisma.collection.findFirst({
+  where: {
+    links: { some: { id: linkId } },
+    OR: [
+      { ownerId: userId || -1 },        // 私有：所有者匹配
+      { members: { some: { userId } } }, // 私有：成员匹配
+      { isPublic: true }                 // 公开集合
+    ]
+  }
+});
 ```
 
 **用户删除后的实际拦截**：
@@ -280,111 +299,176 @@ verifyToken() → 可选获取 userId
 |------|---------|----------|
 | 读取自己的私有归档 | Collection 已级联删除 → findFirst 返回 null | 401 "You don't have access to this collection." |
 | 读取公开集合归档 | Collection 已级联删除 → findFirst 返回 null | 401 "You don't have access to this collection." |
-| 作为成员读取他人归档 | 成员关系 UsersAndCollections 已级联删除，且 Collection 可能仍存在（他人的）→ 视具体权限 | 取决于集合所有者是否删除 |
+| 作为成员读取他人归档 | 成员关系 UsersAndCollections 已级联删除，若集合属他人且公开则可访问 | 取决于集合所有者是否删除 |
 
-**注意**：磁盘上的归档文件在 deleteUserById 事务中被 `removeFolder()` 删除，即使数据库绕过，文件本身也已不存在。
+**文件层兜底**：磁盘上的归档文件在 deleteUserById 事务中被 `removeFolder()` 物理删除，即使数据库绕过，文件本身也已不存在。
+
+---
 
 ### 6.4 头像读取（GET /v1/avatar/[id]）拦截边界
 
-**代码位置**：[apps/web/pages/api/v1/avatar/[id].ts#L6-L40](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/avatar/[id].ts#L6-L40)
+**代码证据**：`apps/web/pages/api/v1/avatar/[id].ts#L6-L40`
 
-**关键逻辑**：
+**调用链源码证据**：
 ```typescript
-const token = await verifyToken({ req });        // 可选，仅用于获取请求者 userId
-const userId = typeof token === "string" ? undefined : token?.id;
+// apps/web/pages/api/v1/avatar/[id].ts
+export default async function Index(req: NextApiRequest, res: NextApiResponse) {
+  const queryId = Number(req.query.id);
 
-// 注意：userId 完全没有被使用！实际只查 URL 里的 queryId
-const targetUser = await prisma.user.findUnique({ where: { id: queryId } });
-if (!targetUser) return 400 "File inaccessible.";
+  if (!queryId) return res.status(401).send("Invalid parameters.");
 
-// 直接读文件
-readFile(`uploads/avatar/${queryId}.jpg`);
+  // verifyToken 仅用于"可选地"获取请求者 userId——注意该 userId 实际上未被使用
+  const token = await verifyToken({ req });
+  const userId = typeof token === "string" ? undefined : token?.id;
+
+  if (req.method === "GET") {
+    // 实际只查 URL 路径里的目标用户 queryId
+    const targetUser = await prisma.user.findUnique({
+      where: { id: queryId },
+    });
+
+    if (!targetUser) {                       // ← 关键拦截点
+      return res.status(400).send("File inaccessible.");
+    }
+
+    const { file, contentType, status } = await readFile(
+      `uploads/avatar/${queryId}.jpg`
+    );
+    return res.setHeader("Content-Type", contentType).status(status as number).send(file);
+  }
+}
 ```
 
 **用户删除后的实际拦截**：
 | 场景 | 拦截机制 | HTTP 状态 |
 |------|---------|----------|
-| 读取已删除用户的头像 | targetUser = prisma.user.findUnique 返回 null | 400 "File inaccessible." |
-| 未登录用户读取存在用户头像 | targetUser 存在 → 直接返回头像文件 | 200 |
-| 已登录用户读取他人头像 | targetUser 存在 → 直接返回头像文件 | 200 |
+| 读取已删除用户的头像 | targetUser = prisma.user.findUnique 返回 null → 命中 `if (!targetUser)` | 400 "File inaccessible." |
+| 未登录用户读取存在用户头像 | targetUser 存在 → 直接返回头像文件（设计行为） | 200 |
+| 已登录用户读取他人头像 | targetUser 存在 → 直接返回头像文件（设计行为） | 200 |
 
-**补充**：磁盘头像文件在 deleteUserById 事务中被 `removeFile()` 删除，双重保险。
+**文件层兜底**：磁盘头像文件在 deleteUserById 事务中被 `removeFile()` 物理删除，双重保险。
 
-**安全结论**：头像 API **不需要认证即可读取任意存在用户的头像**（这是设计行为，用于公开页面显示用户头像）。用户删除后通过 targetUser 存在性检查 + 文件删除被收敛。
+**安全结论**：头像 API **不需要认证即可读取任意存在用户的头像**（用于公开页面展示头像的设计行为）。用户删除后通过 targetUser 存在性检查 + 文件删除被收敛。
+
+---
 
 ### 6.5 公开归档/公开数据访问拦截边界
 
 #### 6.5.1 公开集合元数据（GET /v1/public/collections/[id]）
 
-**代码位置**：[apps/web/lib/api/controllers/public/collections/getPublicCollection.ts#L3-L32](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/public/collections/getPublicCollection.ts#L3-L32)
+**代码证据**：`apps/web/lib/api/controllers/public/collections/getPublicCollection.ts#L3-L32`
 
+**源码证据**：
 ```typescript
-prisma.collection.findFirst({
-  where: { id, isPublic: true },
-  include: { members, _count: { select: { links: true } } }
-});
+// apps/web/lib/api/controllers/public/collections/getPublicCollection.ts
+export default async function getPublicCollection(id: number) {
+  const collection = await prisma.collection.findFirst({
+    where: {
+      id,
+      isPublic: true,    // ← 公开过滤 + 记录存在性
+    },
+    include: { members: { include: { user: { select: { ... } } } }, _count: { select: { links: true } } }
+  });
+  if (collection) return { response: collection, status: 200 };
+  else return { response: "Collection not found.", status: 400 };
+}
 ```
 
-**用户删除后**：Collection 被 `onDelete: Cascade` 删除 → findFirst 返回 null → 400 "Collection not found."
+**用户删除后**：Collection 被 `onDelete: Cascade` 删除 → findFirst 返回 null → **400** "Collection not found."
+
+---
 
 #### 6.5.2 公开集合链接列表（GET /v1/public/collections/links）
 
-**代码位置**：[apps/web/pages/api/v1/public/collections/links/index.ts#L5-L37](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/public/collections/links/index.ts#L5-L37)
+**代码证据**：`apps/web/pages/api/v1/public/collections/links/index.ts#L5-L37`
 
-调用 `searchLinks({ publicOnly: true })`，内部查询 Collection.isPublic === true。用户删除后 Collection 和 Link 均被级联删除 → 返回空结果集。
+调用 `searchLinks({ publicOnly: true })`，内部查询条件含 `collection.isPublic === true`。用户删除后 Collection 和 Link 均被级联删除 → 返回空结果集。
+
+---
 
 #### 6.5.3 公开链接详情（GET /v1/public/links/[id]）
 
-**代码位置**：[apps/web/lib/api/controllers/public/links/linkId/getLinkById.ts#L3-L24](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/public/links/linkId/getLinkById.ts#L3-L24)
+**代码证据**：`apps/web/lib/api/controllers/public/links/linkId/getLinkById.ts#L3-L24`
 
+**源码证据**：
 ```typescript
-prisma.link.findFirst({
-  where: { id: linkId, collection: { isPublic: true } },
-  include: { tags, collection }
-});
+// apps/web/lib/api/controllers/public/links/linkId/getLinkById.ts
+export default async function getLinkById(linkId: number) {
+  const link = await prisma.link.findFirst({
+    where: {
+      id: linkId,
+      collection: { isPublic: true },   // ← 集合公开过滤
+    },
+    include: { tags: true, collection: true },
+  });
+  return { response: link, status: 200 };   // ← 注意：link 为 null 时仍返回 200
+}
 ```
 
-**用户删除后**：Link 被级联删除 → 返回 `null`，HTTP **200**（注意：不是 404），body 为 `{"response": null}`。
+**用户删除后**：Link 被级联删除 → 返回 `null`，HTTP **200**（非 404），body 为 `{"response": null}`。
 
-**小缺陷**：返回 200 + null 而非 404，语义不严谨但不构成安全问题。
+**小缺陷**：返回 200 + null 语义不严谨，但不构成安全问题。
+
+---
 
 #### 6.5.4 公开用户信息（GET /v1/public/users/[id]）
 
-**代码位置**：[apps/web/lib/api/controllers/public/users/getPublicUser.ts#L3-L39](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/public/users/getPublicUser.ts#L3-L39)
+**代码证据**：`apps/web/lib/api/controllers/public/users/getPublicUser.ts#L3-L39`
 
+**源码证据**：
 ```typescript
-prisma.user.findFirst({ where: { id/username/email } });
-// 然后剥离 password 字段，只返回：
-// id, name, username, image, archiveAsScreenshot, archiveAsMonolith, archiveAsPDF
+// apps/web/lib/api/controllers/public/users/getPublicUser.ts
+export default async function getPublicUser(targetId: number | string, isId: boolean) {
+  const user = await prisma.user.findFirst({
+    where: isId ? { id: Number(targetId) }
+                : { OR: [{ username: targetId }, { email: targetId }] },
+  });
+  if (!user || !user.id) return { response: "User not found.", status: 404 };
+
+  const { password, ...lessSensitiveInfo } = user;   // ← 剥离密码字段
+  const data = { id, name, username, image, archiveAsScreenshot, archiveAsMonolith, archiveAsPDF };
+  return { response: data, status: 200 };
+}
 ```
 
-**用户删除后**：findFirst 返回 null → 404 "User not found."。
+**用户删除后**：findFirst 返回 null → **404** "User not found."。
 
-**注意**：此接口**不检查 User.isPrivate 字段**，只要用户存在就返回脱敏信息。但这与账号删除收敛无关。
+**注意**：此接口**不检查 User.isPrivate 字段**，只要用户存在即返回脱敏信息（与账号删除收敛无关，属隐私设计项）。
+
+---
 
 ### 6.6 长期 Token（API Token / Mobile Session）删除后的拦截边界
 
-AccessToken 表记录的生命周期与撤销：
+**代码证据**：
+- Token 撤销软删除逻辑：`apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts`
+- verifyToken 撤销检查逻辑：`apps/web/lib/api/verifyToken.ts#L23-L33`
 
-| 操作 | revoked 字段 | DB 记录状态 | verifyToken 拦截效果 |
-|------|-------------|------------|---------------------|
-| 用户主动撤销 token（DELETE /v1/tokens/[id]） | `true` | 保留（软删除） | ✅ 命中 `revoked === true` → 拦截 |
-| 用户删除自己账号 | N/A | 级联物理删除 | ❌ 记录不存在 → verifyToken 的 revoked 检查不命中 |
-| 管理员删除子用户 | N/A | 级联物理删除 | ❌ 记录不存在 → verifyToken 的 revoked 检查不命中 |
-
-**verifyToken 的撤销检查逻辑**（[apps/web/lib/api/verifyToken.ts#L23-L33](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/verifyToken.ts#L23-L33)）：
+**verifyToken 撤销检查源码证据**：
 ```typescript
-const revoked = await prisma.accessToken.findFirst({
-  where: { token: token.jti, revoked: true },
-});
-if (revoked) return "Your session has expired...";
+// apps/web/lib/api/verifyToken.ts
+if (token.jti) {
+  const revoked = await prisma.accessToken.findFirst({
+    where: {
+      token: token.jti,   // ← JTI 对应 AccessToken.token 字段
+      revoked: true,      // ← 只匹配 revoked===true 的软删除记录
+    },
+  });
+  if (revoked) return "Your session has expired. Please login again.";
+}
 ```
 
-只有当存在 `revoked === true` 的记录时才拦截。记录被物理删除后，findFirst 返回 null，检查被绕过。
+**拦截效果差异矩阵**：
+| 操作 | revoked 字段 | DB 记录状态 | verifyToken 拦截效果 | 兜底拦截 |
+|------|-------------|------------|---------------------|---------|
+| 用户主动撤销 token（`DELETE /v1/tokens/[id]`） | `true` | 保留（软删除） | ✅ 命中 `revoked === true` → 拦截 | 无需 |
+| 用户删除自己账号 | N/A | 级联物理删除 | ❌ 记录不存在 → findFirst 返回 null → 不命中 | ✅ 后续 DB 查询 User/Collection 等均为空 |
+| 管理员删除子用户 | N/A | 级联物理删除 | ❌ 记录不存在 → findFirst 返回 null → 不命中 | ✅ 后续 DB 查询 User/Collection 等均为空 |
 
-**但实际风险被上层覆盖**：如 5.2 节所示，所有使用 verifyToken 的路由之后都会进一步查询 User / Collection / Link 等实体，这些实体在用户删除后均已不存在，所以请求仍会在后续步骤被拦截。
+**根因**：撤销检查只匹配存在且 `revoked===true` 的记录。级联物理删除后记录不存在，findFirst 返回 null 被视为"未撤销"。
 
-**唯一理论风险**：若未来新增一个 API 路由，只调用 `verifyToken()` 验证通过后直接返回不依赖 DB 的静态信息（如返回 token 本身的元数据），则用户删除后该路由仍可被已持有 token 的攻击者访问。当前代码库中不存在此类端点。
+**实际风险结论**：当前所有使用 verifyToken 的路由之后**均有进一步 DB 查询**（见 5.2 节），查询实体在用户删除后均已级联删除，请求在后续步骤仍会被拦截。仅存在**理论风险**：若未来新增一个仅调用 verifyToken() 就直接返回纯静态信息的端点，则该端点在用户删除后仍可被持有有效 JWT 的攻击者访问——当前代码库中不存在此类端点。
+
+---
 
 ### 6.7 认证收敛总结矩阵
 
@@ -394,10 +478,12 @@ if (revoked) return "Your session has expired...";
 | verifyToken() 路由（6 条） | ✅ 是 | 后续查 User/Collection → 404/401 |
 | 公开路由（/v1/public/*） | ✅ 是 | 级联删除后查不到实体 → 400/404/空结果 |
 | 头像 /v1/avatar/[id] | ✅ 是 | 查 targetUser 不存在 → 400 + 文件已删除 |
-| 归档 /v1/archives/[linkId] GET | ✅ 是 | Collection 级联删除 → 401 + 文件已删除 |
+| 归档 GET /v1/archives/[linkId] | ✅ 是 | Collection 级联删除 → 401 + 文件已删除 |
 | Preserved Format Token | ⚠️ 不主动拦截 | Token 5 分钟自失效，与用户存在性无关 |
 | NextAuth Cookie JWT | ✅ 是 | 后续所有页面加载均调用 useSession → 服务端 session 回调查不到用户 |
 | 移动端 Bearer Token | ✅ 是 | 所有 API 调用后续均查 DB 实体 |
+
+**最终结论复查**：账号删除后，数据库级级联删除 + 应用层事务文件清理 + 所有认证路由的后续 DB 查询兜底，构成三层收敛。除短期 Preserved Format Token（5 分钟自失效）外，所有入口均能被有效拦截，不存在实际可利用的持久化访问缺口。
 
 ---
 
@@ -411,7 +497,7 @@ if (revoked) return "Your session has expired...";
 - 通过 `next-auth/react` 的 `signIn()`、`signOut()` 自动携带 CSRF token
 
 **应用层缺口**：
-- [apps/web/next.config.js](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/next.config.js) 中未配置额外的安全 headers（如 CSP、X-Frame-Options 等）
+- `apps/web/next.config.js` 中未配置额外的安全 headers（如 CSP、X-Frame-Options 等）
 - 业务 API（非 NextAuth 路由）未显式校验 CSRF token，依赖 SameSite Cookie
 - 移动端使用 Bearer Token 认证，天然免疫 CSRF
 
@@ -425,7 +511,7 @@ if (revoked) return "Your session has expired...";
 当前代码**尚未实现 MFA（多因素认证）**，但 NextAuth.js 架构提供了清晰的扩展点：
 
 #### 扩展点 1：`signIn` 回调
-在 [apps/web/pages/api/v1/auth/[...nextauth].ts#L1326-L1410](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/pages/api/v1/auth/[...nextauth].ts#L1326-L1410) 中，可插入 MFA 挑战逻辑：
+在 `apps/web/pages/api/v1/auth/[...nextauth].ts` 的 `signIn` 回调中插入 MFA 挑战逻辑：
 ```
 signIn({ user, account, credentials })
   → 检查用户是否启用 MFA
@@ -445,21 +531,21 @@ jwt({ token, user, trigger })
 
 #### 扩展点 3：敏感操作二次校验
 现有敏感操作的密码校验可扩展为 MFA 校验：
-- [apps/web/lib/api/controllers/users/userId/updateUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/updateUserById.ts) 修改邮箱/密码处
-- [apps/web/lib/api/controllers/users/userId/deleteUserById.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/controllers/users/userId/deleteUserById.ts) 删除账号处
+- `apps/web/lib/api/controllers/users/userId/updateUserById.ts` 修改邮箱/密码处
+- `apps/web/lib/api/controllers/users/userId/deleteUserById.ts` 删除账号处
 
 ### 7.3 其他安全边界
 
 #### SSRF 防护（Worker 进程）
-[apps/worker/lib/protectPageRequests.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/worker/lib/protectPageRequests.ts) 使用 Playwright route 拦截，配合 `assertUrlIsSafeForServerSideFetch()` 检查，防止归档抓取时的 SSRF 攻击。
+`apps/worker/lib/protectPageRequests.ts` 使用 Playwright route 拦截，配合 `assertUrlIsSafeForServerSideFetch()` 检查，防止归档抓取时的 SSRF 攻击。
 
 #### 集合级权限（行级安全）
-- [apps/web/lib/api/getPermission.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/getPermission.ts)：后端校验用户对集合/链接的所有权或成员身份
-- [apps/web/lib/api/archives/resolveAccessibleArchive.ts](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/lib/api/archives/resolveAccessibleArchive.ts)：归档访问额外检查 `isPublic`，支持公开集合匿名访问
-- [apps/web/hooks/usePermissions.tsx](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/hooks/usePermissions.tsx)：前端 UI 级别权限控制（仅做显示控制，不替代后端校验）
+- `apps/web/lib/api/getPermission.ts`：后端校验用户对集合/链接的所有权或成员身份
+- `apps/web/lib/api/archives/resolveAccessibleArchive.ts`：归档访问额外检查 `isPublic`，支持公开集合匿名访问
+- `apps/web/hooks/usePermissions.tsx`：前端 UI 级别权限控制（仅做显示控制，不替代后端校验）
 
 #### 前端路由守卫
-[apps/web/layouts/AuthRedirect.tsx](file:///d:/fz/0601/solo-dogfeeding/code/97-linkwarden/apps/web/layouts/AuthRedirect.tsx) 实现前端路由级保护：
+`apps/web/layouts/AuthRedirect.tsx` 实现前端路由级保护：
 - 未登录访问受保护路由 → 重定向 `/login`
 - 已登录访问公开路由 → 重定向 `/dashboard`
 - 订阅失效 → 重定向 `/subscribe`
