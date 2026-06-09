@@ -1,366 +1,433 @@
-# Linkwarden Headless Browser 抓取与渲染流程分析
+# Linkwarden Headless Browser 抓取与渲染流程代码分析
 
-## 一、整体架构概览
-
-Linkwarden 的 Headless Browser 功能位于 `apps/worker/` 目录下，基于 **Playwright** 实现。系统由以下核心模块组成：
-
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| Worker 入口 | [worker.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/worker.ts) | 初始化并启动多个后台 Worker |
-| 链接处理循环 | [linkProcessing.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/workers/linkProcessing.ts) | 批量获取待处理链接，调度浏览器抓取 |
-| 浏览器管理 | [browser.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/browser.ts) | Playwright 浏览器启动与配置 |
-| 归档核心处理器 | [archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/archiveHandler.ts) | 单个链接的完整归档流程编排 |
-| 请求安全防护 | [protectPageRequests.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/protectPageRequests.ts) | SSRF 防护，拦截页面内不安全请求 |
-| 内容类型探测 | [fetchHeaders.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/fetchHeaders.ts) | 发送 HEAD 请求判断链接类型 |
+> 所有路径均为仓库根目录的相对路径
 
 ---
 
-## 二、Worker 启动与调度流程
+## 一、核心文件索引
 
-### 2.1 进程级守护
-
-[index.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/index.ts) 是最外层的进程守护：
-
-- 使用 `child_process.spawn` 启动 `tsx worker.ts` 子进程
-- 监听子进程 `exit` 事件，若异常退出则 **5 秒后自动重启**
-- 监听 `SIGINT` 信号实现优雅退出
-
-### 2.2 Worker 内部任务调度
-
-[worker.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/worker.ts) 初始化时并行启动多个 Worker：
-
-```
-migrationWorker() → 数据迁移
-    ↓
-startRSSPolling()        → RSS 轮询
-linkProcessing()         → 链接归档（核心）
-autoTagPreservedLinks()  → AI 自动打标签
-startIndexing()          → 全文索引
-trialEndEmailWorker()    → 试用到期邮件
-```
-
-其中 `linkProcessing` 是 Headless Browser 抓取的主入口。
+| 模块 | 文件路径 | 关键函数/类 |
+|------|---------|------------|
+| 进程守护 | `apps/worker/index.ts` | `launch()` |
+| Worker 入口 | `apps/worker/worker.ts` | `init()` |
+| 链接处理主循环 | `apps/worker/workers/linkProcessing.ts` | `linkProcessing()`, `restartBrowser()`, `archiveLink()` |
+| 浏览器启动配置 | `apps/worker/lib/browser.ts` | `launchBrowser()`, `getBrowserOptions()`, `getDefaultContextOptions()` |
+| 归档核心调度 | `apps/worker/lib/archiveHandler.ts` | `archiveHandler()`, `determineLinkType()` |
+| 批次公平调度 | `apps/worker/lib/getLinkBatchFairly.ts` | `getLinkBatchFairly()` |
+| SSRF 路由防护 | `apps/worker/lib/protectPageRequests.ts` | `protectPageRequests()` |
+| 响应头探测 | `apps/worker/lib/fetchHeaders.ts` | `fetchHeaders()` |
+| 预览图生成 | `apps/worker/lib/preservationScheme/handleArchivePreview.ts` | `handleArchivePreview()` |
+| Readability 正文 | `apps/worker/lib/preservationScheme/handleReadability.ts` | `handleReadability()` |
+| 截图与 PDF | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts` | `handleScreenshotAndPdf()`, `autoScroll()` |
+| Monolith 归档 | `apps/worker/lib/preservationScheme/handleMonolith.ts` | `handleMonolith()` |
+| 图片直链下载 | `apps/worker/lib/preservationScheme/imageHandler.ts` | `imageHandler()` |
+| PDF 直链下载 | `apps/worker/lib/preservationScheme/pdfHandler.ts` | `pdfHandler()` |
+| Wayback 提交 | `apps/worker/lib/preservationScheme/sendToWayback.ts` | `sendToWayback()` |
 
 ---
 
-## 三、页面抓取流程
+## 二、页面抓取流程代码引用
 
-### 3.1 浏览器生命周期管理
+### 2.1 Worker 启动与进程守护
 
-[linkProcessing.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/workers/linkProcessing.ts) 中的浏览器管理策略：
-
-1. **单例浏览器实例**：整个 Worker 循环共享一个 Browser 实例
-2. **30 分钟自动重启**：每 `BROWSER_MAX_AGE_MS = 30 * 60 * 1000` 重启一次浏览器，防止内存泄漏和进程僵死
-3. **按需重启**：若检测到 `browser.isConnected()` 返回 false，立即重启浏览器
-
+**进程级自动重启** — `apps/worker/index.ts#L3-L12`：
 ```typescript
-const restartBrowser = async (reason: string) => {
-  try {
-    if (browser && browser.isConnected()) {
-      await browser.close();
-    }
-  } catch {}
-  browser = await launchBrowser();
-  browserStartTs = Date.now();
+function launch() {
+  const child = spawn("tsx", ["worker.ts"], { stdio: "inherit" });
+  child.on("exit", (code, signal) => {
+    console.error(`worker exited (code=${code} signal=${signal}) – restarting…`);
+    setTimeout(launch, 5000);  // 5秒后重启子进程
+  });
+}
+```
+
+**多 Worker 并行初始化** — `apps/worker/worker.ts#L11-L20`：
+```typescript
+async function init() {
+  await migrationWorker();
+  startRSSPolling();
+  linkProcessing(workerIntervalInSeconds);       // ← Headless 抓取主循环
+  autoTagPreservedLinks(workerIntervalInSeconds);
+  startIndexing(workerIntervalInSeconds);
+  trialEndEmailWorker();
+}
+```
+
+### 2.2 浏览器生命周期管理
+
+**浏览器单例 + 30 分钟轮换** — `apps/worker/workers/linkProcessing.ts#L14-L33`：
+```typescript
+let browser = await launchBrowser();
+let browserStartTs = Date.now();
+const BROWSER_MAX_AGE_MS = 30 * 60 * 1000;
+
+// 每轮循环检查年龄，超时则重启
+if (Date.now() - browserStartTs >= BROWSER_MAX_AGE_MS) {
+  await restartBrowser("30-minute rotation");
+}
+```
+
+**按需重启（连接断开时）** — `apps/worker/workers/linkProcessing.ts#L65-L67`：
+```typescript
+if (!browser.isConnected?.()) {
+  await restartBrowser("browser disconnected");
+}
+```
+
+### 2.3 浏览器启动配置
+
+**启动选项（代理/自定义路径/远程 CDP）** — `apps/worker/lib/browser.ts#L9-L32`：
+- `PROXY` / `PROXY_BYPASS` / `PROXY_USERNAME` / `PROXY_PASSWORD` → 代理配置
+- `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` → 自定义 Chromium
+- `PLAYWRIGHT_WS_URL` → 走 CDP 连接远程浏览器而非本地 `chromium.launch`
+
+**上下文选项（设备模拟/TLS）** — `apps/worker/lib/browser.ts#L34-L51`：
+- 模拟 `devices["Desktop Chrome"]`
+- `ALLOW_INSECURE_TLS=true` 或 `IGNORE_HTTPS_ERRORS=true` 时忽略证书错误
+
+### 2.4 链接批次公平调度
+
+**待处理链接筛选条件** — `apps/worker/lib/getLinkBatchFairly.ts#L35-L38`：
+```typescript
+const baseLinkWhere: Prisma.LinkWhereInput = {
+  url: { not: null },
+  lastPreserved: null,   // ← 只取从未处理过的链接
 };
 ```
 
-### 3.2 浏览器启动配置
+**轮询取链接（用户间公平）** — `apps/worker/lib/getLinkBatchFairly.ts#L110-L145`：
+- 每轮从每个用户取 `linksPerUser = maxBatchLinks / users.length` 条
+- 直到取满 `maxBatchLinks` 或所有用户无剩余链接
+- 最后更新 `users.lastPickedAt = now`，保证下次轮询优先照顾其他用户
 
-[browser.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/browser.ts) 提供三级配置：
+### 2.5 单链接抓取前置检查
 
-#### 启动选项 `getBrowserOptions()`
-- 支持 `PROXY` 环境变量配置 HTTP/HTTPS 代理（含用户名密码认证）
-- 支持 `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` 指定自定义 Chromium 路径
-- 支持 `PLAYWRIGHT_WS_URL` 连接远程浏览器（CDP 协议）
-
-#### 上下文选项 `getDefaultContextOptions()`
-- 模拟设备：`devices["Desktop Chrome"]`
-- HTTPS 忽略：当 `ALLOW_INSECURE_TLS=true` 或 `IGNORE_HTTPS_ERRORS=true` 时忽略证书错误
-
-### 3.3 链接批次获取（公平调度）
-
-[getLinkBatchFairly.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/getLinkBatchFairly.ts) 实现了**用户间公平调度**：
-
-**链接筛选条件**（mode = "links"）：
-- `url` 不为 null
-- `lastPreserved` 为 null（尚未处理过）
-
-**用户筛选条件**：
-- 有订阅（或试用期内，若无需信用卡）
-- 邮箱已验证（若配置了邮件服务）
-
-**调度算法**：
-1. 按 `lastPickedAt` 升序选出用户（优先照顾长时间未被调度的用户）
-2. 统计每个用户的待处理链接数
-3. 以轮询方式从每个用户处取 `linksPerUser` 条链接，直到填满 `maxBatchLinks`
-4. 更新被选中用户的 `lastPickedAt` 时间戳
-
-### 3.4 单链接处理流程
-
-[archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/archiveHandler.ts) 是单个链接的完整处理流程：
-
-#### 前置检查
-1. **SSRF 安全检查**：调用 `assertUrlIsSafeForServerSideFetch(link.url)` 验证 URL 安全性，若为内网/危险 URL 则跳过整个归档流程
-2. **协议检查**：仅处理 `http://` 和 `https://` 开头的 URL
-3. **全局超时**：设置 `BROWSER_TIMEOUT`（默认 5 分钟）的 AbortController，超时后终止整个流程
-
-#### BrowserContext 与安全防护
+**SSRF 安全检查** — `apps/worker/lib/archiveHandler.ts#L32-L42`：
 ```typescript
-const context = await browser.newContext(contextOptions);
-await protectPageRequests(context);  // 注册路由拦截器
-const page = await context.newPage();
+try {
+  await assertUrlIsSafeForServerSideFetch(link.url);
+} catch (error) {
+  if (error instanceof UnsafeUrlError) {
+    skipPreservation = true;   // ← 危险 URL 直接跳过所有归档
+  }
+}
 ```
 
-[protectPageRequests.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/protectPageRequests.ts) 拦截页面内所有请求：
-- 放行 `about:`、`blob:`、`data:` 等非网络 URL
-- 对其他 URL 执行 SSRF 安全检查，不安全则以 `blockedbyclient` 原因中止请求
+**全局超时（默认 5 分钟）** — `apps/worker/lib/archiveHandler.ts#L63-L75`：
+```typescript
+const abortController = new AbortController();
+const timeoutPromise = new Promise((_, reject) => {
+  timeoutId = setTimeout(() => {
+    abortController.abort();
+    reject(new Error(`Browser has been open for more than ${BROWSER_TIMEOUT} minutes.`));
+  }, BROWSER_TIMEOUT * 60000);
+});
+// 主流程通过 Promise.race([archiveLogic, timeoutPromise]) 竞争
+```
 
-#### 链接类型判定
+**BrowserContext 路由级 SSRF 防护** — `apps/worker/lib/protectPageRequests.ts#L15-L35`：
+```typescript
+await context.route("**/*", async (route: Route) => {
+  const requestUrl = route.request().url();
+  if (isNonNetworkUrl(requestUrl)) { await route.continue(); return; }
+  try {
+    await assertUrlIsSafeForServerSideFetch(requestUrl);
+    await route.continue();
+  } catch (error) {
+    if (error instanceof UnsafeUrlError) {
+      await route.abort("blockedbyclient");   // ← 拦截页面内所有对内网的请求
+    }
+  }
+});
+```
 
-[fetchHeaders.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/fetchHeaders.ts) + `determineLinkType()`：
-1. 发送 `HEAD` 请求（10 秒超时）
-2. 根据 `content-type` 响应头判定类型：
-   - `application/pdf` → 类型 `"pdf"`
-   - `image/*` → 类型 `"image"`（并区分 jpeg/png）
-   - 其他 → 类型 `"url"`
+### 2.6 链接类型判定与分支
 
-#### 分支处理
+**HEAD 请求探测 Content-Type** — `apps/worker/lib/fetchHeaders.ts#L6-L21`（10 秒超时）：
+```typescript
+const responsePromise = safeFetch(url, { method: "HEAD" });
+const timeoutPromise = new Promise((_, reject) => {
+  setTimeout(() => reject(new Error("Fetch header timeout")), 10 * 1000);
+});
+const response = await Promise.race([responsePromise, timeoutPromise]);
+```
 
-**类型 = image**：走 [imageHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/imageHandler.ts)
-- 直接 `safeFetch` 下载原图
-- 生成预览缩略图
-- 保存原始文件并写入数据库
-
-**类型 = pdf**：走 [pdfHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/pdfHandler.ts)
-- 直接 `safeFetch` 下载 PDF
-- 保存文件并写入数据库
-
-**类型 = url**：走完整的 Headless Browser 流程（见下节）
+**类型分流** — `apps/worker/lib/archiveHandler.ts#L112-L195`：
+| 判定类型 | 处理函数 | 是否需要 Playwright |
+|---------|---------|-------------------|
+| `image` | `imageHandler()` — 直接 `safeFetch` 下载 + 生成预览 | ❌ |
+| `pdf` | `pdfHandler()` — 直接 `safeFetch` 下载保存 | ❌ |
+| `url` | 走完整 Playwright 流程（导航 + 多种内容提取） | ✅ |
 
 ---
 
-## 四、渲染等待与内容提取
+## 三、渲染等待代码引用
 
-### 4.1 页面导航等待
+### 3.1 页面导航等待
 
+**`domcontentloaded` 策略** — `apps/worker/lib/archiveHandler.ts#L129`：
 ```typescript
 await page.goto(link.url, { waitUntil: "domcontentloaded" });
 ```
+> 只等 DOM 树构建完毕，不等所有图片/字体/样式资源加载完成，兼顾速度与完整性。
 
-等待策略为 `domcontentloaded`——DOM 树构建完成即继续，不必等所有资源加载完毕。
+**已有 Monolith 文件直接注入** — `apps/worker/lib/archiveHandler.ts#L132-L149`：
+```typescript
+if (link.monolith?.endsWith(".html")) {
+  const file = await readFile(link.monolith);
+  await page.setContent(fileContent.toString("utf-8"), { waitUntil: "domcontentloaded" });
+}
+```
 
-若链接已有预先生成的 Monolith HTML 文件，则直接用 `page.setContent()` 加载本地 HTML 内容，无需再次请求网络。
+### 3.2 截图前自动滚动（触发懒加载）
 
-### 4.2 Meta Description 提取
+**autoScroll 实现** — `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L96-L119`：
+```typescript
+const autoScroll = async (AUTOSCROLL_TIMEOUT: number) => {
+  const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, AUTOSCROLL_TIMEOUT * 1000));
+  const scrollingPromise = new Promise<void>((resolve) => {
+    let totalHeight = 0;
+    const distance = 100;
+    const scrollDown = setInterval(() => {
+      window.scrollBy(0, distance);           // 每 100ms 向下滚 100px
+      totalHeight += distance;
+      if (totalHeight >= document.body.scrollHeight) {
+        clearInterval(scrollDown);
+        window.scroll(0, 0);                  // 滚完回到顶部
+        resolve();
+      }
+    }, 100);
+  });
+  await Promise.race([scrollingPromise, timeoutPromise]);   // 默认 30 秒强制结束
+};
+```
 
+**调用时机** — `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L12`：
+```typescript
+await page.evaluate(autoScroll, Number(process.env.AUTOSCROLL_TIMEOUT) || 30);
+```
+
+---
+
+## 四、内容提取代码引用
+
+### 4.1 Meta Description 提取
+
+**浏览器内 JS 求值** — `apps/worker/lib/archiveHandler.ts#L151-L164`：
 ```typescript
 const metaDescription = await page.evaluate(() => {
   const description = document.querySelector('meta[name="description"]');
   return description?.getAttribute("content") ?? undefined;
 });
+// 截取前 500 字符存入 link.metaDescription
 ```
 
-在浏览器上下文中执行 JS，截取前 500 字符存入 `link.metaDescription`。
+### 4.2 预览图（Preview）生成
 
-### 4.3 预览图生成（Preview）
+**策略一：优先 OG Image** — `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L21-L57`：
+1. `page.evaluate` 读取 `<meta property="og:image">`
+2. 相对路径拼 `document.location.origin`
+3. SSRF 检查后 `page.goto(ogImageUrl)` 跳转抓取
+4. `generatePreview(buffer, collectionId, linkId)` 生成缩略图
+5. `page.goBack()` 回到原页面
 
-[handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts)：
-
-**策略一：优先使用 OG Image**
-1. 读取页面 `<meta property="og:image">` 内容
-2. 若为相对路径则拼接 `document.location.origin`
-3. 对 OG Image URL 做 SSRF 检查后跳转过去抓取图片
-4. 调用 `generatePreview()` 生成缩略图，然后 `page.goBack()` 返回原页面
-
-**策略二：回退到页面截图**
-- 使用 `page.screenshot({ type: "jpeg", quality: 20 })` 低质量截图
-- 限制 Buffer 不超过 `PREVIEW_MAX_BUFFER`（默认 10MB）
-- 保存到 `archives/preview/{collectionId}/{linkId}.jpeg`
-
-### 4.4 Readability 正文提取
-
-[handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts)：
-
-1. **XSS 净化**：使用 `DOMPurify` 对页面 HTML 进行净化
-2. **正文提取**：使用 Mozilla 的 `@mozilla/readability` + `jsdom` 解析出文章正文
-3. **文本清洗**：
-   - 去重连续空格
-   - 去除换行符
-   - 按 `TEXT_CONTENT_LIMIT` 截断字符数
-4. **持久化**：
-   - JSON 序列化 Readability 结果保存到 `archives/{collectionId}/{linkId}_readability.json`
-   - 纯文本内容存入 `link.textContent`（用于搜索索引）
-   - 文件大小限制 `READABILITY_MAX_BUFFER`（默认 100MB）
-
-### 4.5 截图与 PDF 生成
-
-[handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts)：
-
-#### 自动滚动（Auto-Scroll）
-为了触发懒加载图片/内容，截图前先执行自动滚动：
-
+**策略二：回退低质量截图** — `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L59-L81`：
 ```typescript
-const autoScroll = async (AUTOSCROLL_TIMEOUT: number) => {
-  // 每 100ms 向下滚动 100px
-  // 直到滚动距离 >= document.body.scrollHeight
-  // 或达到 AUTOSCROLL_TIMEOUT（默认 30 秒）
-};
+await page.screenshot({ type: "jpeg", quality: 20 })
+// 限制 PREVIEW_MAX_BUFFER（默认 10MB）
+// 保存到 archives/preview/{collectionId}/{linkId}.jpeg
 ```
 
-滚动完成后滚回顶部 `window.scroll(0, 0)`。
+### 4.3 Readability 正文提取
 
-#### 全页截图
-- `page.screenshot({ fullPage: true, type: "jpeg" })`
-- 大小限制 `SCREENSHOT_MAX_BUFFER`（默认 100MB）
-- 保存到 `archives/{collectionId}/{linkId}.jpeg`
+**完整流程** — `apps/worker/lib/preservationScheme/handleReadability.ts#L8-L61`：
+```
+原始 HTML
+  ↓ DOMPurify.sanitize()  XSS 净化
+  ↓ JSDOM 构建 DOM
+  ↓ @mozilla/readability 解析文章
+  ↓ 去空格 / 去换行 / TEXT_CONTENT_LIMIT 截断
+  ↓
+  ├─ JSON 存 archives/{collectionId}/{linkId}_readability.json
+  └─ 纯文本存 link.textContent（供搜索索引）
+```
+大小限制 `READABILITY_MAX_BUFFER`（默认 100MB）。
 
-#### PDF 导出
-- `page.pdf({ width: "1366px", height: "1931px", printBackground: true })`
-- 上下边距默认 `15px`，可通过 `PDF_MARGIN_TOP` / `PDF_MARGIN_BOTTOM` 配置
-- 大小限制 `PDF_MAX_BUFFER`（默认 100MB）
-- 保存到 `archives/{collectionId}/{linkId}.pdf`
+### 4.4 全页截图
 
-截图和 PDF 使用 `Promise.allSettled` 并行执行，互不影响。
+**截图调用** — `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L21-L51`：
+```typescript
+page.screenshot({ fullPage: true, type: "jpeg" })
+// 限制 SCREENSHOT_MAX_BUFFER（默认 100MB）
+// 保存 archives/{collectionId}/{linkId}.jpeg
+```
+
+### 4.5 PDF 导出
+
+**PDF 调用** — `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L58-L91`：
+```typescript
+page.pdf({
+  width: "1366px",
+  height: "1931px",
+  printBackground: true,
+  margin: { top: "15px", bottom: "15px" },  // 可通过 PDF_MARGIN_* 配置
+})
+// 限制 PDF_MAX_BUFFER（默认 100MB）
+// 保存 archives/{collectionId}/{linkId}.pdf
+```
+
+> 截图和 PDF 通过 `Promise.allSettled(processingPromises)` 并行互不影响 — `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L92`
 
 ### 4.6 Monolith 单文件归档
 
-[handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts)：
+**外部 monolith CLI 调用** — `apps/worker/lib/preservationScheme/handleMonolith.ts#L13-L73`：
+```typescript
+const child = spawn("monolith", [
+  "-",            // 从 stdin 读 HTML
+  "-I",           // 移除图片
+  "-b", link.url, // base URL
+  "-j", "-F", "-q", ...  // 去 JS / 去框架 / 静默
+  "-o", "-"       // 输出到 stdout
+], { signal: abortController.signal, killSignal: "SIGKILL" });
 
-使用外部命令行工具 `monolith` 将页面保存为自包含的单个 HTML 文件：
-
-1. 通过 `child_process.spawn` 调用 `monolith`
-2. 从 stdin 注入当前页面的 HTML 内容
-3. 参数：`-I`（移除图片）、`-b`（指定 base URL）、`-j`（移除 JS）、`-F`（去除框架）、`-q`（静默模式）
-4. 支持 `MONOLITH_CUSTOM_OPTIONS` 环境变量自定义参数
-5. 输出限制 `MONOLITH_MAX_BUFFER`（默认 100MB）
-6. 保存到 `archives/{collectionId}/{linkId}.html`
-7. 支持通过 `AbortSignal` 超时中断
+child.stdin.write(htmlFromPage);   // 注入 Playwright 获取到的 HTML
+child.stdin.end();
+```
+- 大小限制 `MONOLITH_MAX_BUFFER`（默认 100MB）
+- 支持 `AbortSignal` 超时中断
+- **独立 `.catch()` 不阻塞其他格式** — `apps/worker/lib/archiveHandler.ts#L189-L193`
 
 ### 4.7 Wayback Machine 提交
 
-[sendToWayback.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/preservationScheme/sendToWayback.ts)：
-- 异步发送 GET 请求到 `https://web.archive.org/save/{url}`
-- **fire-and-forget**：不等待结果，失败静默忽略
+**Fire-and-Forget** — `apps/worker/lib/preservationScheme/sendToWayback.ts#L13-L20`：
+```typescript
+axios.get(`https://web.archive.org/save/${url}`, { headers })
+  .then(() => console.log(`Sent ${url} to Wayback Machine`))
+  .catch(() => {});   // 完全静默失败
+```
+在 archiveHandler 中**不 await**，异步发出即返回 — `apps/worker/lib/archiveHandler.ts#L118-L120`
 
 ---
 
-## 五、失败处理与重试机制
+## 五、失败处理与重试机制代码引用
 
-### 5.1 单链接级别的失败处理
+### 5.1 单链接：失败标记为不可用（不重试）
 
-在 [archiveHandler.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/lib/archiveHandler.ts) 的 `finally` 块中：
-
+**`finally` 块标记逻辑** — `apps/worker/lib/archiveHandler.ts#L203-L230`：
 ```typescript
-await prisma.link.update({
-  where: { id: link.id },
-  data: {
-    lastPreserved: new Date().toISOString(),
-    readable: !finalLink.readable ? "unavailable" : undefined,
-    image: !finalLink.image ? "unavailable" : undefined,
-    monolith: !finalLink.monolith ? "unavailable" : undefined,
-    pdf: !finalLink.pdf ? "unavailable" : undefined,
-    preview: !finalLink.preview ? "unavailable" : undefined,
-    indexVersion: null,
-  },
-});
+const finalLink = await prisma.link.findUnique({ where: { id: link.id } });
+if (finalLink) {
+  await prisma.link.update({
+    where: { id: link.id },
+    data: {
+      lastPreserved: new Date().toISOString(),           // ← 标记为"已处理过"
+      readable: !finalLink.readable  ? "unavailable" : undefined,
+      image:    !finalLink.image     ? "unavailable" : undefined,
+      monolith: !finalLink.monolith  ? "unavailable" : undefined,
+      pdf:      !finalLink.pdf       ? "unavailable" : undefined,
+      preview:  !finalLink.preview   ? "unavailable" : undefined,
+      indexVersion: null,
+    },
+  });
+}
 ```
 
-**关键逻辑**：
-- 无论成功或失败，都会设置 `lastPreserved` 为当前时间
-- 对于未能成功生成的格式，字段值被标记为 `"unavailable"` 而不是 `null`
-- 标记为 `"unavailable"` 的链接**不会在后续批次中被重试**（因为查询条件是 `lastPreserved: null`）
+**关键结论**：
+- 无论成功/失败/超时，`lastPreserved` 一定会被写入
+- 未生成的格式写 `"unavailable"`（而不是 `null`）
+- 批次查询条件是 `lastPreserved: null`，因此该链接**永远不会再进入处理队列**
+- → **单链接只有一次处理机会，没有自动重试**
 
-这意味着：**单个链接只有一次处理机会，失败即标记为不可用，不会自动重试**。
+### 5.2 批次级：单条失败不影响同批其他链接
 
-### 5.2 批次级别的容错
-
-在 [linkProcessing.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/workers/linkProcessing.ts) 中：
-
+**`Promise.allSettled` 并发处理** — `apps/worker/workers/linkProcessing.ts#L71-L72`：
 ```typescript
 const processingPromises = links.map((e) => archiveLink(e));
 await Promise.allSettled(processingPromises);
 ```
 
-- 使用 `Promise.allSettled`：单个链接失败不影响同批次其他链接
-- 每个 `archiveLink` 内部的 try-catch 捕获异常并打印日志
-- 若检测到浏览器断开连接，触发 `restartBrowser("browser disconnected")`
+**单条异常捕获** — `apps/worker/workers/linkProcessing.ts#L45-L69`：
+```typescript
+const archiveLink = async (link) => {
+  try {
+    await archiveHandler(link, browser);
+  } catch (error) {
+    console.error(`Error processing link ${link.url}:`, error);
+    if (!browser.isConnected?.()) {
+      await restartBrowser("browser disconnected");   // 浏览器挂了就重启
+    }
+  }
+};
+```
 
-### 5.3 部分步骤的局部容错
+### 5.3 各模块局部容错汇总
 
-| 模块 | 容错策略 |
-|------|---------|
-| `fetchHeaders` | 10 秒超时或请求失败返回 `null`，链接类型默认为 `"url"` |
-| `handleArchivePreview` | OG Image 下载失败回退到页面截图 |
-| `handleScreenshotAndPdf` | 截图和 PDF 用 `Promise.allSettled` 独立执行 |
-| `handleMonolith` | 单独的 `.catch(err => console.error(err))`，失败不影响其他格式 |
-| `sendToWayback` | 完全静默失败 |
+| 模块 | 文件与行号 | 容错行为 |
+|------|-----------|---------|
+| `fetchHeaders` | `apps/worker/lib/fetchHeaders.ts#L18-L21` | 超时/失败 → 返回 `null`，类型默认 `"url"` |
+| `handleArchivePreview` | `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L52-L57` | OG Image 失败 → 回退到 `page.screenshot` |
+| `handleScreenshotAndPdf` | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L92` | `Promise.allSettled` 让截图和 PDF 互不影响 |
+| `handleMonolith` | `apps/worker/lib/archiveHandler.ts#L189-L193` | 独立 `.catch()`，失败只打日志不抛出 |
+| `sendToWayback` | `apps/worker/lib/preservationScheme/sendToWayback.ts#L20` | `.catch(() => {})` 完全静默 |
 
-### 5.4 进程级别的自动恢复
+### 5.4 进程级自动恢复
 
-最外层 [index.ts](file:///d:/fz/0601/solo-dogfeeding/code/125-linkwarden/apps/worker/index.ts)：
-- Worker 子进程异常退出 → 5 秒后重启
-- 浏览器每 30 分钟定期重启，防止资源泄漏
-
----
-
-## 六、配置项汇总
-
-| 环境变量 | 默认值 | 说明 |
-|---------|--------|------|
-| `BROWSER_TIMEOUT` | `5` | 单链接浏览器处理超时（分钟） |
-| `ARCHIVE_SCRIPT_INTERVAL` | `10` | Worker 轮询间隔（秒） |
-| `ARCHIVE_TAKE_COUNT` | `5` | 每批次处理链接数 |
-| `AUTOSCROLL_TIMEOUT` | `30` | 自动滚动超时（秒） |
-| `PREVIEW_MAX_BUFFER` | `10` | 预览图大小上限（MB） |
-| `SCREENSHOT_MAX_BUFFER` | `100` | 截图大小上限（MB） |
-| `PDF_MAX_BUFFER` | `100` | PDF 大小上限（MB） |
-| `READABILITY_MAX_BUFFER` | `100` | Readability JSON 大小上限（MB） |
-| `MONOLITH_MAX_BUFFER` | `100` | Monolith HTML 大小上限（MB） |
-| `TEXT_CONTENT_LIMIT` | 无限制 | 正文纯文本字符数上限 |
-| `PROXY` | - | HTTP/HTTPS 代理地址 |
-| `PROXY_BYPASS` | - | 代理绕过规则 |
-| `PROXY_USERNAME` | - | 代理用户名 |
-| `PROXY_PASSWORD` | - | 代理密码 |
-| `PLAYWRIGHT_WS_URL` | - | 远程浏览器 CDP 地址 |
-| `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` | - | 自定义 Chromium 路径 |
-| `ALLOW_INSECURE_TLS` / `IGNORE_HTTPS_ERRORS` | `false` | 是否忽略 HTTPS 证书错误 |
-| `MONOLITH_CUSTOM_OPTIONS` | `-j -F -q` | Monolith 自定义参数 |
-| `PDF_MARGIN_TOP` / `PDF_MARGIN_BOTTOM` | `15px` | PDF 页边距 |
+| 层级 | 机制 | 文件与行号 |
+|------|------|-----------|
+| 整个 Worker 进程 | `spawn` 子进程退出 → 5 秒后重启 | `apps/worker/index.ts#L6-L10` |
+| 浏览器实例 | 30 分钟定期重启 + 断连按需重启 | `apps/worker/workers/linkProcessing.ts#L18-L33` |
 
 ---
 
-## 七、流程时序图（简化）
+## 六、配置项汇总（全部为环境变量）
+
+| 变量名 | 默认值 | 生效位置 |
+|--------|--------|---------|
+| `BROWSER_TIMEOUT` | `5` 分钟 | `apps/worker/lib/archiveHandler.ts#L23` |
+| `ARCHIVE_SCRIPT_INTERVAL` | `10` 秒 | `apps/worker/worker.ts#L8` |
+| `ARCHIVE_TAKE_COUNT` | `5` | `apps/worker/workers/linkProcessing.ts#L8` |
+| `AUTOSCROLL_TIMEOUT` | `30` 秒 | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L12` |
+| `PREVIEW_MAX_BUFFER` | `10` MB | `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L65` |
+| `SCREENSHOT_MAX_BUFFER` | `100` MB | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L30` |
+| `PDF_MAX_BUFFER` | `100` MB | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L69` |
+| `READABILITY_MAX_BUFFER` | `100` MB | `apps/worker/lib/preservationScheme/handleReadability.ts#L41` |
+| `MONOLITH_MAX_BUFFER` | `100` MB | `apps/worker/lib/preservationScheme/handleMonolith.ts#L52` |
+| `TEXT_CONTENT_LIMIT` | 无限制 | `apps/worker/lib/preservationScheme/handleReadability.ts#L13` |
+| `PROXY` / `PROXY_BYPASS` / `PROXY_USERNAME` / `PROXY_PASSWORD` | - | `apps/worker/lib/browser.ts#L14-L21` |
+| `PLAYWRIGHT_WS_URL` | - | `apps/worker/lib/browser.ts#L56-L58` |
+| `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` | - | `apps/worker/lib/browser.ts#L23-L29` |
+| `ALLOW_INSECURE_TLS` / `IGNORE_HTTPS_ERRORS` | `false` | `apps/worker/lib/browser.ts#L37-L39` |
+| `MONOLITH_CUSTOM_OPTIONS` | `-j -F -q` | `apps/worker/lib/preservationScheme/handleMonolith.ts#L19-L21` |
+| `PDF_MARGIN_TOP` / `PDF_MARGIN_BOTTOM` | `15px` | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L53-L56` |
+
+---
+
+## 七、完整调用链速查
 
 ```
-linkProcessing (无限循环)
-    │
-    ├─→ 检查浏览器年龄，必要时重启
-    │
-    ├─→ getLinkBatchFairly() ── 公平调度获取 N 条链接
-    │
-    └─→ 并发处理每条链接 (Promise.allSettled)
-            │
-            └─→ archiveHandler(link, browser)
-                    │
-                    ├─→ SSRF 安全检查
-                    ├─→ 创建 BrowserContext (带 SSRF 路由拦截)
-                    ├─→ 5 分钟全局超时 AbortController
-                    │
-                    ├─→ fetchHeaders() ── HEAD 请求判断类型
-                    │       │
-                    │       ├─ image → imageHandler() ── 直接下载
-                    │       ├─ pdf   → pdfHandler()   ── 直接下载
-                    │       └─ url   → 继续 Playwright 流程
-                    │
-                    ├─→ page.goto(url, waitUntil: "domcontentloaded")
-                    ├─→ 提取 metaDescription
-                    │
-                    ├─→ handleArchivePreview()  ── OG Image / 截图
-                    ├─→ handleReadability()      ── Readability 正文
-                    ├─→ handleScreenshotAndPdf() ── autoScroll → 截图/PDF
-                    ├─→ handleMonolith()         ── 单文件 HTML (异步)
-                    └─→ sendToWayback()          ── 提交 archive.org (异步)
-                            │
-                            └─→ finally: 标记 lastPreserved + 未生成格式为 unavailable
+apps/worker/index.ts (进程守护)
+ └─ spawn tsx worker.ts
+     └─ apps/worker/worker.ts#init()
+         └─ apps/worker/workers/linkProcessing.ts#linkProcessing() [无限循环]
+             ├─ 每 30 分钟重启浏览器
+             ├─ apps/worker/lib/getLinkBatchFairly.ts#getLinkBatchFairly()  ── 取 N 条链接
+             └─ Promise.allSettled 并发:
+                 └─ apps/worker/lib/archiveHandler.ts#archiveHandler(link, browser)
+                     ├─ SSRF 检查
+                     ├─ 5 分钟全局超时 AbortController
+                     ├─ BrowserContext + protectPageRequests (路由级 SSRF)
+                     ├─ apps/worker/lib/fetchHeaders.ts  HEAD 判断类型
+                     │   ├─ image ──► imageHandler.ts    (safeFetch 直下)
+                     │   ├─ pdf   ──► pdfHandler.ts      (safeFetch 直下)
+                     │   └─ url   ──► Playwright 流程:
+                     │       ├─ page.goto(url, domcontentloaded)
+                     │       ├─ metaDescription 提取
+                     │       ├─ handleArchivePreview.ts   (OG Image → 回退截图)
+                     │       ├─ handleReadability.ts      (DOMPurify → Readability → JSON + textContent)
+                     │       ├─ handleScreenshotAndPdf.ts (autoScroll → 全页截图 + PDF)
+                     │       ├─ handleMonolith.ts         (spawn monolith CLI)
+                     │       └─ sendToWayback.ts          (fire-and-forget)
+                     └─ finally:
+                         ├─ lastPreserved = now
+                         └─ 未生成格式 → "unavailable" (不再重试)
 ```
