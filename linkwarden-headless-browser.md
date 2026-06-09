@@ -430,19 +430,84 @@ if (
 
 **代码位置** — `apps/worker/lib/archiveHandler.ts#L63-L108`：
 
-| 行号 | 代码 | 同步/异步 | 是否可能失败 | 失败原因 | 失败后 `lastPreserved` | 会被重试？ | 资源泄漏？ |
-|------|------|----------|------------|---------|----------------------|-----------|-----------|
+| 行号 | 代码 | 同步/异步 | 是否可能失败 | 失败原因 | 失败后 `lastPreserved` | 会被重试？ | 资源泄漏 |
+|------|------|----------|------------|---------|----------------------|-----------|---------|
 | L63 | `const abortController = new AbortController()` | 同步 | ❌ 几乎不可能 | — | — | — | — |
 | L64 | `let timeoutId: NodeJS.Timeout \| undefined` | 同步 | ❌ | — | — | — | — |
-| L66-L75 | `const timeoutPromise = new Promise(...)` + `setTimeout` 注册 | 同步（注册回调） | ❌ | 回调在 5 分钟后执行，不阻塞此处 | — | — | — |
+| **L66-L75** | **`const timeoutPromise = new Promise(...)` + `setTimeout` 注册** | **同步（注册回调）** | **✅ 隐性风险** | 注册本身不失败，但若后续 L78-L83 抛异常，`clearTimeout` 永远不会被调用 | ❌ **不写入**（此步本身不失败，但若后续失败则间接影响） | — | **⚠️ timeoutId 泄漏**：5 分钟后 setTimeout 回调仍会执行 `reject(...)`，产生 UnhandledPromiseRejection |
 | L77 | `const contextOptions = getDefaultContextOptions()` | 同步 | ❌ 几乎不可能 | 只是读取 env 和 Playwright `devices` 常量 | — | — | — |
-| **L78** | **`const context = await browser.newContext(contextOptions)`** | **异步** | **✅ 可能** | 浏览器已断开连接、Playwright 内部错误、系统资源不足 | ❌ **不写入** | ✅ **会重试** | ❌ Context 还未创建 |
-| **L79** | **`await protectPageRequests(context)`** | **异步** | **✅ 可能** | 内部调用 `context.route("**/*", handler)`，若 Context 已关闭或 Playwright 异常会抛错 | ❌ **不写入** | ✅ **会重试** | ✅ Context 已创建但未关闭 |
-| **L80** | **`const page = await context.newPage()`** | **异步** | **✅ 可能** | Context 已关闭、沙箱限制、内存不足等 Playwright 异常 | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 已创建但未关闭 |
-| **L82** | **`createFolder({ filePath: "archives/preview/..." })`** | **同步** | **✅ 可能** | 实现：`packages/filesystem/createFolder.ts#L17` 调用 `fs.mkdirSync(..., { recursive: true })`，可能抛 `EACCES`（权限）、`EROFS`（只读磁盘）、`ENOSPC`（磁盘满） | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 已创建但未关闭 |
-| **L83** | **`createFolder({ filePath: "archives/..." })`** | **同步** | **✅ 可能** | 同上 | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 已创建但未关闭 |
+| **L78** | **`const context = await browser.newContext(contextOptions)`** | **异步** | **✅ 可能** | 浏览器已断开、Playwright 内部错误、系统资源不足 | ❌ **不写入** | ✅ **会重试** | + ⚠️ timeoutId 泄漏（见上） |
+| **L79** | **`await protectPageRequests(context)`** | **异步** | **✅ 可能** | 内部调用 `context.route("**/*", handler)`，若 Context 已关闭或 Playwright 异常会 reject | ❌ **不写入** | ✅ **会重试** | ✅ Context 泄漏 + ⚠️ timeoutId 泄漏 |
+| **L80** | **`const page = await context.newPage()`** | **异步** | **✅ 可能** | Context 已关闭、沙箱限制、内存不足等 Playwright 异常 | ❌ **不写入** | ✅ **会重试** | ✅ **Context 泄漏**（Page 创建失败不存在 Page 泄漏）+ ⚠️ timeoutId 泄漏 |
+| **L82** | **`createFolder({ filePath: "archives/preview/..." })`** | **同步** | **✅ 可能** | 实现：`packages/filesystem/createFolder.ts#L17` 调用 `fs.mkdirSync(..., { recursive: true })`，可能抛 `EACCES`（权限）、`EROFS`（只读磁盘）、`ENOSPC`（磁盘满） | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 泄漏 + ⚠️ timeoutId 泄漏 |
+| **L83** | **`createFolder({ filePath: "archives/..." })`** | **同步** | **✅ 可能** | 同上 | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 泄漏 + ⚠️ timeoutId 泄漏 |
 | L85 | `link.tags.filter(isArchivalTag)` | 同步 | ❌ | 纯函数 | — | — | — |
 | L86-L107 | `archivalSettings = ...` | 同步 | ❌ | 只是读取 tag 和 user 属性 | — | — | — |
+
+---
+
+**关键校准 1：timeoutPromise 的 setTimeout 泄漏风险**
+
+注册位置 `apps/worker/lib/archiveHandler.ts#L66-L75`（try 之前）：
+```typescript
+const timeoutPromise = new Promise((_, reject) => {
+  timeoutId = setTimeout(() => {
+    abortController.abort();
+    reject(
+      new Error(`Browser has been open for more than ${BROWSER_TIMEOUT} minutes.`)
+    );
+  }, BROWSER_TIMEOUT * 60000);
+});
+```
+
+清理位置 `apps/worker/lib/archiveHandler.ts#L204-L206`（**只在 finally 里**）：
+```typescript
+finally {
+  if (timeoutId !== undefined) {
+    clearTimeout(timeoutId);   // ← 唯一的清理位置
+  }
+  ...
+}
+```
+
+**后果**：只要阶段 B 中 L78-L83 任意一处失败（异常冒泡不进 finally），`clearTimeout` 就永远不会执行。5 分钟后回调依然触发：
+- `abortController.abort()`：AbortController 已随函数栈销毁，调用无害但无意义
+- `reject(new Error(...))`：`timeoutPromise` 这个 Promise 已经脱离所有作用域，其 reject 会产生 **UnhandledPromiseRejection**（Node 中可能触发 `process.on("unhandledRejection")` 警告，未来版本可能直接终止进程）
+
+---
+
+**关键校准 2：`context.newPage()` 失败时 Page 并未创建成功**
+
+Playwright 的 `context.newPage()` 返回 `Promise<Page>`：
+- Promise **resolve** → Page 创建成功，得到 Page 实例
+- Promise **reject** → Page **创建失败**，不存在返回对象
+
+因此 L80 失败时：
+- ❌ **Page 未创建**，不存在 Page 资源泄漏
+- ✅ **Context 已创建**（L78 已成功），存在 Context 泄漏
+
+只有当 L80 执行成功之后再走到 L82/L83 失败时，才同时存在 Context + Page 两个对象的泄漏。
+
+---
+
+**关键校准 3：Context 的唯一关闭路径**
+
+整个 `archiveHandler` 中，`context.close()` 只出现一次：
+`apps/worker/lib/archiveHandler.ts#L229`（finally 块中）：
+```typescript
+await context?.close().catch(() => {});
+```
+
+**关闭路径汇总**：
+| 场景 | 是否走到 finally | Context 是否关闭 |
+|------|----------------|----------------|
+| 阶段 A（L44-L61 `return`） | ❌ 早退出 | N/A（Context 还未创建） |
+| 阶段 B-1（L78 `newContext` 失败） | ❌ | N/A（Context 创建失败） |
+| 阶段 B-2/B-3（L79/L80 失败） | ❌ | ❌ **泄漏**（Context 已创建） |
+| 阶段 B-4（L82/L83 失败） | ❌ | ❌ **泄漏**（Context+Page 均已创建） |
+| 阶段 C（try 内任意异常/正常完成） | ✅ finally 必然执行 | ✅ `context?.close()` |
+
+---
 
 **`protectPageRequests` 为何可能失败** — `apps/worker/lib/protectPageRequests.ts#L15-L36`：
 ```typescript
@@ -464,11 +529,16 @@ export function createFolder({ filePath }: { filePath: string }) {
 ```
 本地文件系统模式下同步调用 `fs.mkdirSync`，任何 I/O 错误都会同步抛出。
 
+---
+
 **阶段 B 汇总**：
 - L78 / L79 / L80 / L82 / L83 这 5 处失败都会导致**异常向上冒泡**
 - 均**不会进入 try/finally**，均**不会写入 `lastPreserved`**
 - 因此这些链接**会在下一批次被重新选中重试**
-- 除 L78（Context 未创建）外，其余失败都会造成 BrowserContext / Page **资源泄漏**
+- 资源泄漏三档：
+  - L78：无 Context/Page 泄漏，但有 **timeoutId 泄漏 → UnhandledPromiseRejection**
+  - L79/L80：**Context 泄漏** + timeoutId 泄漏（L80 失败时 Page 未创建成功，不泄漏）
+  - L82/L83：**Context + Page 泄漏** + timeoutId 泄漏
 
 ---
 
@@ -535,18 +605,22 @@ try {
 
 ### 5.4 全阶段失败行为对比
 
-| 阶段 | 触发场景 | 代码位置 | 失败类型 | `lastPreserved` | 各格式字段 | 会被重试？ | Context 是否关闭 |
-|------|---------|---------|---------|----------------|-----------|-----------|----------------|
-| **A. 主动标记** | SSRF 不安全 / 非 http(s) 协议 / `DISABLE_PRESERVATION=true` | `apps/worker/lib/archiveHandler.ts#L44-L61` | 主动 `prisma.link.update` + `return` | ✅ 写入当前时间 | ✅ 全部硬编码 `"unavailable"` | ❌ 不会 | N/A（未创建） |
-| **B-1** | `browser.newContext()` 抛异常 | `apps/worker/lib/archiveHandler.ts#L78` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | N/A（未创建） |
-| **B-2** | `protectPageRequests(context)` 抛异常 | `apps/worker/lib/archiveHandler.ts#L79` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | ❌ 泄漏 |
-| **B-3** | `context.newPage()` 抛异常 | `apps/worker/lib/archiveHandler.ts#L80` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | ❌ 泄漏 |
-| **B-4** | 2 次 `createFolder()` 抛 `EACCES`/`EROFS`/`ENOSPC` | `apps/worker/lib/archiveHandler.ts#L82-L83` | 异常向上冒泡（`fs.mkdirSync` 同步抛） | ❌ 不写 | 保持不变 | ✅ **会** | ❌ 泄漏 |
-| **C. finally 兜底** | try 块内任意异常（page.goto / 超时 / 内容提取 / OG Image 非 SSRF 错误 等） | `apps/worker/lib/archiveHandler.ts#L109-L230` | `catch` 打日志 + re-throw → `finally` 兜底写库 | ✅ 写入当前时间 | ✅ 仍为空的写 `"unavailable"`，已成功的保留 | ❌ 不会 | ✅ `context?.close()` 必然调用 |
+| 阶段 | 触发场景 | 代码位置 | 失败类型 | `lastPreserved` | 各格式字段 | 会被重试？ | Context 状态 | 其他资源泄漏 |
+|------|---------|---------|---------|----------------|-----------|-----------|-------------|-------------|
+| **A. 主动标记** | SSRF 不安全 / 非 http(s) / `DISABLE_PRESERVATION=true` | `apps/worker/lib/archiveHandler.ts#L44-L61` | 主动 `prisma.link.update` + `return` | ✅ 写入当前时间 | ✅ 全部硬编码 `"unavailable"` | ❌ 不会 | N/A（未创建） | 无 |
+| **B-1** | `browser.newContext()` 抛异常 | `apps/worker/lib/archiveHandler.ts#L78` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | N/A（创建失败） | ⚠️ **timeoutId 泄漏** → 5 分钟后 UnhandledPromiseRejection |
+| **B-2** | `protectPageRequests(context)` 抛异常 | `apps/worker/lib/archiveHandler.ts#L79` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | ❌ Context 泄漏 | ⚠️ timeoutId 泄漏 |
+| **B-3** | `context.newPage()` 抛异常 | `apps/worker/lib/archiveHandler.ts#L80` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | ❌ Context 泄漏 | ⚠️ timeoutId 泄漏（Page 创建失败，无 Page 泄漏） |
+| **B-4** | 2 × `createFolder()` 抛 `EACCES`/`EROFS`/`ENOSPC` | `apps/worker/lib/archiveHandler.ts#L82-L83` | 异常向上冒泡（`fs.mkdirSync` 同步抛） | ❌ 不写 | 保持不变 | ✅ **会** | ❌ Context 泄漏 | ⚠️ timeoutId 泄漏 + **Page 泄漏**（L80 已成功） |
+| **C. finally 兜底** | try 块内任意异常 / 正常完成 | `apps/worker/lib/archiveHandler.ts#L109-L230` | `catch` 日志 + re-throw → `finally` 兜底写库 | ✅ 写入当前时间 | ✅ 仍为空的写 `"unavailable"`，已成功的保留 | ❌ 不会 | ✅ `context?.close()` 必然调用 | 无（finally 中清 timeoutId + 关 Context） |
 
 > **修正后的核心结论**：
-> - **不会重试（主动或兜底写了 lastPreserved）**：阶段 A + 阶段 C
-> - **会自动重试（异常冒泡未写 lastPreserved）**：阶段 B 的 5 处（L78/L79/L80/L82/L83），且其中 4 处存在 BrowserContext/Page 资源泄漏风险
+> - **不会重试（写了 lastPreserved）**：阶段 A（主动标记） + 阶段 C（finally 兜底）
+> - **会自动重试（异常冒泡未写 lastPreserved）**：阶段 B 的 5 处（L78/L79/L80/L82/L83）
+> - **资源泄漏按严重程度递增**：
+>   - B-1：只有 timeoutId 泄漏（UnhandledPromiseRejection 风险）
+>   - B-2/B-3：Context 泄漏 + timeoutId 泄漏（B-3 中 Page 创建失败，无 Page 泄漏）
+>   - B-4：Context + Page 泄漏 + timeoutId 泄漏
 
 ---
 
@@ -616,7 +690,7 @@ const archiveLink = async (link) => {
 
 ---
 
-## 七、完整调用链速查（含失败分支）
+## 七、完整调用链速查（含失败分支与资源泄漏）
 
 ```
 apps/worker/index.ts (进程守护: 子进程挂了 5s 后重启)
@@ -632,20 +706,28 @@ apps/worker/index.ts (进程守护: 子进程挂了 5s 后重启)
                      │     └─ prisma.link.update: lastPreserved=now + 所有格式 "unavailable" → return
                      │                                                               (不重试 ❌)
                      │
-                     ├─ AbortController + 5 分钟 timeoutPromise
+                     ├─ AbortController
+                     ├─ ⚠️ L66: 注册 setTimeout(5min) — clearTimeout 只在 finally 里
+                     │        ↑  若后续 B 阶段失败，此 timeoutId 将泄漏 → 5min 后 UnhandledPromiseRejection
+                     │
                      ├─ getDefaultContextOptions()
                      │
                      ├─ [阶段 B-1] browser.newContext()
-                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context 未创建）
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅
+                     │            (Context 未创建，但 timeoutId 泄漏 ⚠️)
                      │
                      ├─ [阶段 B-2] protectPageRequests(context)   ← context.route("**/*", handler)
-                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context 泄漏 ❗）
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅
+                     │            (Context 泄漏 ❗ + timeoutId 泄漏 ⚠️)
                      │
                      ├─ [阶段 B-3] context.newPage()
-                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context+Page 泄漏 ❗）
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅
+                     │            (Context 泄漏 ❗ + timeoutId 泄漏 ⚠️)
+                     │            ↑ Page 创建失败时 reject，无 Page 泄漏
                      │
                      ├─ [阶段 B-4] 2 × createFolder()             ← fs.mkdirSync 同步抛 EACCES/EROFS/ENOSPC
-                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context+Page 泄漏 ❗）
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅
+                     │            (Context 泄漏 ❗ + Page 泄漏 ❗ + timeoutId 泄漏 ⚠️)
                      │
                      ├─ archivalTags.filter() + archivalSettings  (纯同步，不失败)
                      │
@@ -668,10 +750,10 @@ apps/worker/index.ts (进程守护: 子进程挂了 5s 后重启)
                           console.log("Reason:", err);
                           throw err;   // 继续向上抛
                         } finally {                              ← [阶段 C · finally 兜底]
-                          ├─ 清 timeout
+                          ├─ clearTimeout(timeoutId)           ← 唯一的清理位置
                           ├─ prisma.link.update:
                           │     ├─ lastPreserved = now
                           │     └─ 仍为空的格式 → "unavailable"    ← 不再重试 ❌
-                          └─ context?.close().catch(() => {})    ← 必然关闭 Context
+                          └─ context?.close().catch(() => {})          ← Context 唯一关闭路径
                         }
 ```
