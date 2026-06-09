@@ -295,9 +295,73 @@ OR collection.members.some(m => m.userId = userId)
 
 所有 Link 查询的 `orderBy`：`{ id: "desc" }`（即按创建时间倒序）。
 
-所有 Link 查询的 `omit`：`{ textContent: true }`（不返回全文索引内容，减小体积）。
+#### 5.2.4 Link 查询 include/omit 与字段返回分析（已核对）
 
-#### 5.2.4 collectionLinks 返回结构（第 149-152 行）
+所有 Link 查询使用统一的 Prisma 查询参数（[getDashboardDataV2.ts#L67-L82](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/dashboard/getDashboardDataV2.ts#L67-L82)、[#L97-L112](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/dashboard/getDashboardDataV2.ts#L97-L112)、[#L131-L146](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/dashboard/getDashboardDataV2.ts#L131-L146)）：
+
+```typescript
+omit: { textContent: true },
+include: {
+  tags: true,
+  collection: true,
+  pinnedBy: {
+    where: { id: userId },
+    select: { id: true },
+  },
+},
+```
+
+**Prisma 查询行为核心规则：未被 `omit` 的标量字段默认全部返回。** 因此：
+
+| 类别 | 处理方式 |
+|------|----------|
+| **被 omit 排除** | 仅 `textContent`（全文索引大字段，用于搜索，不展示） |
+| **标量字段（默认返回）** | id, name, type, description, icon, iconWeight, color, url, preview, image, pdf, readable, monolith, clientSide, aiTagged, metaDescription, indexVersion, lastPreserved, importDate, createdAt, updatedAt, collectionId, createdById |
+| **关系字段（include 返回）** | tags（完整 Tag 对象）、collection（完整 Collection 对象）、pinnedBy（仅当前用户的 { id }） |
+
+**前端 TypeScript 类型约束**（[global.ts#L14-L34](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/types/global.ts#L14-L34)）`LinkIncludingShortenedCollectionAndTags` 将 `id/createdAt/collectionId/updatedAt/lastPreserved/importDate` 设为可选，但实际 Prisma 返回中这些字段**均存在且非空**。
+
+#### 5.2.5 Link 标量字段完整清单与邮件摘要适用性
+
+基于 Prisma `Link` 模型（[schema.prisma#L166-L198](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/prisma/schema.prisma#L166-L198)）、Dashboard 返回字段、以及前端 Card 组件实际消费字段（[DashboardLinks.tsx](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/DashboardLinks.tsx)、[LinkCard.tsx](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkCard.tsx)），整理如下：
+
+| 字段 | 类型 | Dashboard 是否返回 | 邮件摘要用途 | 前端 Card 是否使用 |
+|------|------|:------------------:|-------------|:------------------:|
+| `id` | Int | ✅ | 生成详情链接、去重 | ✅（拖拽 key、路由跳转） |
+| `name` | String (default: "") | ✅ | **链接标题（摘要核心）** | ✅（卡片主标题，line-clamp-2） |
+| `description` | String (default: "") | ✅ | **用户自定义描述** | ❌（Dashboard Card 不显示） |
+| `metaDescription` | String? | ✅ | **页面元描述（抓取所得）** | ❌ |
+| `url` | String? | ✅ | **跳转原始链接** | ✅（LinkTypeBadge 显示域名、点击跳转） |
+| `type` | String (default: "url") | ✅ | 链接类型徽标（url/pdf/image/monolith） | ✅（LinkTypeBadge） |
+| `preview` | String? | ✅ | **缩略图状态判断**（"unavailable" / 归档路径） | ✅（Image 组件 + 轮询 refetch 判断） |
+| `image` | String? | ✅ | 截图归档可用性判断 | ✅（formatStats.formatAvailable） |
+| `pdf` | String? | ✅ | PDF 归档可用性判断 | ✅（同上） |
+| `readable` | String? | ✅ | Readability 归档可用性判断 | ✅（同上） |
+| `monolith` | String? | ✅ | Monolith 归档可用性判断 | ✅（同上） |
+| `icon` | String? | ✅ | Phosphor 图标名称（用户自定义图标） | ✅（LinkIcon） |
+| `iconWeight` | String? | ✅ | 图标粗细 | ✅（LinkIcon） |
+| `color` | String? | ✅ | 图标颜色 | ✅（LinkIcon） |
+| `createdAt` | DateTime | ✅ | **创建时间（摘要排序+展示）** | ✅（LinkDate，回退用） |
+| `importDate` | DateTime? | ✅ | 导入时间（优先于 createdAt 展示） | ✅（LinkDate，优先用） |
+| `updatedAt` | DateTime | ✅ | 缩略图 URL 缓存刷新参数 | ✅（Image src query） |
+| `lastPreserved` | DateTime? | ✅ | 上次归档成功时间（可选展示） | ❌ |
+| `collectionId` | Int | ✅ | 关联收藏夹 | ✅（匹配 Collection 对象） |
+| `createdById` | Int? | ✅ | 创建者 ID（可选展示） | ❌ |
+| `clientSide` | Boolean | ✅ | 是否客户端归档（邮件可忽略） | ❌ |
+| `aiTagged` | Boolean | ✅ | 是否已 AI 打标签（可选展示） | ❌ |
+| `indexVersion` | Int? | ✅ | 全文索引版本（邮件可忽略） | ❌ |
+| `textContent` | String? | ❌（被 omit） | 无需（邮件不展示全文） | ❌ |
+| — **关系字段** — | — | — | — | — |
+| `tags` | Tag[] | ✅（include） | **标签展示** | ⚠️（Card 本身未直接渲染 tags，但数据返回） |
+| `collection` | Collection | ✅（include） | **所属收藏夹名称+颜色** | ✅（LinkCollection 组件） |
+| `pinnedBy` | { id: number }[] | ✅（include，仅当前用户） | **固定状态标识** | ✅（LinkPin 组件 + 前端过滤 pinned） |
+
+**邮件摘要核心可复用字段（14 个，全部 Dashboard 已返回）：**
+`id`、`name`、`description`、`metaDescription`、`url`、`preview`、`image`、`type`、`createdAt`、`importDate`、`tags`、`collection.name`、`collection.id`、`collection.color`、`pinnedBy`
+
+**特别修正：之前评估认为 description 可能不含——实际 Prisma 未 omit 该字段，description 和 metaDescription 均完整返回。**
+
+#### 5.2.6 collectionLinks 返回结构（第 149-152 行）
 
 ```typescript
 const collectionLinks: Record<number, any[]> = {};
@@ -320,7 +384,7 @@ collectionsResult.forEach(({ colId, links }) => {
 - 仅包含用户在 Dashboard 配置中**显式添加**的 COLLECTION 分区
 - 未启用或无权限的收藏夹不出现于此对象中
 
-#### 5.2.5 链接合并与去重逻辑（第 154-159 行）
+#### 5.2.7 链接合并与去重逻辑（第 154-159 行）
 
 ```typescript
 const merged = [...recentlyAddedLinks, ...pinnedLinks].sort(
@@ -340,7 +404,7 @@ const uniqueLinks = merged.filter(
    - `filter` 保留第一次出现（即保留该条），后续重复被丢弃
    - 最终 `uniqueLinks` 的最大长度约为 16~32 条，取决于 pinned 与 recent 的重叠程度
 
-#### 5.2.6 最终返回结构
+#### 5.2.8 最终返回结构
 
 ```typescript
 return {
@@ -380,11 +444,11 @@ return {
 | **数据量** | ⚠️ 固定 take 16 条/分区 | 邮件摘要可能需要可配置数量（如 weekly=10, daily=5） | 参数化 take 值 |
 | **collectionLinks** | ⚠️ 依赖用户 Dashboard 的 COLLECTION 分区配置 | 邮件摘要可能需要"所有收藏夹各取 N 条"而非仅 Dashboard 配置的 | 绕过 dashboardSections，直接查用户可访问的所有 Collection |
 | **links 合并去重** | ✅ 已实现按 id 去重 | 完全适用 | 无需调整 |
-| **字段内容** | ⚠️ 返回 tags、collection、pinnedBy 关系，但 omit textContent | 邮件摘要需要链接名称、URL、预览图、描述 | 需确认 description 是否在返回中（当前 include 未显式指定，默认不含） |
+| **字段内容** | ✅ 除 `textContent` 外所有标量字段均返回（name, description, metaDescription, url, preview, image 等共 23 个），同时 include tags、collection、pinnedBy 关系 | **高度适用**——邮件摘要所需核心字段（标题、URL、描述、预览图、标签、收藏夹、固定状态）全部已返回 | 无需调整，可直接复用 |
 | **统计数据** | ✅ numberOfPinnedLinks、numberOfTags | 基本适用 | 邮件摘要可能还需要 period 内新增链接数等增量指标 |
 | **分区开关依赖** | ⚠️ 查询依赖 dashboardSections 存在性 | 邮件摘要不应被 Dashboard UI 开关影响 | 移除 section 存在性检查，始终返回完整摘要数据 |
 
-**总体评估：Dashboard V2 查询的数据聚合逻辑**（权限过滤、合并去重、多收藏夹查询）**可以较高程度复用为 Digest 数据层，但需要剥离对 dashboardSections 的依赖、增加时间窗口过滤、并参数化返回条数。** 不建议直接调用 `getDashboardDataV2()`，建议新建一个 `getDigestData(userId, since, limit)` 函数在其基础上改造。
+**总体评估：Dashboard V2 查询的数据聚合逻辑**（权限过滤、合并去重、多收藏夹查询、字段完整性）**可以较高程度复用为 Digest 数据层，尤其字段方面无需任何改动**。需要改造的只有三点：剥离对 dashboardSections 的依赖、增加时间窗口过滤、并参数化返回条数。不建议直接调用 `getDashboardDataV2()`，建议新建一个 `getDigestData(userId, since, limit)` 函数在其基础上改造。
 
 ---
 
