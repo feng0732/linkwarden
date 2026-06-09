@@ -96,14 +96,15 @@ const feedLastPubDate = feedLastBuildDate ??
   }, new Date(0));
 ```
 
-`??` 是空值合并运算符：仅当左侧为 `null`/`undefined` 时才执行右侧。因此分为两个分支：
+`??` 是空值合并运算符：仅当左侧为 `null`/`undefined` 时才执行右侧。因此分为三个分支：
 
 | 分支 | 条件 | feedLastPubDate 的值 | 是否 truthy |
 |------|------|---------------------|------------|
-| **A** | 频道有 `lastBuildDate`（非 null/undefined） | 直接取频道的 `lastBuildDate`（string 或 Date） | ✅ 是（非空字符串或 Date 对象均为 truthy） |
+| **A** | 频道有非空 `lastBuildDate`（string 或 Date） | 直接取频道的 `lastBuildDate` | ✅ 是（非空字符串或 Date 对象均为 truthy） |
+| **A'** | 频道有 `lastBuildDate` 但为**空字符串** `""` | 直接取空字符串 `""`（`""` 不是 null/undefined，`??` 不触发右侧） | ❌ 否（`!"" → true`） |
 | **B** | 频道无 `lastBuildDate`（undefined） | `reduce` 结果，初始值 `new Date(0)`，遍历 item 取最大 `pubDate` | ✅ 是（Date 对象始终为 truthy，`new Date(0)` 也是 truthy） |
 
-**重要代码事实：L23-L26 的 throw 是死代码**
+**分支 A'：频道 lastBuildDate 为空字符串时，会走错误分支**
 
 ```typescript
 if (!feedLastPubDate)
@@ -112,7 +113,13 @@ if (!feedLastPubDate)
   );
 ```
 
-无论分支 A 还是 B，`feedLastPubDate` 永远是 truthy（见上表），因此这个错误**在实际运行中永远不会被抛出**。
+按代码顺序追踪：
+1. `feedLastBuildDate = ""`（空字符串）
+2. `feedLastPubDate = "" ?? reduce(...)` → `""`（空字符串不是 `null`/`undefined`，`??` 取左侧）
+3. `!feedLastPubDate` → `!""` → `true`
+4. **进入 throw 分支，抛出错误**
+
+结论：L23-L26 的 throw **不是完全的死代码**——在分支 A'（频道 lastBuildDate 为空字符串）这种极端异常情况下确实会触发。正常 RSS Feed（分支 A 或 B）不会触发。
 
 #### 第三层：Item 级精确过滤
 
@@ -254,24 +261,42 @@ reduce 每次迭代行为：
 - 创建对应数量的 Link
 - L90：`lastBuildDate` 被更新为 reduce 返回的最大 item.pubDate
 
-**B2：所有 item 都缺少 pubDate（或 pubDate 全部无效）**
+**B2：所有 item 都缺少 pubDate（或 pubDate 全部无效）——第一轮导入**
 - `newItems` = 空数组
 - `hasPassedLimit` 检查 0 条 → 通过
 - `Promise.all([])` 不创建任何 Link
 - L90：`lastBuildDate` 被更新为 `new Date(0)`（**1970-01-01 00:00:00 UTC**）
 
-**分支 B 的特点：当所有 item 都无 pubDate 时，游标被设为 1970 年。下轮 Worker 会用 `new Date(0)` 与新的 feedLastPubDate 比较（必然更大），再次进入处理分支，但由于 item 依然没有 pubDate，仍然不创建任何链接，游标保持 1970 年——构成一个无害的空转循环。**
+**B2：第二轮及之后 Worker 轮询——按代码顺序追踪 1970 游标比较**
+
+此时数据库中 `rssSubscription.lastBuildDate = new Date(0)`（1970 年），Feed 仍然无频道 lastBuildDate、所有 item 无 pubDate。
+
+| 代码行 | 表达式 | 值分析 | 布尔结果 |
+|--------|--------|--------|----------|
+| L12-L21 | `feedLastPubDate` | `undefined ?? reduce(..., new Date(0))` → 所有 item 无 pubDate → acc 不变 → `new Date(0)` | - |
+| L23 | `!feedLastPubDate` | `!new Date(0)` → Date 对象始终为 truthy | `false`，不抛错 |
+| L28 | `!rssSubscription.lastBuildDate` | `!new Date(0)` → Date 对象为 truthy，取反 | **`false`**，第一个条件不成立 |
+| L30-L31 | `new Date(rssSubscription.lastBuildDate) < new Date(feedLastPubDate)` | `new Date(0) < new Date(0)` → `1970 < 1970` | `false`，第二个条件也不成立 |
+| L28 整体 | `false \|\| (true && false)` | 逻辑或运算 | **`false`，不进入处理分支！** |
+
+**分支 B2 的正确结论：第一轮导入后游标设为 1970 年，从第二轮起 L28 的第一层判断就返回 false，不会进入处理分支，因此不会反复处理。** 之前"构成无害空转循环"的说法与代码事实不符。
+
+如果后续某一轮 Feed 中出现了带 pubDate 的新 item：
+- `feedLastPubDate` = reduce 返回最大的新 item.pubDate（必然大于 1970 年）
+- L30-L31 比较：`new Date(0) < 新时间` → `true`
+- 整体条件为 `false || (true && true)` → `true`，进入处理分支处理新 item
 
 ---
 
-**所有 item 缺少 pubDate 的边界情况汇总表：**
+**所有 item 缺少 pubDate 的边界情况汇总表（首轮 + 后续轮对比）：**
 
-| 分支 | 频道 lastBuildDate | feedLastPubDate 值 | newItems | 是否创建 Link | 最终 lastBuildDate 更新值 |
-|------|-------------------|--------------------|----------|--------------|------------------------|
-| **A** | ✅ 存在 | 频道的 lastBuildDate | `[]` | ❌ 不创建 | 频道的 lastBuildDate 对应时间 |
-| **B** | ❌ 缺失 | `new Date(0)`（reduce 初始值） | `[]` | ❌ 不创建 | `new Date(0)`（1970-01-01） |
+| 分支 | 频道 lastBuildDate | 首轮 feedLastPubDate | 首轮 newItems | 首轮是否创建 Link | 首轮 lastBuildDate 更新为 | 后续轮是否进入处理分支 |
+|------|-------------------|---------------------|---------------|------------------|------------------------|---------------------|
+| **A** | ✅ 存在（非空） | 频道的 lastBuildDate | `[]` | ❌ 不创建 | 频道的 lastBuildDate 对应时间 | ❌ 不进入（`频道时间 < 频道时间` = false） |
+| **A'** | ❌ 存在但为空字符串 `""` | `""`（空字符串） | 不执行（L23 throw） | - | - | 每轮都会 throw |
+| **B** | ❌ 缺失（undefined） | `new Date(0)`（reduce 初始值） | `[]` | ❌ 不创建 | `new Date(0)`（1970-01-01） | ❌ 不进入（`1970 < 1970` = false） |
 
-**两个分支都不会触发 L23-L26 的 throw，因为 feedLastPubDate 在两种情况下都是 truthy。**
+**分支 A 和 B 正常情况下（非 A'）都不会触发 L23-L26 的 throw，因为 feedLastPubDate 在两种情况下都是 truthy。只有分支 A'（频道 lastBuildDate 为空字符串）会触发 throw。**
 
 ---
 
@@ -291,9 +316,9 @@ reduce 每次迭代行为：
 | 实现简单，无需存储每条已处理 item 的 GUID/URL | 依赖 `pubDate` 准确性，若 Feed 不含 pubDate 则条目被丢弃 |
 | 数据库压力小，仅存一个时间戳 | 同秒发布的多条新文章可能因 `>` 严格比较导致漏处理 |
 | 首次创建时天然导入全部历史条目（利用 JS `Date > null → true`） | 首次创建时若历史条目数超过剩余配额，会**全部被丢弃**且不更新游标，造成死循环 |
-| 频道有 lastBuildDate 时，即使无 pubDate 条目也能前进游标（分支 A2） | 频道无 lastBuildDate 且所有 item 无 pubDate 时，游标被钉在 1970 年，Worker 每轮空转（分支 B2） |
+| 频道有 lastBuildDate 时，即使无 pubDate 条目也能前进游标（分支 A2），后续轮不重复处理 | 频道无 lastBuildDate 且所有 item 无 pubDate 时，首轮游标设为 1970 年，但从第二轮起 L28 判断拦截，不会反复处理（分支 B2） |
+| 无频道时间、无条目时间时，1970 年游标作为兜底锚点，后续出现带 pubDate 的新 item 时仍能正确触发处理 | 频道 lastBuildDate 为空字符串时（极端异常），`??` 不触发 reduce，直接取空字符串导致 L23 throw（分支 A'） |
 | 天然支持大部分 RSS Feed | 若 Feed 修改历史条目的 pubDate 为更新时间，可能造成重复导入 |
-| | L23-L26 的 `if (!feedLastPubDate) throw` 是死代码，永远不会触发 |
 
 ---
 
@@ -545,7 +570,7 @@ apps/worker/workers/rssPolling.ts  while(true)
   └─ delay(NEXT_PUBLIC_RSS_POLLING_INTERVAL_MINUTES × 60)  睡眠等待
 ```
 
-## 十、首次创建时 lastBuildDate=null 行为汇总流程图
+## 十、首次创建时 lastBuildDate=null 行为汇总流程图 + 后续轮询对比
 
 ```
 prisma.rssSubscription.create()
@@ -560,25 +585,29 @@ prisma.rssSubscription.create()
 ┌──────────────────────────────────┐
 │ L28: !rssSubscription.lastBuildDate │
 │          !null → true             │
-│     → 一定进入处理分支             │
+│     → 首轮一定进入处理分支         │
 └──────────────┬───────────────────┘
                │
                ▼
-┌─────────────────────────────────────────────────┐
-│ L12-L21: feedLastPubDate 计算（两大分支）         │
-│                                                   │
-│ 分支 A：频道有 lastBuildDate                       │
-│   feedLastPubDate = feed.lastBuildDate            │
-│   （string 或 Date，永远 truthy）                  │
-│                                                   │
-│ 分支 B：频道无 lastBuildDate (undefined)           │
-│   feedLastPubDate = reduce(..., new Date(0))      │
-│   有 pubDate → 取最大                              │
-│   无 pubDate → new Date(0) （永远 truthy）        │
-│                                                   │
-│ ★ 两个分支都不会触发 L23-L26 的 throw              │
-└──────────────┬──────────────────────────────────┘
-               │
+┌──────────────────────────────────────────────────────┐
+│ L12-L21: feedLastPubDate 计算（三个分支）              │
+│                                                        │
+│ 分支 A：频道有非空 lastBuildDate                        │
+│   feedLastPubDate = feed.lastBuildDate                 │
+│   （string 或 Date，永远 truthy）                       │
+│                                                        │
+│ 分支 A'：频道 lastBuildDate 为 空字符串 ""              │
+│   feedLastPubDate = "" （?? 不触发 reduce）             │
+│   !"" → true → ★ L23 throw Error！                     │
+│                                                        │
+│ 分支 B：频道无 lastBuildDate (undefined)                │
+│   feedLastPubDate = reduce(..., new Date(0))           │
+│   有 pubDate → 取最大                                   │
+│   无 pubDate → new Date(0) （永远 truthy）             │
+│                                                        │
+│ ★ 仅分支 A' 触发 throw，A/B 正常分支不触发              │
+└──────────────┬───────────────────────────────────────┘
+               │（A/B 正常分支继续）
                ▼
 ┌──────────────────────────────────────────────┐
 │ L38-L41: newItems 过滤（与分支 A/B 无关！）    │
@@ -611,13 +640,31 @@ prisma.rssSubscription.create()
    └────┬─────┘                 │
         │                       │
         ▼                       ▼
-┌─────────────────────┐  ┌────────────────────────────┐
-│ 更新 lastBuildDate  │  │ 更新 lastBuildDate          │
-│                     │  │                            │
-│ 分支 A → 频道的     │  │ 分支 A → 频道的            │
-│          lastBuildDate│ │          lastBuildDate     │
-│                     │  │                            │
-│ 分支 B → max(       │  │ 分支 B → new Date(0)       │
-│          item.pubDate)│ │          (1970-01-01)     │
-└─────────────────────┘  └────────────────────────────┘
+┌─────────────────────┐  ┌──────────────────────────────────┐
+│ 首轮更新             │  │ 首轮更新                          │
+│ lastBuildDate        │  │ lastBuildDate                     │
+│                     │  │                                    │
+│ 分支 A → 频道的     │  │ 分支 A → 频道的                    │
+│          lastBuildDate│ │          lastBuildDate            │
+│                     │  │                                    │
+│ 分支 B → max(       │  │ 分支 B → new Date(0)              │
+│          item.pubDate)│ │          (1970-01-01)            │
+└──────────┬──────────┘  └───────────────┬──────────────────┘
+           │                             │
+           ▼                             ▼
+┌──────────────────────────────────────────────────────────┐
+│          第二轮及之后 Worker 轮询（L28 判断）               │
+│                                                            │
+│ 分支 A：!频道时间 → false                                  │
+│         频道时间 < 频道时间 → false                         │
+│         整体 false → 不进入处理分支 ✅ 不会反复处理          │
+│                                                            │
+│ 分支 A'：每轮都会 L23 throw（空字符串永远是 falsy）          │
+│                                                            │
+│ 分支 B：!new Date(0) → false                               │
+│         new Date(0) < new Date(0) → false                  │
+│         整体 false → 不进入处理分支 ✅ 不会反复处理          │
+│         （若之后出现带 pubDate 的新 item，则 1970 < 新时间   │
+│          → true → 正常进入处理分支）                        │
+└──────────────────────────────────────────────────────────┘
 ```
