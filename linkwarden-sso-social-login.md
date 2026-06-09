@@ -435,7 +435,9 @@ interface Session {
 - `basePath="/api/v1/auth"` 对应 NextAuth 路由挂载位置 `/api/v1/auth/[...nextauth]`。
 - `refetchOnWindowFocus={false}` 关闭窗口聚焦时自动续期。
 
-### 4.2 JWT 的签发与 Cookie 存储
+### 4.2 JWT 的签发与三类 Token 的创建路径
+
+项目使用统一的 JWT 格式（`{ id, iat, exp, jti, sub? }`），但**存在三种独立的创建路径**，对应的后端持久化行为截然不同。
 
 NextAuth `session.strategy = "jwt"`（[代码位置](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts#L1316-L1319)）：
 
@@ -446,17 +448,25 @@ session: {
 },
 ```
 
-JWT 通过 `next-auth/jwt` 的 `encode` 函数使用 `NEXTAUTH_SECRET` 签名，并以 **HttpOnly Cookie**（`next-auth.session-token`）形式存储在浏览器。
+**三类 Token 的创建全景**：
 
-API Token（非浏览器会话）场景下使用相同 JWT 结构，由手动调用 `encode` 生成：
-- 会话级 API Token：[apps/web/lib/api/controllers/session/createSession.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/session/createSession.ts)
-- 用户自定义 Access Token：[apps/web/lib/api/controllers/tokens/postToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/postToken.ts)
+| # | Token 类型 | 创建入口 | 生成函数 | AccessToken 表记录 | isSession |
+|---|---|---|---|---|---|
+| 1 | NextAuth Cookie 会话（浏览器） | Web 前端 `signIn("credentials")` / `signIn("google")` 等 → NextAuth 内置 encode | `next-auth/jwt` 默认 encode（jwt 回调之后） | ❌ **不写入** | N/A |
+| 2 | 程序化会话 Token（移动端等） | `POST /api/v1/session`（用户名 + 密码） | [createSession.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/session/createSession.ts) | ✅ 写入 | `true`（显式设置） |
+| 3 | 用户自管理 API Key | `POST /api/v1/tokens`（前端设置页面） | [postToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/postToken.ts) | ✅ 写入 | `false`（Prisma schema 默认值） |
 
-### 4.3 浏览器会话 Cookie vs API Token Authorization Header：边界详解
+全项目只有**两处** `prisma.accessToken.create` 调用（grep 确认）：
+- `createSession.ts:32` — 对应类型 2
+- `postToken.ts:80` — 对应类型 3
 
-项目使用的 JWT 鉴权对后端完全透明——`next-auth/jwt` 的 `getToken({ req })` 函数会自动从两个来源提取 JWT，**调用方无需关心来源**。
+NextAuth 的 `[...nextauth].ts` 中**没有配置 `events` 字段**（无 `signIn`/`signOut` 等事件钩子），因此浏览器 OAuth / Credentials / Email 登录成功后，NextAuth 仅执行 `Set-Cookie`，**完全不写入 AccessToken 表**。
 
-**Token 提取的双重来源**：
+### 4.3 三类 Token 与两类传输通道：边界详解
+
+项目使用两条独立的 Token 传输通道（Cookie vs Bearer Header），由 `next-auth/jwt` 的 `getToken({ req })` 自动识别，后端鉴权逻辑不区分来源。但**三类 Token 的撤销能力和在 Token 列表中的可见性存在本质差异**。
+
+#### 4.3.1 Token 传输的双重通道
 
 ```
                     getToken({ req })
@@ -467,28 +477,29 @@ API Token（非浏览器会话）场景下使用相同 JWT 结构，由手动调
   (浏览器自动携带，HttpOnly)           (移动端 / API 调用手动设置)
 ```
 
-`getToken` 的提取优先级（NextAuth v4 源码逻辑）：
-1. 先尝试从 Cookie 中读取（`next-auth.session-token` 或 `__Secure-next-auth.session-token`）
+`getToken` 的提取优先级（NextAuth v4.22.1 源码逻辑）：
+1. 先尝试从 Cookie 中读取（`next-auth.session-token` 或 `__Secure-next-auth.session-token`，HTTPS 环境下使用后者）
 2. 若无 Cookie，尝试从 `Authorization` 请求头提取 `Bearer <token>`
 3. 都没有则返回 `null`
 
-**浏览器会话 vs API Token 的边界对比**：
+**使用场景对应**：
+- **通道 1（Cookie）**：仅由类型 1（NextAuth Cookie 会话）使用。Web 前端通过 NextAuth Client 的 `signIn()` 登录后，浏览器自动携带。
+- **通道 2（Bearer Header）**：由类型 2（程序化会话）和类型 3（用户 API Key）使用。移动端 App 将 Token 存入 SecureStore，每个请求手动添加 `Authorization: Bearer <token>`。
 
-| 维度 | 浏览器会话 (Browser Session) | API Token / 移动端会话 |
-|---|---|---|
-| **传递方式** | HttpOnly Cookie (`next-auth.session-token`) | `Authorization: Bearer <jwt>` Header |
-| **创建方式** | OAuth/Email/Credentials 登录成功后 NextAuth 自动 Set-Cookie | `POST /api/v1/session`（用户名密码换 Token）或 `POST /api/v1/tokens`（用户手动创建 API Key） |
-| **JWT 有效期** | 30 天（由 `session.maxAge` 控制） | 7/30/60/90 天或"永不"（200 年），由创建时参数决定 |
-| **AccessToken.isSession** | `true`（OAuth/Credentials/Email 登录的会话会写入 AccessToken 表） | `false`（用户手动创建的 API Key）或 `true`（`POST /api/v1/session` 创建的程序化会话） |
-| **客户端存储** | 浏览器 Cookie 存储，JS 不可读（HttpOnly） | 移动端 App / 第三方脚本自行安全存储 |
-| **自动携带** | 浏览器对同源请求自动携带 Cookie | 调用方需手动在每个请求中添加 Header |
-| **使用方** | Web 前端（[apps/web](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web)） | 移动端 App（[apps/mobile](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile)）、第三方 API 集成、浏览器扩展等 |
-| **撤销方式** | `DELETE /api/v1/tokens/:id` 设置 `revoked=true` | `DELETE /api/v1/tokens/:id` 设置 `revoked=true`（同一机制） |
-
-**移动端的 Bearer Token 使用示例**（来自 [packages/router/user.tsx#L24-L38](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/router/user.tsx#L24-L38)）：
-
+移动端实际代码（[apps/mobile/store/auth.ts#L99-L115](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile/store/auth.ts#L99-L115)）：
 ```typescript
-const url = auth?.instance + "/api/v1/users/me";
+// 移动端登录：调用 POST /api/v1/session（走 verifyByCredentials → createSession）
+const res = await fetch(`${instance}/api/v1/session`, {
+  method: "POST",
+  body: JSON.stringify({ username, password }),
+  headers: { "Content-Type": "application/json" },
+});
+const session = (await res.json()).response.token;
+await SecureStore.setItemAsync("TOKEN", session);
+```
+
+之后所有 API 请求通过 [packages/router/user.tsx#L30-L38](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/router/user.tsx#L30-L38) 等统一注入：
+```typescript
 const response = await fetch(url, {
   auth?.session
     ? { headers: { Authorization: `Bearer ${auth.session}` } }
@@ -496,13 +507,76 @@ const response = await fetch(url, {
 });
 ```
 
-**鉴权时后端不区分来源**：`verifyToken`、`verifyUser`、`isAuthenticatedRequest` 都只调用 `getToken({ req })`，无论是浏览器 Cookie 还是 Bearer Header 来的 JWT，走的是完全相同的校验逻辑（查 `token.id`、验过期、查 `AccessToken.revoked`）。
+#### 4.3.2 三类 Token 的完整对比
 
-**AccessToken 表中两类记录的区分**：
-- `isSession=true`：浏览器 OAuth/Email/Credentials 登录产生的会话，或 `POST /api/v1/session` 程序化创建的会话。前端"已登录设备"列表中会显示。
-- `isSession=false`：用户在"设置 → 访问令牌"页面手动创建的 API Key。
+| 维度 | 类型 1：NextAuth Cookie 会话 | 类型 2：程序化会话 Token | 类型 3：用户自管理 API Key |
+|---|---|---|---|
+| **创建方式** | NextAuth OAuth/Email/Credentials 登录成功 | `POST /api/v1/session`（username + password） | `POST /api/v1/tokens`（name + expires） |
+| **创建函数** | NextAuth 内部 `encode` + jwt 回调 | `createSession(userId, sessionName)` | `postToken(body, userId)` |
+| **传输方式** | HttpOnly Cookie（浏览器自动携带） | `Authorization: Bearer` Header | `Authorization: Bearer` Header |
+| **客户端存储** | 浏览器 Cookie（JS 不可读） | 移动端 SecureStore / 调用方自行存储 | 调用方自行存储 |
+| **JWT 有效期** | 30 天（`session.maxAge`） | 200 年（硬编码 `expiryDate.setDate(+73000)`） | 7/30/60/90 天或 200 年（"永不"） |
+| **JWT.jti 生成** | NextAuth 内部默认生成 | `crypto.randomUUID()`（手动） | `crypto.randomUUID()`（手动） |
+| **AccessToken 表** | ❌ **无记录** | ✅ 有记录，`token = jti` | ✅ 有记录，`token = jti` |
+| **AccessToken.isSession** | N/A（无记录） | `true`（显式设置） | `false`（Prisma schema `@default(false)`） |
+| **AccessToken.name** | N/A | `sessionName \|\| "Unknown Device"` | 用户传入的 `name`（唯一约束） |
+| **能否被撤销** | ❌ **不能** | ✅ 能（`revoked=true`） | ✅ 能（`revoked=true`） |
+| **出现在 Token 列表？** | ❌ **不出现** | ✅ 出现（`isSession=true`） | ✅ 出现（`isSession=false`） |
+| **实际使用方** | Web 浏览器前端（[apps/web](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web)） | 移动端 App（[apps/mobile](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile)）、第三方脚本 | 用户自建集成、浏览器扩展等 |
 
-两类记录在 `GET /api/v1/tokens` 中都会返回（[getTokens.ts#L5-L8](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/getTokens.ts#L5-L8)），撤销接口也相同。
+#### 4.3.3 撤销机制的边界：为何浏览器会话不可撤销
+
+所有鉴权函数（`verifyToken` / `verifyUser` / `isAuthenticatedRequest`）都通过以下 SQL 检查撤销状态（[verifyToken.ts#L24-L29](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/verifyToken.ts#L24-L29)）：
+
+```typescript
+const revoked = await prisma.accessToken.findFirst({
+  where: {
+    token: token.jti,   // 用 JWT 的 jti 匹配 AccessToken.token 字段
+    revoked: true,
+  },
+});
+```
+
+**三类 Token 的撤销判定**：
+- **类型 1（浏览器）**：AccessToken 表中不存在对应 jti 的行 → `findFirst` 返回 `null` → `revoked` 为 falsy → **永远不会被判定为已撤销**。唯一失效方式：用户点击 `signOut()` 清除浏览器 Cookie，或等待 JWT 30 天自然过期。
+- **类型 2（程序化会话）**：存在 AccessToken 行（isSession=true）→ 若被 `DELETE /api/v1/tokens/:id` 设置 `revoked=true` → 下次请求被拒绝。
+- **类型 3（API Key）**：存在 AccessToken 行（isSession=false）→ 同上，可被撤销。
+
+**安全隐患**：若浏览器 Cookie 中的 JWT 被窃取，攻击者可在 30 天内持续使用，服务端无任何手段主动失效该 Token（除非修改 `NEXTAUTH_SECRET` 令所有 JWT 全局失效）。
+
+#### 4.3.4 Token 列表（GET /api/v1/tokens）的返回内容
+
+`getTokens()` 查询条件（[getTokens.ts#L4-L8](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/getTokens.ts#L4-L8)）：
+
+```typescript
+prisma.accessToken.findMany({
+  where: { userId, revoked: false },
+  select: { id, name, isSession, expires, createdAt },
+});
+```
+
+因此返回的 Token 列表**同时包含**：
+- `isSession=true`：移动端等程序化会话（类型 2）
+- `isSession=false`：用户手动创建的 API Key（类型 3）
+
+浏览器会话（类型 1）**不会出现在列表中**，因为没有写入 AccessToken 表。
+
+#### 4.3.5 撤销接口（DELETE /api/v1/tokens/:id）的行为
+
+`deleteTokenById()` 实现（[deleteTokenById.ts#L14-L20](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts#L14-L20)）：
+
+```typescript
+await prisma.accessToken.update({
+  where: { id: tokenExists?.id },
+  data: { revoked: true },  // 软删除，不物理删除
+});
+```
+
+适用于类型 2 和类型 3。类型 1（浏览器会话）无对应 AccessToken 行，因此无法通过此接口撤销。
+
+**登出的区分**：
+- Web 前端：调用 `signOut()`（next-auth/react）→ 清除浏览器 Cookie → 但 JWT 本身仍有效（如果被窃取）
+- 移动端：调用 `signOut()`（zustand store）→ 删除 SecureStore 中的 Token → 但服务端 AccessToken 行仍存在且未撤销（需用户手动在 Token 列表中删除）
 
 ### 4.4 请求鉴权：verifyToken / verifyUser / isAuthenticatedRequest
 
@@ -537,35 +611,44 @@ verifyUser(req, res)      isAuthenticatedRequest(req)
 **isAuthenticatedRequest**：[apps/web/lib/api/isAuthenticatedRequest.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/isAuthenticatedRequest.ts)
 - 与 `verifyUser` 逻辑类似但**不写 HTTP 响应**，适合在中间件或需要自定义响应的场景使用。
 
-### 4.5 AccessToken 体系：可撤销的 API Token
+### 4.5 AccessToken 体系：可撤销 Token 的持久化
 
 数据模型：[packages/prisma/schema.prisma#L234-L246](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/prisma/schema.prisma#L234-L246)
 
 ```prisma
 model AccessToken {
   id         Int       @id @default(autoincrement())
-  name       String                        // Token 名称，如 "iPhone"
+  name       String                        // Token 名称（如 "iPhone"、"My API Key"）
   user       User      @relation(...)
   userId     Int
   token      String    @unique             // 存储 JWT.jti（非 JWT 本身）
   revoked    Boolean   @default(false)      // 软删除标记
-  isSession  Boolean   @default(false)      // 是否为浏览器会话 Token
+  isSession  Boolean   @default(false)      // true=程序化会话(类型2)，false=用户API Key(类型3)
   expires    DateTime                      // 过期时间
   lastUsedAt DateTime?
-  ...
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @default(now()) @updatedAt
 }
 ```
 
+**⚠️ 重要**：Prisma schema 注释中的"是否为浏览器会话 Token"具有误导性。**浏览器会话（类型 1）根本不写入 AccessToken 表**。`isSession` 字段仅区分：
+- `true` — 程序化会话 Token（类型 2，由 `createSession()` 创建，如移动端登录）
+- `false`（默认）— 用户自管理 API Key（类型 3，由 `postToken()` 创建）
+
 **撤销机制**：JWT 本身无状态不可撤销，因此通过 `jti`（JWT ID）关联 `AccessToken.token` 字段实现"软撤销"。每次鉴权时查询 `revoked` 字段（见 `verifyToken` / `isAuthenticatedRequest`）。
 
-**两种 Token 生成入口**：
+**AccessToken 表中记录的两种创建入口**（全项目仅此两处写入点）：
 
-| 类型 | 生成位置 | isSession | 有效期 |
-|------|---------|-----------|--------|
-| 浏览器会话登录 | `createSession()` | `true` | 200 年（实际由 JWT Cookie 30 天控制） |
-| 用户手动创建 API Key | `postToken()` | `false` | 7/30/60/90 天或永不 |
+| 类型 | 创建函数 | isSession | expires | name 来源 | 实际调用方 |
+|------|---------|-----------|---------|-----------|-----------|
+| 程序化会话 Token | [createSession()](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/session/createSession.ts) | `true`（显式设置） | 200 年（硬编码） | `sessionName \|\| "Unknown Device"` | 移动端 `POST /api/v1/session` |
+| 用户自管理 API Key | [postToken()](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/postToken.ts) | `false`（schema 默认，代码未显式设置） | 7/30/60/90 天或 200 年 | 用户传入（唯一约束） | Web 前端 `POST /api/v1/tokens` |
 
-两者均使用 `next-auth/jwt` 的 `encode` 生成相同格式 JWT，区别仅在于 `AccessToken.isSession` 标记。
+两者均使用 `next-auth/jwt` 的 `encode` 生成相同格式 JWT，且都将 `jti`（通过 `crypto.randomUUID()` 手动生成）存入 `AccessToken.token` 字段。浏览器会话（类型 1）既不调用这两个函数，也不写入 AccessToken 表。
+
+**jti 的生成方式差异**：
+- 类型 1（浏览器）：由 NextAuth 内部默认生成 jti
+- 类型 2/3：由代码显式调用 `crypto.randomUUID()` 生成 jti，然后立即 `decode` 取回 jti 值用于写入 AccessToken.token 字段（见 [createSession.ts#L27-L37](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/session/createSession.ts#L27-L37) 和 [postToken.ts#L75-L86](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/postToken.ts#L75-L86)）
 
 ### 4.6 前端路由守卫：AuthRedirect
 
@@ -748,6 +831,29 @@ Email Magic Link 验证所用，`@@unique([identifier, token])`。
 
 **问题**：开发者不仔细看容易混淆，尤其 `POST /api/v1/session` 的语义在 RESTful 中通常是"创建/更新会话"，但实际它是"用凭据换 Token"的认证端点，和 NextAuth 的 session 概念完全不同。
 
+### 7.7 安全隐患：浏览器 Cookie 会话不可集中撤销
+
+- **机制**：浏览器 OAuth/Email/Credentials 登录成功后，NextAuth 仅写入 HttpOnly Cookie，**不写入 AccessToken 表**。配置文件中无 `events.signIn` 等钩子（见 [apps/web/pages/api/v1/auth/[...nextauth].ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/pages/api/v1/auth/%5B...nextauth%5D.ts)）
+- **撤销判定**：`verifyToken` 通过 `findFirst({ where: { token: jti, revoked: true } })` 检查撤销。因无 AccessToken 行，查询返回 `null` → 永远判定为"未撤销"
+- **实际影响**：若浏览器 JWT Cookie 被窃取，攻击者可在 30 天（`session.maxAge`）有效期内持续使用。服务端唯一的对抗手段是修改 `NEXTAUTH_SECRET` 使所有用户的所有 JWT 全局失效
+- **建议**：在 NextAuth `events.signIn` 中为浏览器会话写入 AccessToken 记录（isSession=true），或在 `jwt` 回调中手动写入
+
+### 7.8 Bug：移动端登出不撤销服务端 Token
+
+- **位置**：[apps/mobile/store/auth.ts#L135-L154](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile/store/auth.ts#L135-L154)
+- **当前行为**：移动端 `signOut()` 仅从 SecureStore 删除本地 Token，**不调用** `DELETE /api/v1/tokens/:id` 撤销服务端 AccessToken 记录
+- **问题**：移动端用户点击"退出登录"后，服务端对应的 AccessToken（isSession=true）仍处于 `revoked=false` 状态，若 Token 已泄露，攻击者可继续使用
+- **对比**：Web 前端同样无法撤销浏览器会话（见 7.7），但 Web 端至少清除了本地 Cookie；移动端的情况更严重——服务端 Token 仍可被滥用
+
+### 7.9 误导性注释：AccessToken.isSession 被注释为"是否为浏览器会话 Token"
+
+- **位置**：[packages/prisma/schema.prisma#L241](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/prisma/schema.prisma#L241)
+- **实际含义**：
+  - `isSession=true` → 程序化会话 Token（`createSession()` 创建，移动端等使用）
+  - `isSession=false` → 用户自管理 API Key（`postToken()` 创建，默认值）
+  - 浏览器 Cookie 会话**完全不写入 AccessToken 表**，因此该字段与浏览器会话毫无关系
+- **建议**：将注释改为 "true=程序化会话(如移动端), false=用户API Key"
+
 ---
 
 ## 8. 关键文件索引
@@ -773,6 +879,8 @@ Email Magic Link 验证所用，`@@unique([identifier, token])`。
 | [apps/web/lib/api/controllers/tokens/postToken.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/postToken.ts) | 创建用户级 API Token（isSession=false） |
 | [apps/web/lib/api/controllers/tokens/getTokens.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/getTokens.ts) | 查询用户所有未撤销 Token |
 | [apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/controllers/tokens/tokenId/deleteTokenById.ts) | 软删除 Token（revoked=true） |
+| [apps/web/lib/api/verifyByCredentials.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/verifyByCredentials.ts) | 用户名/密码校验（供 POST /api/v1/session 使用） |
+| [apps/mobile/store/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile/store/auth.ts) | 移动端 Zustand auth store：POST /api/v1/session 登录、SecureStore 存储 Token、登出 |
 | [packages/router/user.tsx](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/router/user.tsx) | 移动端 useUser：演示 Authorization: Bearer 使用方式 |
 | [packages/router/tokens.tsx](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/router/tokens.tsx) | Token 增删查 React Query Hooks |
 | [packages/prisma/schema.prisma](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/packages/prisma/schema.prisma) | User / Account / AccessToken / VerificationToken 数据模型 |
