@@ -319,47 +319,147 @@ include: {
 | **标量字段（默认返回）** | id, name, type, description, icon, iconWeight, color, url, preview, image, pdf, readable, monolith, clientSide, aiTagged, metaDescription, indexVersion, lastPreserved, importDate, createdAt, updatedAt, collectionId, createdById |
 | **关系字段（include 返回）** | tags（完整 Tag 对象）、collection（完整 Collection 对象）、pinnedBy（仅当前用户的 { id }） |
 
-**前端 TypeScript 类型约束**（[global.ts#L14-L34](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/types/global.ts#L14-L34)）`LinkIncludingShortenedCollectionAndTags` 将 `id/createdAt/collectionId/updatedAt/lastPreserved/importDate` 设为可选，但实际 Prisma 返回中这些字段**均存在且非空**。
+**前端 TypeScript 类型约束**（[global.ts#L14-L34](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/types/global.ts#L14-L34)）`LinkIncludingShortenedCollectionAndTags` 将 `id/createdAt/collectionId/updatedAt/lastPreserved/importDate` 设为可选，但 DB 层实际可空性不一致：`id/createdAt/collectionId/updatedAt` 非空，`lastPreserved/importDate` 可空——详见 5.2.5.1。
 
 #### 5.2.5 Link 标量字段完整清单与邮件摘要适用性
 
 基于 Prisma `Link` 模型（[schema.prisma#L166-L198](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/prisma/schema.prisma#L166-L198)）、Dashboard 返回字段、以及前端 Card 组件实际消费字段（[DashboardLinks.tsx](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/DashboardLinks.tsx)、[LinkCard.tsx](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkCard.tsx)），整理如下：
 
-| 字段 | 类型 | Dashboard 是否返回 | 邮件摘要用途 | 前端 Card 是否使用 |
-|------|------|:------------------:|-------------|:------------------:|
-| `id` | Int | ✅ | 生成详情链接、去重 | ✅（拖拽 key、路由跳转） |
-| `name` | String (default: "") | ✅ | **链接标题（摘要核心）** | ✅（卡片主标题，line-clamp-2） |
-| `description` | String (default: "") | ✅ | **用户自定义描述** | ❌（Dashboard Card 不显示） |
-| `metaDescription` | String? | ✅ | **页面元描述（抓取所得）** | ❌ |
-| `url` | String? | ✅ | **跳转原始链接** | ✅（LinkTypeBadge 显示域名、点击跳转） |
-| `type` | String (default: "url") | ✅ | 链接类型徽标（url/pdf/image/monolith） | ✅（LinkTypeBadge） |
-| `preview` | String? | ✅ | **缩略图状态判断**（"unavailable" / 归档路径） | ✅（Image 组件 + 轮询 refetch 判断） |
-| `image` | String? | ✅ | 截图归档可用性判断 | ✅（formatStats.formatAvailable） |
-| `pdf` | String? | ✅ | PDF 归档可用性判断 | ✅（同上） |
-| `readable` | String? | ✅ | Readability 归档可用性判断 | ✅（同上） |
-| `monolith` | String? | ✅ | Monolith 归档可用性判断 | ✅（同上） |
-| `icon` | String? | ✅ | Phosphor 图标名称（用户自定义图标） | ✅（LinkIcon） |
-| `iconWeight` | String? | ✅ | 图标粗细 | ✅（LinkIcon） |
-| `color` | String? | ✅ | 图标颜色 | ✅（LinkIcon） |
-| `createdAt` | DateTime | ✅ | **创建时间（摘要排序+展示）** | ✅（LinkDate，回退用） |
-| `importDate` | DateTime? | ✅ | 导入时间（优先于 createdAt 展示） | ✅（LinkDate，优先用） |
-| `updatedAt` | DateTime | ✅ | 缩略图 URL 缓存刷新参数 | ✅（Image src query） |
-| `lastPreserved` | DateTime? | ✅ | 上次归档成功时间（可选展示） | ❌ |
-| `collectionId` | Int | ✅ | 关联收藏夹 | ✅（匹配 Collection 对象） |
-| `createdById` | Int? | ✅ | 创建者 ID（可选展示） | ❌ |
-| `clientSide` | Boolean | ✅ | 是否客户端归档（邮件可忽略） | ❌ |
-| `aiTagged` | Boolean | ✅ | 是否已 AI 打标签（可选展示） | ❌ |
-| `indexVersion` | Int? | ✅ | 全文索引版本（邮件可忽略） | ❌ |
-| `textContent` | String? | ❌（被 omit） | 无需（邮件不展示全文） | ❌ |
-| — **关系字段** — | — | — | — | — |
-| `tags` | Tag[] | ✅（include） | **标签展示** | ⚠️（Card 本身未直接渲染 tags，但数据返回） |
-| `collection` | Collection | ✅（include） | **所属收藏夹名称+颜色** | ✅（LinkCollection 组件） |
-| `pinnedBy` | { id: number }[] | ✅（include，仅当前用户） | **固定状态标识** | ✅（LinkPin 组件 + 前端过滤 pinned） |
+| 字段 | Prisma 类型 | DB 可空性 | Dashboard 是否返回 | 邮件摘要用途 | 前端 Card 是否使用 |
+|------|------------|:---------:|:------------------:|-------------|:------------------:|
+| `id` | Int @default(autoincrement()) | ❌ 非空 | ✅ | 生成详情链接、去重 | ✅（拖拽 key、路由跳转） |
+| `name` | String @default("") | ❌ 非空 | ✅ | **链接标题（摘要核心）** | ✅（卡片主标题，line-clamp-2） |
+| `description` | String @default("") | ❌ 非空 | ✅ | **用户自定义描述** | ❌（Dashboard Card 不显示） |
+| `metaDescription` | String? | ✅ 可空 | ✅ | **页面元描述（归档 Worker 抓取所得）** | ❌ |
+| `url` | String? | ✅ 可空 | ✅ | **跳转原始链接** | ✅（LinkTypeBadge 显示域名、点击跳转） |
+| `type` | String @default("url") | ❌ 非空 | ✅ | 链接类型徽标（url/pdf/image/monolith） | ✅（LinkTypeBadge） |
+| `preview` | String? | ✅ 可空 | ✅ | **缩略图状态判断**（"unavailable" / 归档路径） | ✅（Image 组件 + 轮询 refetch 判断） |
+| `image` | String? | ✅ 可空 | ✅ | 截图归档可用性判断 | ✅（formatStats.formatAvailable） |
+| `pdf` | String? | ✅ 可空 | ✅ | PDF 归档可用性判断 | ✅（同上） |
+| `readable` | String? | ✅ 可空 | ✅ | Readability 归档可用性判断 | ✅（同上） |
+| `monolith` | String? | ✅ 可空 | ✅ | Monolith 归档可用性判断 | ✅（同上） |
+| `icon` | String? | ✅ 可空 | ✅ | Phosphor 图标名称（用户自定义图标） | ✅（LinkIcon） |
+| `iconWeight` | String? | ✅ 可空 | ✅ | 图标粗细 | ✅（LinkIcon） |
+| `color` | String? | ✅ 可空 | ✅ | 图标颜色 | ✅（LinkIcon） |
+| `createdAt` | DateTime @default(now()) | ❌ 非空 | ✅ | **创建时间（摘要排序+展示）** | ✅（LinkDate，回退用） |
+| `importDate` | DateTime? | ✅ 可空 | ✅ | 导入时间（优先于 createdAt 展示） | ✅（LinkDate，优先用） |
+| `updatedAt` | DateTime @default(now()) @updatedAt | ❌ 非空 | ✅ | 缩略图 URL 缓存刷新参数 | ✅（Image src query） |
+| `lastPreserved` | DateTime? | ✅ 可空 | ✅ | 上次归档成功时间（可选展示） | ❌ |
+| `collectionId` | Int | ❌ 非空 | ✅ | 关联收藏夹 | ✅（匹配 Collection 对象） |
+| `createdById` | Int? | ✅ 可空 | ✅ | 创建者 ID（可选展示） | ❌ |
+| `clientSide` | Boolean @default(false) | ❌ 非空 | ✅ | 是否客户端归档（邮件可忽略） | ❌ |
+| `aiTagged` | Boolean @default(false) | ❌ 非空 | ✅ | 是否已 AI 打标签（可选展示） | ❌ |
+| `indexVersion` | Int? | ✅ 可空 | ✅ | 全文索引版本（邮件可忽略） | ❌ |
+| `textContent` | String? | ✅ 可空 | ❌（被 omit） | 无需（邮件不展示全文） | ❌ |
+| — **关系字段** — | — | — | — | — | — |
+| `tags` | Tag[] | — | ✅（include） | **标签展示** | ⚠️（Card 未直接渲染，但数据返回） |
+| `collection` | Collection | — | ✅（include） | **所属收藏夹名称+颜色** | ✅（LinkCollection 组件） |
+| `pinnedBy` | { id: number }[] | — | ✅（include，仅当前用户） | **固定状态标识** | ✅（LinkPin 组件 + 前端过滤 pinned） |
 
-**邮件摘要核心可复用字段（14 个，全部 Dashboard 已返回）：**
-`id`、`name`、`description`、`metaDescription`、`url`、`preview`、`image`、`type`、`createdAt`、`importDate`、`tags`、`collection.name`、`collection.id`、`collection.color`、`pinnedBy`
+**邮件摘要核心可复用字段（15 个，全部 Dashboard 已返回）：**
+`id`、`name`、`description`、`metaDescription`、`url`、`preview`、`image`、`type`、`createdAt`、`importDate`、`lastPreserved`、`tags`、`collection.name`、`collection.color`、`pinnedBy`
 
 **特别修正：之前评估认为 description 可能不含——实际 Prisma 未 omit 该字段，description 和 metaDescription 均完整返回。**
+
+##### 5.2.5.1 关键字段可空性与值来源详解
+
+###### `createdAt` / `updatedAt` —— 非空，Prisma 自动维护
+
+| 属性 | 值 |
+|------|---|
+| DB 可空性 | ❌ **非空**（`@default(now())`） |
+| 值来源 | Prisma ORM 自动赋值 |
+| 特殊行为 | `updatedAt` 带 `@updatedAt`，每次更新行自动刷新 |
+| 空值风险 | **无**——每条 Link 必存在 |
+
+###### `description` —— 非空但可能为空字符串
+
+| 属性 | 值 |
+|------|---|
+| DB 可空性 | ❌ **非空**（`@default("")`） |
+| 值来源 | 1. 用户新建 Link 时显式传入（[postLink.ts#L108](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/links/postLink.ts#L108)）<br>2. 导入时从备份文件读取（[importFromLinkwarden.ts#L68](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L68)） |
+| 空值形式 | 空字符串 `""`（用户未填写时） |
+| 最大长度 | 导入时限制 254 字符（`.slice(0, 254)`） |
+| 注意 | Schema 的 `PostLinkSchema` 中 description 为可选（z.optional），但 DB 层 default "" 保证永不 null |
+
+###### `metaDescription` —— 可空，归档 Worker 异步填充
+
+| 属性 | 值 |
+|------|---|
+| DB 可空性 | ✅ **可空**（`String?`，无 default） |
+| 值来源 | **仅由归档 Worker 抓取**——Playwright 访问页面后读取 `<meta name="description">` 内容（[archiveHandler.ts#L151-L164](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/archiveHandler.ts#L151-L164)） |
+| 空值场景 | 1. Link 创建后尚未被 Worker 处理<br>2. 页面无 `<meta name="description">` 标签<br>3. 非 URL 类型 Link（pdf/image 等不执行抓取）<br>4. URL 无法被服务端访问（标记 skipPreservation） |
+| 值处理 | 抓取后 `.trim().slice(0, 500)`——最多 500 字符 |
+| 典型占比 | 非 URL 类型 + 未处理的新 Link 可能有 **20%~50%** 为 null |
+
+###### `importDate` —— 可空，仅导入数据有值
+
+| 属性 | 值 |
+|------|---|
+| DB 可空性 | ✅ **可空**（`DateTime?`，无 default） |
+| 值来源 | 1. Linkwarden 导入：`new Date(link.importDate \|\| link.createdAt)`（[importFromLinkwarden.ts#L69](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L69)）<br>2. Pocket 导入：`new Date(Number(link.time_added) * 1000)`，若 `time_added` 缺失则为 `null`（[importFromPocket.ts#L70-L72](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L70-L72)） |
+| 空值场景 | **所有手动创建的 Link 均为 null**（[postLink.ts](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/links/postLink.ts) 创建时未设置该字段） |
+| 前端展示逻辑 | [LinkDate.tsx#L6](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkDate.tsx#L6)：`link.importDate \|\| link.createdAt`——**importDate 优先，fallback 到 createdAt** |
+
+###### `lastPreserved` —— 可空，归档完成后填充
+
+| 属性 | 值 |
+|------|---|
+| DB 可空性 | ✅ **可空**（`DateTime?`，无 default） |
+| 值来源 | 1. 新建不可抓取的 URL：`postLink.ts#L140` 直接设为当前时间（`!shouldPreserveUrl && link.url` 时）<br>2. 归档 Worker 完成所有格式处理后：[archiveHandler.ts#L216](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/archiveHandler.ts#L216) 设为当前时间<br>3. Worker 跳过归档时（skipPreservation / 非 http URL）：[archiveHandler.ts#L51](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/archiveHandler.ts#L51) 设为当前时间 |
+| 空值场景 | **新建且尚未被 Worker 处理的可抓取 URL 类型 Link**——约为新创建后几秒钟到几分钟内为 null |
+| 含义 | 表示"归档流程已执行"——无论成功还是失败，只要 Worker 处理过就会有值 |
+
+###### `url` / `preview` / `image` / `pdf` / `readable` / `monolith` —— 可空，三态值模式
+
+这些归档格式字段遵循统一的三态模式：
+
+| 状态 | 值示例 | 含义 |
+|------|--------|------|
+| 未处理 | `null` | Link 创建后尚未被 Worker 处理 |
+| 处理成功 | `"archives/12/456.jpeg"` / `"archives/12/456.pdf"` 等 | 归档文件的相对路径 |
+| 不可用 | `"unavailable"` | Worker 处理后确认无法生成该格式 |
+
+`preview` 字段额外说明：通过 `/api/v1/archives/{id}?format=jpeg&preview=true` 接口访问时会附带 `&updatedAt={updatedAt}` 作为缓存刷新参数（[DashboardLinks.tsx#L157](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/DashboardLinks.tsx#L157)）。
+
+`url` 字段说明：手动创建 Link 时可为 null（例如上传 PDF 或图片作为 Link），但绝大多数 Link 有 url。
+
+##### 5.2.5.2 邮件摘要展示时的空值处理建议
+
+| 字段 | 空值/默认值 | 邮件中处理建议 |
+|------|------------|---------------|
+| **`name`** | `""`（空字符串） | 显示 fallback：<br>1. 若有 `url` → 显示域名（`new URL(url).host`）<br>2. 若无 `url` → 显示 `type`（如 `"PDF"`、`"Image"`） |
+| **`description`** | `""`（空字符串） | fallback 到 `metaDescription`（若 metaDescription 也为空则不展示描述行） |
+| **`metaDescription`** | `null` | fallback 到 `description`（两者都空则省略描述区域） |
+| **`url`** | `null` | 不渲染跳转链接；但仍可展示详情页链接 `/dashboard/links/{id}` |
+| **`preview` / `image`** | `null` 或 `"unavailable"` | 不展示缩略图；或展示站点 favicon 作为占位（需从 `url` 提取域名） |
+| **`importDate`** | `null` | fallback 到 `createdAt`，与前端 LinkDate 组件一致 |
+| **`lastPreserved`** | `null` | 不展示该指标；或标注为"待归档" |
+| **`tags`** | `[]`（空数组） | 不展示标签行 |
+| **`pinnedBy`** | `[]`（空数组） | 不显示"固定"徽标 |
+
+**推荐模板渲染优先级（单条链接展示）：**
+
+```
+1. [缩略图]  preview != null && preview != "unavailable"
+              → /api/v1/archives/{id}?format=jpeg&preview=true&updatedAt={updatedAt}
+            否则不展示
+
+2. [标题]    name != "" → name
+            否则 url != null → new URL(url).host
+            否则 → type.toUpperCase()
+
+3. [描述]    description != "" → description（截断 200 字符）
+            否则 metaDescription != null → metaDescription（截断 200 字符）
+            否则 → 不展示
+
+4. [元信息]
+   - 标签：tags.length > 0 → 展示标签名列表
+   - 收藏夹：collection.name + 颜色圆点
+   - 日期：importDate || createdAt → toLocaleDateString()
+   - 固定徽标：pinnedBy.length > 0 → 展示
+   - 类型徽标：url + type 组合显示
+```
 
 #### 5.2.6 collectionLinks 返回结构（第 149-152 行）
 
