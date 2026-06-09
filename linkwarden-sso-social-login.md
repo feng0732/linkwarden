@@ -2,7 +2,7 @@
 
 本文档从代码实现角度梳理 Linkwarden 项目中 SSO（单点登录）与社交登录（Social Login）的完整实现链路，涵盖 **Provider 配置**、**回调处理**、**用户会话建立** 三大核心阶段。
 
-项目基于 [NextAuth.js (v4)](https://next-auth.js.org/) 实现认证，使用 **JWT Session 策略**（非数据库 Session 策略），并通过 Prisma ORM 持久化 Account / User / AccessToken 等数据。
+项目基于 [NextAuth.js v4.24.13](https://next-auth.js.org/) 实现认证（`yarn.lock` 实际解析版本，`package.json` 声明范围 `^4.22.1`），使用 **JWT Session 策略**（非数据库 Session 策略），并通过 Prisma ORM 持久化 Account / User / AccessToken 等数据。
 
 ---
 
@@ -22,8 +22,9 @@
    - 3.4 [session 回调：会话对象组装 + 订阅校验](#34-session-回调会话对象组装--订阅校验)
 4. [用户会话建立](#4-用户会话建立)
    - 4.1 [SessionProvider 注入（前端）](#41-sessionprovider-注入前端)
-   - 4.2 [JWT 的签发与 Cookie 存储](#42-jwt-的签发与-cookie-存储)
-   - 4.3 [浏览器会话 Cookie vs API Token Authorization Header：边界详解](#43-浏览器会话-cookie-vs-api-token-authorization-header边界详解)
+     - 4.1.1 [两个会话查询入口的关键边界](#411-两个会话查询入口的关键边界)
+   - 4.2 [JWT 的签发与三类 Token 的创建路径](#42-jwt-的签发与三类-token-的创建路径)
+   - 4.3 [三类 Token 与两类传输通道：边界详解](#43-三类-token-与两类传输通道边界详解)
    - 4.4 [请求鉴权：verifyToken / verifyUser / isAuthenticatedRequest](#44-请求鉴权verifytoken--verifyuser--isauthenticatedrequest)
    - 4.5 [AccessToken 体系：可撤销的 API Token](#45-accesstoken-体系可撤销的-api-token)
    - 4.6 [前端路由守卫：AuthRedirect](#46-前端路由守卫authredirect)
@@ -229,7 +230,7 @@ adapter.linkAccount = (account) => {
 | `POST /signin/:provider` | POST | Email Provider 提交邮箱地址 |
 | `GET /callback/:provider` | GET | **核心回调路由**：第三方 OAuth/OIDC Provider 携带 `code` 回调到此，NextAuth 完成 code→token→userinfo 交换 |
 | `POST /callback/:provider` | POST | Credentials Provider 的登录提交 |
-| `GET /session` | GET | 查询当前会话（SessionProvider 自动调用） |
+| `GET /session` | GET | 查询当前会话（SessionProvider 自动调用，**仅支持 Cookie 认证**，不接受 Bearer Token） |
 | `POST /session` | POST | 更新会话（不常用） |
 | `GET /csrf` | GET | 获取 CSRF Token |
 | `POST /signout` | POST | 登出：清除 Cookie + 触发事件 |
@@ -261,10 +262,10 @@ const callbackUrl = `${process.env.NEXTAUTH_URL}/callback/email?token=${token}&e
 
 **注意 `/api/v1/session` 与 `/api/v1/auth/session` 的区别**（两个同名但完全不同的端点）：
 
-| 端点 | 归属 | 作用 |
-|---|---|---|
-| `GET /api/v1/auth/session` | NextAuth 内置 | 由 SessionProvider 自动调用，返回当前 Cookie 对应的 session 对象 |
-| `POST /api/v1/session` | 项目自定义 API | 使用**用户名/密码**换取 API Token（走 `verifyByCredentials` + `createSession`），不涉及 OAuth 流程。代码：[apps/web/pages/api/v1/session/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/pages/api/v1/session/index.ts) |
+| 端点 | 归属 | 作用 | 支持的认证方式 |
+|---|---|---|---|
+| `GET /api/v1/auth/session` | NextAuth 内置 | 由 SessionProvider 自动调用，返回当前 Cookie 对应的 session 对象 | **仅 Cookie**（不支持 Bearer Header） |
+| `POST /api/v1/session` | 项目自定义 API | 使用**用户名/密码**换取 API Token（走 `verifyByCredentials` + `createSession`），不涉及 OAuth 流程。代码：[apps/web/pages/api/v1/session/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/pages/api/v1/session/index.ts) | 请求体中的 `{ username, password }`，无需预先认证 |
 
 ### 3.2 signIn 回调：准入控制 + 自动账号关联
 
@@ -435,6 +436,51 @@ interface Session {
 - `basePath="/api/v1/auth"` 对应 NextAuth 路由挂载位置 `/api/v1/auth/[...nextauth]`。
 - `refetchOnWindowFocus={false}` 关闭窗口聚焦时自动续期。
 
+#### 4.1.1 两个会话查询入口的关键边界
+
+项目存在**两条完全独立的会话查询/鉴权入口**，它们支持的认证方式截然不同，不可混淆：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      入口 A：NextAuth 内置 Session 路由                   │
+│                                                                         │
+│   Web: SessionProvider ──► GET /api/v1/auth/session (NextAuth 内置)     │
+│                                                                         │
+│   ✅ 支持：Cookie (next-auth.session-token)                              │
+│   ❌ 不支持：Authorization: Bearer <token>                               │
+│   调用方：仅 Web 浏览器前端                                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      入口 B：业务 API getToken 鉴权                       │
+│                                                                         │
+│   Web / Mobile ──► GET /api/v1/users/me                                 │
+│                     GET /api/v1/links                                   │
+│                     POST /api/v1/collections 等所有业务 API              │
+│                     │                                                   │
+│                     ▼                                                   │
+│                getToken({ req })  (next-auth/jwt)                       │
+│                                                                         │
+│   ✅ 支持：Cookie (next-auth.session-token)                              │
+│   ✅ 支持：Authorization: Bearer <token>                                 │
+│   调用方：Web 浏览器 + 移动端 App + 第三方 API 调用                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**入口 A（NextAuth `GET /api/v1/auth/session`）**：
+- 由 NextAuth `[...nextauth].ts` catch-all 路由自动处理，**无自定义代码覆盖**（[apps/web/pages/api/v1/auth](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/pages/api/v1/auth) 目录中仅有 `[...nextauth].ts` + 3 个自定义 reset/forgot/verify-email 路由，无自定义 session.ts）
+- NextAuth v4 的 session 路由源码**仅读取 Cookie**，不解析 `Authorization` Header
+- 由 Web 前端 [SessionProvider](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/pages/_app.tsx#L50-L54) 和 `useSession()` hook 自动调用
+- **移动端 App 完全不使用此入口**（[apps/mobile](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile) 中未引用 `useSession` / `SessionProvider`）
+
+**入口 B（业务 API `getToken({ req })`）**：
+- 所有 `/api/v1/*` 业务路由（非 NextAuth 内置）通过 [verifyToken](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/verifyToken.ts#L12) 或 [isAuthenticatedRequest](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/web/lib/api/isAuthenticatedRequest.ts#L12) 间接调用 `getToken({ req })`
+- `getToken` 来自 `next-auth/jwt`，其内部逻辑**同时支持 Cookie 和 Bearer Header**（Cookie 优先）
+- Web 浏览器调用业务 API 时走 Cookie 通道，移动端走 Bearer Header 通道，后端代码无需区分
+
+**为何 SessionProvider 不能用 Bearer Token**：
+NextAuth React Client (`next-auth/react`) 在 fetch `/api/v1/auth/session` 时使用浏览器默认 `credentials: "include"`（自动携带 Cookie），但**没有提供注入自定义 Authorization Header 的机制**。因此移动端无法复用 `useSession()`，必须实现独立的 Zustand auth store（[apps/mobile/store/auth.ts](file:///d:/fz/0601/solo-dogfeeding/code/124-linkwarden/apps/mobile/store/auth.ts)），手动为每个 API 请求注入 Bearer Header。
+
 ### 4.2 JWT 的签发与三类 Token 的创建路径
 
 项目使用统一的 JWT 格式（`{ id, iat, exp, jti, sub? }`），但**存在三种独立的创建路径**，对应的后端持久化行为截然不同。
@@ -464,7 +510,9 @@ NextAuth 的 `[...nextauth].ts` 中**没有配置 `events` 字段**（无 `signI
 
 ### 4.3 三类 Token 与两类传输通道：边界详解
 
-项目使用两条独立的 Token 传输通道（Cookie vs Bearer Header），由 `next-auth/jwt` 的 `getToken({ req })` 自动识别，后端鉴权逻辑不区分来源。但**三类 Token 的撤销能力和在 Token 列表中的可见性存在本质差异**。
+**注意**：本节描述的"双通道"仅适用于**入口 B（业务 API getToken 鉴权）**。入口 A（NextAuth 内置 session 路由）仅支持 Cookie，不支持 Bearer Header，详见 [4.1.1 两个会话查询入口的关键边界](#411-两个会话查询入口的关键边界)。
+
+项目使用两条独立的 Token 传输通道（Cookie vs Bearer Header），由 `next-auth/jwt` 的 `getToken({ req })` 自动识别，**业务 API 的后端鉴权逻辑不区分来源**。但**三类 Token 的撤销能力和在 Token 列表中的可见性存在本质差异**。
 
 #### 4.3.1 Token 传输的双重通道
 
@@ -477,7 +525,7 @@ NextAuth 的 `[...nextauth].ts` 中**没有配置 `events` 字段**（无 `signI
   (浏览器自动携带，HttpOnly)           (移动端 / API 调用手动设置)
 ```
 
-`getToken` 的提取优先级（NextAuth v4.22.1 源码逻辑）：
+`getToken` 的提取优先级（NextAuth v4.24.13 源码逻辑，业务 API 鉴权使用）：
 1. 先尝试从 Cookie 中读取（`next-auth.session-token` 或 `__Secure-next-auth.session-token`，HTTPS 环境下使用后者）
 2. 若无 Cookie，尝试从 `Authorization` 请求头提取 `Bearer <token>`
 3. 都没有则返回 `null`
