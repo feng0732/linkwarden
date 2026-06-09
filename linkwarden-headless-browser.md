@@ -87,13 +87,14 @@ if (!browser.isConnected?.()) {
 
 ### 2.4 链接批次公平调度
 
-**待处理链接筛选条件** — `apps/worker/lib/getLinkBatchFairly.ts#L35-L38`：
+**待处理链接筛选条件（决定是否会被重试）** — `apps/worker/lib/getLinkBatchFairly.ts#L35-L38`：
 ```typescript
 const baseLinkWhere: Prisma.LinkWhereInput = {
   url: { not: null },
-  lastPreserved: null,   // ← 只取从未处理过的链接
+  lastPreserved: null,   // ← 只取 lastPreserved 仍为 null 的链接
 };
 ```
+> **关键**：`lastPreserved` 一旦被写入非 null 值（无论成功失败），该链接就**永远不会**再进入下一批处理。
 
 **轮询取链接（用户间公平）** — `apps/worker/lib/getLinkBatchFairly.ts#L110-L145`：
 - 每轮从每个用户取 `linksPerUser = maxBatchLinks / users.length` 条
@@ -222,21 +223,71 @@ const metaDescription = await page.evaluate(() => {
 // 截取前 500 字符存入 link.metaDescription
 ```
 
-### 4.2 预览图（Preview）生成
+### 4.2 预览图（Preview）生成 — OG Image 与回退逻辑
 
-**策略一：优先 OG Image** — `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L21-L57`：
-1. `page.evaluate` 读取 `<meta property="og:image">`
-2. 相对路径拼 `document.location.origin`
-3. SSRF 检查后 `page.goto(ogImageUrl)` 跳转抓取
-4. `generatePreview(buffer, collectionId, linkId)` 生成缩略图
-5. `page.goBack()` 回到原页面
+**`handleArchivePreview` 完整控制流** — `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L17-L82`：
 
-**策略二：回退低质量截图** — `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L59-L81`：
-```typescript
-await page.screenshot({ type: "jpeg", quality: 20 })
-// 限制 PREVIEW_MAX_BUFFER（默认 10MB）
-// 保存到 archives/preview/{collectionId}/{linkId}.jpeg
 ```
+读取 <meta property="og:image"> → ogImageUrl
+        │
+        ├─ ogImageUrl === null（页面无 OG 标签）
+        │     │
+        │     └─ previewGenerated = false → 进入回退截图
+        │
+        └─ ogImageUrl 存在
+              │
+              ├─ 相对路径 → 拼接 origin
+              │
+              └─ try {
+                    assertUrlIsSafeForServerSideFetch(ogImageUrl)  ← SSRF 检查
+                    page.goto(ogImageUrl)                          ← 跳转到 OG 图
+                    imageResponse.body()                            ← 取 buffer
+                    generatePreview(...)                            ← 生成缩略图
+                    page.goBack()                                   ← 返回原页面
+                 } catch (error) {
+                    if (error instanceof UnsafeUrlError) {
+                        // 静默吞掉，什么也不做
+                    } else {
+                        throw error;   ← 非 SSRF 异常（网络错误等）重新抛出
+                    }
+                 }
+                      │
+                      ├─ SSRF 不安全（UnsafeUrlError）：被静默吞掉
+                      │     → previewGenerated = false → 进入回退截图
+                      │
+                      ├─ 其他异常（page.goto 失败、buffer 读取失败等）：
+                      │     → throw 向上冒泡 → handleArchivePreview 整体失败
+                      │     → ❌ 不会走回退截图
+                      │
+                      └─ OG Image 成功：
+                            ├─ generatePreview() 返回 true  → previewGenerated = true → 不回退
+                            └─ generatePreview() 返回 false → previewGenerated = false → 进入回退截图
+```
+
+**回退截图逻辑** — `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L59-L81`：
+```typescript
+if (!previewGenerated && !link.preview?.startsWith("archive")) {
+  await page
+    .screenshot({ type: "jpeg", quality: 20 })
+    .then(async (screenshot) => {
+      // 超过 PREVIEW_MAX_BUFFER（默认10MB）则跳过
+      // 保存到 archives/preview/{collectionId}/{linkId}.jpeg
+      // 更新 link.preview 字段
+    });
+}
+```
+> 注意：回退截图的 `page.screenshot()` 本身挂在 `.then()` 上，没有对应 `.catch()`；如果截图抛异常，`handleArchivePreview` 会整体失败并向上抛出。
+
+**回退触发条件汇总**：
+
+| 场景 | `previewGenerated` | 是否走回退截图 |
+|------|-------------------|--------------|
+| 页面无 `og:image` 标签 | `false` | ✅ |
+| `og:image` URL 是 SSRF 不安全（`UnsafeUrlError`） | `false` | ✅ |
+| `generatePreview()` 生成缩略图返回 `false` | `false` | ✅ |
+| `page.goto(ogImageUrl)` 抛网络错误 / `body()` 抛异常 | —（函数整体 throw）| ❌ |
+| OG Image 完整成功 | `true` | ❌ |
+| `link.preview` 已经是 `archive*` 开头（已有归档预览） | 任意 | ❌ |
 
 ### 4.3 Readability 正文提取
 
@@ -311,34 +362,164 @@ axios.get(`https://web.archive.org/save/${url}`, { headers })
 
 ## 五、失败处理与重试机制代码引用
 
-### 5.1 单链接：失败标记为不可用（不重试）
+### 5.0 重提前提：待处理链接的筛选条件
 
-**`finally` 块标记逻辑** — `apps/worker/lib/archiveHandler.ts#L203-L230`：
+来自 `apps/worker/lib/getLinkBatchFairly.ts#L35-L38`：
 ```typescript
-const finalLink = await prisma.link.findUnique({ where: { id: link.id } });
-if (finalLink) {
+lastPreserved: null   // ← 只有此字段仍为 null 的链接才会被下一批选中
+```
+因此，**`lastPreserved` 是否被写入是判断链接能否被重试的唯一依据**。下面按 `archiveHandler` 的执行阶段分三类讨论。
+
+---
+
+### 5.1 阶段 A：主流程前失败（try 之前的早退出分支）
+
+**代码位置** — `apps/worker/lib/archiveHandler.ts#L44-L61`：
+```typescript
+if (
+  skipPreservation ||
+  (!link.url?.startsWith("http://") && !link.url?.startsWith("https://"))
+) {
   await prisma.link.update({
     where: { id: link.id },
     data: {
-      lastPreserved: new Date().toISOString(),           // ← 标记为"已处理过"
-      readable: !finalLink.readable  ? "unavailable" : undefined,
-      image:    !finalLink.image     ? "unavailable" : undefined,
-      monolith: !finalLink.monolith  ? "unavailable" : undefined,
-      pdf:      !finalLink.pdf       ? "unavailable" : undefined,
-      preview:  !finalLink.preview   ? "unavailable" : undefined,
+      lastPreserved: new Date().toISOString(),   // ← 写 lastPreserved
+      readable: "unavailable",
+      image: "unavailable",
+      monolith: "unavailable",
+      pdf: "unavailable",
+      preview: "unavailable",
       indexVersion: null,
     },
   });
+  return;   // ← 直接返回，不进入 try / finally
 }
 ```
 
-**关键结论**：
-- 无论成功/失败/超时，`lastPreserved` 一定会被写入
-- 未生成的格式写 `"unavailable"`（而不是 `null`）
-- 批次查询条件是 `lastPreserved: null`，因此该链接**永远不会再进入处理队列**
-- → **单链接只有一次处理机会，没有自动重试**
+**触发条件**：
+- `skipPreservation === true`：由 SSRF 检查抛出 `UnsafeUrlError` 或 `DISABLE_PRESERVATION=true` 导致
+- URL 不是 `http://` 或 `https://` 开头
 
-### 5.2 批次级：单条失败不影响同批其他链接
+**对重试的影响**：
+| 项目 | 结果 |
+|------|------|
+| `lastPreserved` | ✅ **被写入为当前时间** |
+| 各格式字段 | ✅ 全部硬编码为 `"unavailable"` |
+| 是否进入 `finally` | ❌ 不会，代码在 `return` 处已退出 |
+| 是否关闭 BrowserContext | N/A（Context 尚未创建） |
+| **下一批是否会被重试** | ❌ **不会**（`lastPreserved` 非 null） |
+
+---
+
+### 5.2 阶段 B：try 之前但 BrowserContext 创建期间失败
+
+`archiveHandler` 中，**`try {` 关键字出现在第 109 行**，但以下代码在 try 之前执行（`apps/worker/lib/archiveHandler.ts#L63-L108`）：
+
+```
+L63  const abortController = new AbortController();
+L66  const timeoutPromise = new Promise(...);
+L77  const contextOptions = getDefaultContextOptions();
+L78  const context = await browser.newContext(contextOptions);   ← 可能抛异常
+L79  await protectPageRequests(context);                         ← 可能抛异常
+L80  const page = await context.newPage();                       ← 可能抛异常
+L82  createFolder(...);
+L83  createFolder(...);
+L85  const archivalTags = link.tags.filter(isArchivalTag);
+L86  const archivalSettings = ...    // 读取用户归档偏好
+```
+
+**如果 L78-L80（浏览器上下文/页面创建）抛异常**：
+- 异常直接向上抛出，**不会进入 `try`，也不会进入 `finally`**
+- `lastPreserved` **不会被写入**（仍为 `null`）
+- BrowserContext 可能泄漏（没有 `context.close()`）
+
+**对重试的影响**：
+| 项目 | 结果 |
+|------|------|
+| `lastPreserved` | ❌ **未被写入（仍为 null）** |
+| 各格式字段 | 保持不变 |
+| 是否进入 `finally` | ❌ 不会 |
+| 是否关闭 BrowserContext | ❌ 不会（可能泄漏） |
+| **下一批是否会被重试** | ✅ **会**（`lastPreserved` 仍为 null） |
+
+这是整个流程中**唯一会导致链接自动重试**的失败场景。
+
+---
+
+### 5.3 阶段 C：主流程内失败（try 块内部）
+
+**try/catch/finally 结构** — `apps/worker/lib/archiveHandler.ts#L109-L230`：
+```typescript
+try {
+  await Promise.race([
+    (async () => {
+      // determineLinkType → imageHandler / pdfHandler / page.goto + 各内容提取
+    })(),
+    timeoutPromise,
+  ]);
+} catch (err) {
+  console.log("Failed Link:", link.url);
+  console.log("Reason:", err);
+  throw err;   // ← 捕获后重新抛出
+} finally {
+  if (timeoutId !== undefined) clearTimeout(timeoutId);
+
+  const finalLink = await prisma.link.findUnique({ where: { id: link.id } });
+  if (finalLink) {
+    await prisma.link.update({
+      where: { id: link.id },
+      data: {
+        lastPreserved: new Date().toISOString(),   // ← 必然写 lastPreserved
+        readable: !finalLink.readable  ? "unavailable" : undefined,
+        image:    !finalLink.image     ? "unavailable" : undefined,
+        monolith: !finalLink.monolith  ? "unavailable" : undefined,
+        pdf:      !finalLink.pdf       ? "unavailable" : undefined,
+        preview:  !finalLink.preview   ? "unavailable" : undefined,
+        indexVersion: null,
+      },
+    });
+  } else {
+    await removeFiles(link.id, link.collectionId);   // 链接已被删除则清理文件
+  }
+
+  await context?.close().catch(() => {});   // ← 必然关闭 Context
+}
+```
+
+**触发条件（try 内任意异常）**：
+- `determineLinkType` 中 HEAD 请求异常（fetchHeaders 本身已 try/catch，但极端情况仍可能抛）
+- `imageHandler` / `pdfHandler` 抛异常（下载失败、Buffer 超限之外的错误）
+- `page.goto()` 失败 / 超时
+- `metaDescription` 的 `page.evaluate()` 抛异常
+- `handleArchivePreview()` 抛异常（如 OG Image 非 SSRF 错误、回退截图失败）
+- `handleReadability()` 抛异常（DOMPurify / Readability / 文件写入失败等）
+- `handleScreenshotAndPdf()` 抛异常（autoScroll 抛异常、截图/PDF 异常 — 注意其内部 `Promise.allSettled` 只能隔离截图和 PDF 之间，不能隔离 autoScroll 和上层）
+- 全局 `BROWSER_TIMEOUT` 超时触发（`timeoutPromise` reject）
+- `handleMonolith` 之外的任何未被局部 catch 的错误
+
+**对重试的影响**：
+| 项目 | 结果 |
+|------|------|
+| `lastPreserved` | ✅ **被写入为当前时间（finally 必然执行）** |
+| 各格式字段 | ✅ 仍为空的格式被标记为 `"unavailable"`，已成功生成的保留 |
+| 是否关闭 BrowserContext | ✅ `context?.close()` 必然调用 |
+| **下一批是否会被重试** | ❌ **不会**（`lastPreserved` 非 null） |
+
+---
+
+### 5.4 三阶段失败行为对比
+
+| 失败阶段 | 代码位置 | `lastPreserved` 是否写入 | 是否会被下一批重试 | 是否关闭 BrowserContext |
+|---------|---------|------------------------|-------------------|----------------------|
+| **A. 主流程前早退出**（SSRF 不安全 / 非 http(s) / DISABLE_PRESERVATION） | `apps/worker/lib/archiveHandler.ts#L44-L61` | ✅ 写入 | ❌ 不会 | N/A（还未创建） |
+| **B. BrowserContext 创建失败**（`browser.newContext` / `newPage` 抛异常） | `apps/worker/lib/archiveHandler.ts#L77-L80`（try 之外） | ❌ 不写入 | ✅ **会重试** | ❌ 可能泄漏 |
+| **C. 主流程内任意异常**（try 块内所有代码） | `apps/worker/lib/archiveHandler.ts#L109-L198` | ✅ 写入（finally） | ❌ 不会 | ✅ `finally` 中关闭 |
+
+> **核心结论**：只有阶段 B（BrowserContext 创建期间失败）会导致链接在后续批次中被自动重试；其余失败均会写入 `lastPreserved` 从而永久标记为"已处理"，失败格式字段值为 `"unavailable"`。
+
+---
+
+### 5.5 批次级：单条失败不影响同批其他链接
 
 **`Promise.allSettled` 并发处理** — `apps/worker/workers/linkProcessing.ts#L71-L72`：
 ```typescript
@@ -360,17 +541,19 @@ const archiveLink = async (link) => {
 };
 ```
 
-### 5.3 各模块局部容错汇总
+### 5.6 各模块局部容错汇总
 
-| 模块 | 文件与行号 | 容错行为 |
-|------|-----------|---------|
-| `fetchHeaders` | `apps/worker/lib/fetchHeaders.ts#L18-L21` | 超时/失败 → 返回 `null`，类型默认 `"url"` |
-| `handleArchivePreview` | `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L52-L57` | OG Image 失败 → 回退到 `page.screenshot` |
-| `handleScreenshotAndPdf` | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L92` | `Promise.allSettled` 让截图和 PDF 互不影响 |
-| `handleMonolith` | `apps/worker/lib/archiveHandler.ts#L189-L193` | 独立 `.catch()`，失败只打日志不抛出 |
-| `sendToWayback` | `apps/worker/lib/preservationScheme/sendToWayback.ts#L20` | `.catch(() => {})` 完全静默 |
+| 模块 | 文件与行号 | 容错行为 | 是否会冒泡到 archiveHandler 的 catch |
+|------|-----------|---------|-------------------------------------|
+| `fetchHeaders` | `apps/worker/lib/fetchHeaders.ts#L18-L21` | 超时/失败 → 返回 `null`，类型默认 `"url"` | ❌ 内部吞掉 |
+| `handleArchivePreview` OG Image SSRF 错误 | `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L52-L56` | `UnsafeUrlError` 静默 → 回退截图 | ❌ 吞掉并回退 |
+| `handleArchivePreview` OG Image 非 SSRF 错误 | `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L53-L54` | 其他异常（网络错误等）重新抛出 | ✅ 冒泡 |
+| `handleArchivePreview` 回退截图失败 | `apps/worker/lib/preservationScheme/handleArchivePreview.ts#L60-L80` | 无 `.catch()`，Promise reject 冒泡 | ✅ 冒泡 |
+| `handleScreenshotAndPdf` 截图 vs PDF | `apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts#L92` | `Promise.allSettled` 让截图和 PDF 互不影响 | 截图/PDF 各自失败不影响对方，但 autoScroll 等前置失败会冒泡 |
+| `handleMonolith` | `apps/worker/lib/archiveHandler.ts#L189-L193` | 独立 `.catch(err => console.error(err))` | ❌ 吞掉，只打日志 |
+| `sendToWayback` | `apps/worker/lib/preservationScheme/sendToWayback.ts#L20` | `.catch(() => {})` 完全静默 | ❌ 吞掉，且不 await |
 
-### 5.4 进程级自动恢复
+### 5.7 进程级自动恢复
 
 | 层级 | 机制 | 文件与行号 |
 |------|------|-----------|
@@ -402,32 +585,50 @@ const archiveLink = async (link) => {
 
 ---
 
-## 七、完整调用链速查
+## 七、完整调用链速查（含失败分支）
 
 ```
-apps/worker/index.ts (进程守护)
+apps/worker/index.ts (进程守护: 子进程挂了 5s 后重启)
  └─ spawn tsx worker.ts
      └─ apps/worker/worker.ts#init()
          └─ apps/worker/workers/linkProcessing.ts#linkProcessing() [无限循环]
              ├─ 每 30 分钟重启浏览器
-             ├─ apps/worker/lib/getLinkBatchFairly.ts#getLinkBatchFairly()  ── 取 N 条链接
+             ├─ apps/worker/lib/getLinkBatchFairly.ts#getLinkBatchFairly()  ── 取 lastPreserved=null 的链接
              └─ Promise.allSettled 并发:
                  └─ apps/worker/lib/archiveHandler.ts#archiveHandler(link, browser)
-                     ├─ SSRF 检查
-                     ├─ 5 分钟全局超时 AbortController
-                     ├─ BrowserContext + protectPageRequests (路由级 SSRF)
-                     ├─ apps/worker/lib/fetchHeaders.ts  HEAD 判断类型
-                     │   ├─ image ──► imageHandler.ts    (safeFetch 直下)
-                     │   ├─ pdf   ──► pdfHandler.ts      (safeFetch 直下)
-                     │   └─ url   ──► Playwright 流程:
-                     │       ├─ page.goto(url, domcontentloaded)
-                     │       ├─ metaDescription 提取
-                     │       ├─ handleArchivePreview.ts   (OG Image → 回退截图)
-                     │       ├─ handleReadability.ts      (DOMPurify → Readability → JSON + textContent)
-                     │       ├─ handleScreenshotAndPdf.ts (autoScroll → 全页截图 + PDF)
-                     │       ├─ handleMonolith.ts         (spawn monolith CLI)
-                     │       └─ sendToWayback.ts          (fire-and-forget)
-                     └─ finally:
-                         ├─ lastPreserved = now
-                         └─ 未生成格式 → "unavailable" (不再重试)
+                     │
+                     ├─ [阶段 A] SSRF 不安全 / 非 http(s) / DISABLE_PRESERVATION
+                     │     └─ 直接写 lastPreserved + 所有格式 "unavailable" → return (不重试)
+                     │
+                     ├─ AbortController + 5 分钟 timeoutPromise
+                     │
+                     ├─ [阶段 B] browser.newContext() / context.newPage()
+                     │     └─ 失败: 异常向上抛出，lastPreserved 不写 → 下批会重试 ✅
+                     │
+                     ├─ protectPageRequests (路由级 SSRF)
+                     ├─ createFolder
+                     ├─ 读取 archivalSettings
+                     │
+                     └─ try {
+                          Promise.race([
+                            determineLinkType → 分流:
+                              ├─ image ──► imageHandler.ts
+                              ├─ pdf   ──► pdfHandler.ts
+                              └─ url   ──► Playwright 流程:
+                                    ├─ page.goto(url, domcontentloaded)
+                                    ├─ metaDescription 提取
+                                    ├─ handleArchivePreview (OG Image → 仅 SSRF 错误会回退截图)
+                                    ├─ handleReadability
+                                    ├─ handleScreenshotAndPdf (autoScroll → 全页截图 + PDF)
+                                    ├─ handleMonolith (独立 .catch，不冒泡)
+                                    └─ sendToWayback (fire-and-forget)
+                          , timeoutPromise ])
+                        } catch (err) {
+                          日志 + re-throw
+                        } finally {                              ← [阶段 C] 必然执行
+                          ├─ 清 timeout
+                          ├─ 写 lastPreserved = now
+                          ├─ 未生成的格式 → "unavailable"         ← 不再重试 ❌
+                          └─ context.close()
+                        }
 ```
