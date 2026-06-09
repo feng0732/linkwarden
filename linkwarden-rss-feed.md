@@ -290,13 +290,48 @@ reduce 每次迭代行为：
 
 **所有 item 缺少 pubDate 的边界情况汇总表（首轮 + 后续轮对比）：**
 
-| 分支 | 频道 lastBuildDate | 首轮 feedLastPubDate | 首轮 newItems | 首轮是否创建 Link | 首轮 lastBuildDate 更新为 | 后续轮是否进入处理分支 |
-|------|-------------------|---------------------|---------------|------------------|------------------------|---------------------|
-| **A** | ✅ 存在（非空） | 频道的 lastBuildDate | `[]` | ❌ 不创建 | 频道的 lastBuildDate 对应时间 | ❌ 不进入（`频道时间 < 频道时间` = false） |
-| **A'** | ❌ 存在但为空字符串 `""` | `""`（空字符串） | 不执行（L23 throw） | - | - | 每轮都会 throw |
-| **B** | ❌ 缺失（undefined） | `new Date(0)`（reduce 初始值） | `[]` | ❌ 不创建 | `new Date(0)`（1970-01-01） | ❌ 不进入（`1970 < 1970` = false） |
+| 分支 | 频道 lastBuildDate | 首轮 feedLastPubDate | 首轮 newItems | 首轮是否创建 Link | 首轮 lastBuildDate 更新为 | 后续轮（频道时间不变）是否进入 | 后续轮（频道时间变新 T2 > T1）是否进入 |
+|------|-------------------|---------------------|---------------|------------------|------------------------|---------------------------|-------------------------------------|
+| **A** | ✅ 存在（非空） | 频道的 T1 | `[]` | ❌ 不创建 | T1 | ❌ 不进入（`T1 < T1` = false） | ✅ **进入**（`T1 < T2` = true），但空 newItems，不建 Link，游标前进到 T2 |
+| **A'** | ❌ 存在但为空字符串 `""` | `""`（空字符串） | 不执行（L23 throw） | - | - | 每轮都会 throw | 每轮都会 throw |
+| **B** | ❌ 缺失（undefined） | `new Date(0)`（reduce 初始值） | `[]` | ❌ 不创建 | `new Date(0)`（1970-01-01） | ❌ 不进入（`1970 < 1970` = false） | ❌ 不进入（频道无时间，feedLastPubDate 仍是 1970，`1970 < 1970` = false） |
 
 **分支 A 和 B 正常情况下（非 A'）都不会触发 L23-L26 的 throw，因为 feedLastPubDate 在两种情况下都是 truthy。只有分支 A'（频道 lastBuildDate 为空字符串）会触发 throw。**
+
+---
+
+**又一边界情况：频道 lastBuildDate 变新但所有 item 仍缺 pubDate**
+
+前情：第一轮已处理，数据库游标 = T1，频道所有 item 无 pubDate。
+
+第二轮场景：频道 `lastBuildDate` 更新为 T2（T2 > T1），但所有 item 依然没有 pubDate。
+
+**按代码顺序逐行拆解（仅分支 A，频道有 lastBuildDate）：**
+
+| 代码行 | 表达式 | 值分析 | 结果 |
+|--------|--------|--------|------|
+| L12-L21 | `feedLastPubDate` | 取频道的新时间 `T2`（非空字符串或 Date） | `T2` |
+| L23 | `!feedLastPubDate` | `!T2` → truthy 取反 | `false`，不抛错 |
+| L28 左条件 | `!rssSubscription.lastBuildDate` | `!T1` → T1 是 Date 对象，truthy，取反 | **`false`**，第一个条件不成立 |
+| L30-L31 右条件 | `new Date(T1) < new Date(T2)` | T2 比 T1 新 | **`true`**，第二个条件成立 |
+| L28 整体 | `false \|\| (true && true)` | 逻辑或运算 | **`true`，进入处理分支！** |
+| L38-L41 | `newItems = items.filter(...)` | 遍历每个 item：`itemPubDate = null` → `null && ...` 短路为 falsy → 全部被过滤 | `newItems = []`（空数组） |
+| L43-L46 | `hasPassedLimit(ownerId, 0)` | 0 条 → 不可能超配额 | 通过 |
+| L57-L85 | `Promise.all([])` | 空数组，不执行任何 create | 0 条 Link 被创建 |
+| L87-L91 | 游标更新 | `new Date(T2)` | 数据库游标前进到 `T2` |
+
+**分支 B（频道无 lastBuildDate）在同一场景下：**
+- 频道没有 lastBuildDate，所以不存在"频道时间变新"的概念
+- `feedLastPubDate` 始终是 reduce 结果，所有 item 无 pubDate → 始终是 `new Date(0)`
+- L30-L31：`new Date(0) < new Date(0)` → `false`
+- 整体条件 `false`，不进入处理分支
+
+**结论：只有分支 A（频道有 lastBuildDate 且该值确实更新了）才会出现"进入处理分支但 newItems 为空"的空转。** 虽然每次都进入分支，但由于游标每轮都会前进到最新的频道时间 T2 → T3 → T4...，所以每轮 L30-L31 只在频道时间真的更新时才返回 true，频道时间不变的轮次不会重复进入。
+
+影响评估：
+- 不产生重复 Link（newItems 为空）
+- 每次都执行 `findMany` + `safeFetch` + `parser.parseString` + `hasPassedLimit` + 空 `Promise.all` + 游标 update，有一定资源开销
+- 但不会无限循环进入（频道时间不变时 L28 整体为 false）
 
 ---
 
@@ -316,7 +351,7 @@ reduce 每次迭代行为：
 | 实现简单，无需存储每条已处理 item 的 GUID/URL | 依赖 `pubDate` 准确性，若 Feed 不含 pubDate 则条目被丢弃 |
 | 数据库压力小，仅存一个时间戳 | 同秒发布的多条新文章可能因 `>` 严格比较导致漏处理 |
 | 首次创建时天然导入全部历史条目（利用 JS `Date > null → true`） | 首次创建时若历史条目数超过剩余配额，会**全部被丢弃**且不更新游标，造成死循环 |
-| 频道有 lastBuildDate 时，即使无 pubDate 条目也能前进游标（分支 A2），后续轮不重复处理 | 频道无 lastBuildDate 且所有 item 无 pubDate 时，首轮游标设为 1970 年，但从第二轮起 L28 判断拦截，不会反复处理（分支 B2） |
+| 频道有 lastBuildDate 时，即使无 pubDate 条目也能前进游标（分支 A2），频道时间不变的后续轮不重复处理 | 频道有 lastBuildDate 且该值持续更新、但所有 item 仍缺 pubDate 时，每轮都会进入处理分支但空转（不创建 Link 但有 HTTP 请求和 DB 开销） |
 | 无频道时间、无条目时间时，1970 年游标作为兜底锚点，后续出现带 pubDate 的新 item 时仍能正确触发处理 | 频道 lastBuildDate 为空字符串时（极端异常），`??` 不触发 reduce，直接取空字符串导致 L23 throw（分支 A'） |
 | 天然支持大部分 RSS Feed | 若 Feed 修改历史条目的 pubDate 为更新时间，可能造成重复导入 |
 
@@ -652,19 +687,28 @@ prisma.rssSubscription.create()
 └──────────┬──────────┘  └───────────────┬──────────────────┘
            │                             │
            ▼                             ▼
-┌──────────────────────────────────────────────────────────┐
-│          第二轮及之后 Worker 轮询（L28 判断）               │
-│                                                            │
-│ 分支 A：!频道时间 → false                                  │
-│         频道时间 < 频道时间 → false                         │
-│         整体 false → 不进入处理分支 ✅ 不会反复处理          │
-│                                                            │
-│ 分支 A'：每轮都会 L23 throw（空字符串永远是 falsy）          │
-│                                                            │
-│ 分支 B：!new Date(0) → false                               │
-│         new Date(0) < new Date(0) → false                  │
-│         整体 false → 不进入处理分支 ✅ 不会反复处理          │
-│         （若之后出现带 pubDate 的新 item，则 1970 < 新时间   │
-│          → true → 正常进入处理分支）                        │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│          第二轮及之后 Worker 轮询（L28 判断）                   │
+│                                                                │
+│ 分支 A：频道时间不变                                           │
+│   !T1 → false                                                  │
+│   T1 < T1 → false                                              │
+│   整体 false → 不进入处理分支 ✅ 不会反复处理                  │
+│                                                                │
+│ 分支 A：频道时间变新（T2 > T1）且所有 item 仍缺 pubDate         │
+│   !T1 → false                                                  │
+│   T1 < T2 → true                                               │
+│   整体 true → ★ 进入处理分支                                   │
+│   → newItems = []（空数组）                                    │
+│   → 0 条 Link 被创建                                           │
+│   → 游标前进到 T2，频道不变的下轮不再进入                      │
+│                                                                │
+│ 分支 A'：每轮都会 L23 throw（空字符串永远是 falsy）              │
+│                                                                │
+│ 分支 B：!new Date(0) → false                                   │
+│         new Date(0) < new Date(0) → false                      │
+│         整体 false → 不进入处理分支 ✅ 不会反复处理              │
+│         （若之后出现带 pubDate 的新 item，则 1970 < 新时间       │
+│          → true → 正常进入处理分支）                            │
+└──────────────────────────────────────────────────────────────┘
 ```
