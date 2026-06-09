@@ -368,11 +368,20 @@ axios.get(`https://web.archive.org/save/${url}`, { headers })
 ```typescript
 lastPreserved: null   // ← 只有此字段仍为 null 的链接才会被下一批选中
 ```
-因此，**`lastPreserved` 是否被写入是判断链接能否被重试的唯一依据**。下面按 `archiveHandler` 的执行阶段分三类讨论。
+因此，**`lastPreserved` 是否被写入是判断链接能否被重试的唯一依据**。
+
+失败处理在代码中分为两大类，共四个阶段：
+
+| 大类 | 描述 | `lastPreserved` | 是否会被重试 |
+|------|------|----------------|-------------|
+| **主动标记** | 代码显式调用 `prisma.link.update` 写入 `"unavailable"` | ✅ 写入 | ❌ 不会 |
+| **异常抛出** | 未被 catch 的异常向上冒泡，未走任何写入逻辑 | ❌ 不写入（仍为 null） | ✅ **会重试** |
+
+下面按执行顺序逐一展开。
 
 ---
 
-### 5.1 阶段 A：主流程前失败（try 之前的早退出分支）
+### 5.1 阶段 A：主动标记为 Unavailable（主流程前早退出）
 
 **代码位置** — `apps/worker/lib/archiveHandler.ts#L44-L61`：
 ```typescript
@@ -383,9 +392,9 @@ if (
   await prisma.link.update({
     where: { id: link.id },
     data: {
-      lastPreserved: new Date().toISOString(),   // ← 写 lastPreserved
-      readable: "unavailable",
-      image: "unavailable",
+      lastPreserved: new Date().toISOString(),   // ← 主动写 lastPreserved
+      readable: "unavailable",                   // ← 主动把所有格式
+      image: "unavailable",                      //    硬编码为 unavailable
       monolith: "unavailable",
       pdf: "unavailable",
       preview: "unavailable",
@@ -396,57 +405,74 @@ if (
 }
 ```
 
-**触发条件**：
-- `skipPreservation === true`：由 SSRF 检查抛出 `UnsafeUrlError` 或 `DISABLE_PRESERVATION=true` 导致
-- URL 不是 `http://` 或 `https://` 开头
+**触发条件**（逻辑 OR）：
+| 条件 | 来源 | 含义 |
+|------|------|------|
+| `skipPreservation === true` | `apps/worker/lib/archiveHandler.ts#L32-L42` | URL 未通过 SSRF 检查抛出 `UnsafeUrlError`，或全局 `DISABLE_PRESERVATION=true` |
+| URL 非 `http(s)://` | `apps/worker/lib/archiveHandler.ts#L45-L47` | 协议不支持（如 `file://`、`mailto:`、相对路径等） |
 
 **对重试的影响**：
 | 项目 | 结果 |
 |------|------|
-| `lastPreserved` | ✅ **被写入为当前时间** |
+| `lastPreserved` | ✅ **被主动写入为当前时间** |
 | 各格式字段 | ✅ 全部硬编码为 `"unavailable"` |
 | 是否进入 `finally` | ❌ 不会，代码在 `return` 处已退出 |
 | 是否关闭 BrowserContext | N/A（Context 尚未创建） |
 | **下一批是否会被重试** | ❌ **不会**（`lastPreserved` 非 null） |
 
----
-
-### 5.2 阶段 B：try 之前但 BrowserContext 创建期间失败
-
-`archiveHandler` 中，**`try {` 关键字出现在第 109 行**，但以下代码在 try 之前执行（`apps/worker/lib/archiveHandler.ts#L63-L108`）：
-
-```
-L63  const abortController = new AbortController();
-L66  const timeoutPromise = new Promise(...);
-L77  const contextOptions = getDefaultContextOptions();
-L78  const context = await browser.newContext(contextOptions);   ← 可能抛异常
-L79  await protectPageRequests(context);                         ← 可能抛异常
-L80  const page = await context.newPage();                       ← 可能抛异常
-L82  createFolder(...);
-L83  createFolder(...);
-L85  const archivalTags = link.tags.filter(isArchivalTag);
-L86  const archivalSettings = ...    // 读取用户归档偏好
-```
-
-**如果 L78-L80（浏览器上下文/页面创建）抛异常**：
-- 异常直接向上抛出，**不会进入 `try`，也不会进入 `finally`**
-- `lastPreserved` **不会被写入**（仍为 `null`）
-- BrowserContext 可能泄漏（没有 `context.close()`）
-
-**对重试的影响**：
-| 项目 | 结果 |
-|------|------|
-| `lastPreserved` | ❌ **未被写入（仍为 null）** |
-| 各格式字段 | 保持不变 |
-| 是否进入 `finally` | ❌ 不会 |
-| 是否关闭 BrowserContext | ❌ 不会（可能泄漏） |
-| **下一批是否会被重试** | ✅ **会**（`lastPreserved` 仍为 null） |
-
-这是整个流程中**唯一会导致链接自动重试**的失败场景。
+> 这是"主动放弃"模式：链接从待处理队列中永久移除，用户需手动重新触发归档。
 
 ---
 
-### 5.3 阶段 C：主流程内失败（try 块内部）
+### 5.2 阶段 B：异常抛出不写 lastPreserved（try 之前的逐步骤分析）
+
+`archiveHandler` 中，**`try {` 关键字出现在第 109 行**，但 L63-L108 的所有步骤都在 try 之外执行。以下逐行拆解每个步骤的失败可能性与后果：
+
+**代码位置** — `apps/worker/lib/archiveHandler.ts#L63-L108`：
+
+| 行号 | 代码 | 同步/异步 | 是否可能失败 | 失败原因 | 失败后 `lastPreserved` | 会被重试？ | 资源泄漏？ |
+|------|------|----------|------------|---------|----------------------|-----------|-----------|
+| L63 | `const abortController = new AbortController()` | 同步 | ❌ 几乎不可能 | — | — | — | — |
+| L64 | `let timeoutId: NodeJS.Timeout \| undefined` | 同步 | ❌ | — | — | — | — |
+| L66-L75 | `const timeoutPromise = new Promise(...)` + `setTimeout` 注册 | 同步（注册回调） | ❌ | 回调在 5 分钟后执行，不阻塞此处 | — | — | — |
+| L77 | `const contextOptions = getDefaultContextOptions()` | 同步 | ❌ 几乎不可能 | 只是读取 env 和 Playwright `devices` 常量 | — | — | — |
+| **L78** | **`const context = await browser.newContext(contextOptions)`** | **异步** | **✅ 可能** | 浏览器已断开连接、Playwright 内部错误、系统资源不足 | ❌ **不写入** | ✅ **会重试** | ❌ Context 还未创建 |
+| **L79** | **`await protectPageRequests(context)`** | **异步** | **✅ 可能** | 内部调用 `context.route("**/*", handler)`，若 Context 已关闭或 Playwright 异常会抛错 | ❌ **不写入** | ✅ **会重试** | ✅ Context 已创建但未关闭 |
+| **L80** | **`const page = await context.newPage()`** | **异步** | **✅ 可能** | Context 已关闭、沙箱限制、内存不足等 Playwright 异常 | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 已创建但未关闭 |
+| **L82** | **`createFolder({ filePath: "archives/preview/..." })`** | **同步** | **✅ 可能** | 实现：`packages/filesystem/createFolder.ts#L17` 调用 `fs.mkdirSync(..., { recursive: true })`，可能抛 `EACCES`（权限）、`EROFS`（只读磁盘）、`ENOSPC`（磁盘满） | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 已创建但未关闭 |
+| **L83** | **`createFolder({ filePath: "archives/..." })`** | **同步** | **✅ 可能** | 同上 | ❌ **不写入** | ✅ **会重试** | ✅ Context + Page 已创建但未关闭 |
+| L85 | `link.tags.filter(isArchivalTag)` | 同步 | ❌ | 纯函数 | — | — | — |
+| L86-L107 | `archivalSettings = ...` | 同步 | ❌ | 只是读取 tag 和 user 属性 | — | — | — |
+
+**`protectPageRequests` 为何可能失败** — `apps/worker/lib/protectPageRequests.ts#L15-L36`：
+```typescript
+export default async function protectPageRequests(context: BrowserContext) {
+  await context.route("**/*", async (route: Route) => { ... });
+}
+```
+`context.route()` 返回 `Promise<void>`，Playwright 在注册路由失败时（如 Context 已关闭）会 reject。
+
+**`createFolder` 为何可能失败** — `packages/filesystem/createFolder.ts#L5-L18`：
+```typescript
+export function createFolder({ filePath }: { filePath: string }) {
+  if (s3Client) {
+    // S3 模式：什么都不做（自动建目录）
+  } else {
+    fs.mkdirSync(creationPath, { recursive: true });  // ← 同步抛异常
+  }
+}
+```
+本地文件系统模式下同步调用 `fs.mkdirSync`，任何 I/O 错误都会同步抛出。
+
+**阶段 B 汇总**：
+- L78 / L79 / L80 / L82 / L83 这 5 处失败都会导致**异常向上冒泡**
+- 均**不会进入 try/finally**，均**不会写入 `lastPreserved`**
+- 因此这些链接**会在下一批次被重新选中重试**
+- 除 L78（Context 未创建）外，其余失败都会造成 BrowserContext / Page **资源泄漏**
+
+---
+
+### 5.3 阶段 C：主流程内失败（try 块内部，finally 兜底写 lastPreserved）
 
 **try/catch/finally 结构** — `apps/worker/lib/archiveHandler.ts#L109-L230`：
 ```typescript
@@ -507,15 +533,20 @@ try {
 
 ---
 
-### 5.4 三阶段失败行为对比
+### 5.4 全阶段失败行为对比
 
-| 失败阶段 | 代码位置 | `lastPreserved` 是否写入 | 是否会被下一批重试 | 是否关闭 BrowserContext |
-|---------|---------|------------------------|-------------------|----------------------|
-| **A. 主流程前早退出**（SSRF 不安全 / 非 http(s) / DISABLE_PRESERVATION） | `apps/worker/lib/archiveHandler.ts#L44-L61` | ✅ 写入 | ❌ 不会 | N/A（还未创建） |
-| **B. BrowserContext 创建失败**（`browser.newContext` / `newPage` 抛异常） | `apps/worker/lib/archiveHandler.ts#L77-L80`（try 之外） | ❌ 不写入 | ✅ **会重试** | ❌ 可能泄漏 |
-| **C. 主流程内任意异常**（try 块内所有代码） | `apps/worker/lib/archiveHandler.ts#L109-L198` | ✅ 写入（finally） | ❌ 不会 | ✅ `finally` 中关闭 |
+| 阶段 | 触发场景 | 代码位置 | 失败类型 | `lastPreserved` | 各格式字段 | 会被重试？ | Context 是否关闭 |
+|------|---------|---------|---------|----------------|-----------|-----------|----------------|
+| **A. 主动标记** | SSRF 不安全 / 非 http(s) 协议 / `DISABLE_PRESERVATION=true` | `apps/worker/lib/archiveHandler.ts#L44-L61` | 主动 `prisma.link.update` + `return` | ✅ 写入当前时间 | ✅ 全部硬编码 `"unavailable"` | ❌ 不会 | N/A（未创建） |
+| **B-1** | `browser.newContext()` 抛异常 | `apps/worker/lib/archiveHandler.ts#L78` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | N/A（未创建） |
+| **B-2** | `protectPageRequests(context)` 抛异常 | `apps/worker/lib/archiveHandler.ts#L79` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | ❌ 泄漏 |
+| **B-3** | `context.newPage()` 抛异常 | `apps/worker/lib/archiveHandler.ts#L80` | 异常向上冒泡 | ❌ 不写 | 保持不变 | ✅ **会** | ❌ 泄漏 |
+| **B-4** | 2 次 `createFolder()` 抛 `EACCES`/`EROFS`/`ENOSPC` | `apps/worker/lib/archiveHandler.ts#L82-L83` | 异常向上冒泡（`fs.mkdirSync` 同步抛） | ❌ 不写 | 保持不变 | ✅ **会** | ❌ 泄漏 |
+| **C. finally 兜底** | try 块内任意异常（page.goto / 超时 / 内容提取 / OG Image 非 SSRF 错误 等） | `apps/worker/lib/archiveHandler.ts#L109-L230` | `catch` 打日志 + re-throw → `finally` 兜底写库 | ✅ 写入当前时间 | ✅ 仍为空的写 `"unavailable"`，已成功的保留 | ❌ 不会 | ✅ `context?.close()` 必然调用 |
 
-> **核心结论**：只有阶段 B（BrowserContext 创建期间失败）会导致链接在后续批次中被自动重试；其余失败均会写入 `lastPreserved` 从而永久标记为"已处理"，失败格式字段值为 `"unavailable"`。
+> **修正后的核心结论**：
+> - **不会重试（主动或兜底写了 lastPreserved）**：阶段 A + 阶段 C
+> - **会自动重试（异常冒泡未写 lastPreserved）**：阶段 B 的 5 处（L78/L79/L80/L82/L83），且其中 4 处存在 BrowserContext/Page 资源泄漏风险
 
 ---
 
@@ -597,17 +628,26 @@ apps/worker/index.ts (进程守护: 子进程挂了 5s 后重启)
              └─ Promise.allSettled 并发:
                  └─ apps/worker/lib/archiveHandler.ts#archiveHandler(link, browser)
                      │
-                     ├─ [阶段 A] SSRF 不安全 / 非 http(s) / DISABLE_PRESERVATION
-                     │     └─ 直接写 lastPreserved + 所有格式 "unavailable" → return (不重试)
+                     ├─ [阶段 A · 主动标记] SSRF 不安全 / 非 http(s) / DISABLE_PRESERVATION
+                     │     └─ prisma.link.update: lastPreserved=now + 所有格式 "unavailable" → return
+                     │                                                               (不重试 ❌)
                      │
                      ├─ AbortController + 5 分钟 timeoutPromise
+                     ├─ getDefaultContextOptions()
                      │
-                     ├─ [阶段 B] browser.newContext() / context.newPage()
-                     │     └─ 失败: 异常向上抛出，lastPreserved 不写 → 下批会重试 ✅
+                     ├─ [阶段 B-1] browser.newContext()
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context 未创建）
                      │
-                     ├─ protectPageRequests (路由级 SSRF)
-                     ├─ createFolder
-                     ├─ 读取 archivalSettings
+                     ├─ [阶段 B-2] protectPageRequests(context)   ← context.route("**/*", handler)
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context 泄漏 ❗）
+                     │
+                     ├─ [阶段 B-3] context.newPage()
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context+Page 泄漏 ❗）
+                     │
+                     ├─ [阶段 B-4] 2 × createFolder()             ← fs.mkdirSync 同步抛 EACCES/EROFS/ENOSPC
+                     │     └─ 失败: 异常冒泡，lastPreserved 不写 → 下批会重试 ✅（Context+Page 泄漏 ❗）
+                     │
+                     ├─ archivalTags.filter() + archivalSettings  (纯同步，不失败)
                      │
                      └─ try {
                           Promise.race([
@@ -624,11 +664,14 @@ apps/worker/index.ts (进程守护: 子进程挂了 5s 后重启)
                                     └─ sendToWayback (fire-and-forget)
                           , timeoutPromise ])
                         } catch (err) {
-                          日志 + re-throw
-                        } finally {                              ← [阶段 C] 必然执行
+                          console.log("Failed Link:", link.url);
+                          console.log("Reason:", err);
+                          throw err;   // 继续向上抛
+                        } finally {                              ← [阶段 C · finally 兜底]
                           ├─ 清 timeout
-                          ├─ 写 lastPreserved = now
-                          ├─ 未生成的格式 → "unavailable"         ← 不再重试 ❌
-                          └─ context.close()
+                          ├─ prisma.link.update:
+                          │     ├─ lastPreserved = now
+                          │     └─ 仍为空的格式 → "unavailable"    ← 不再重试 ❌
+                          └─ context?.close().catch(() => {})    ← 必然关闭 Context
                         }
 ```
