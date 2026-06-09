@@ -325,36 +325,36 @@ include: {
 
 基于 Prisma `Link` 模型（[schema.prisma#L166-L198](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/prisma/schema.prisma#L166-L198)）、Dashboard 返回字段、以及前端 Card 组件实际消费字段（[DashboardLinks.tsx](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/DashboardLinks.tsx)、[LinkCard.tsx](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/LinkViews/LinkComponents/LinkCard.tsx)），整理如下：
 
-| 字段 | Prisma 类型 | DB 可空性 | Dashboard 是否返回 | 邮件摘要用途 | 前端 Card 是否使用 |
-|------|------------|:---------:|:------------------:|-------------|:------------------:|
-| `id` | Int @default(autoincrement()) | ❌ 非空 | ✅ | 生成详情链接、去重 | ✅（拖拽 key、路由跳转） |
-| `name` | String @default("") | ❌ 非空 | ✅ | **链接标题（摘要核心）** | ✅（卡片主标题，line-clamp-2） |
-| `description` | String @default("") | ❌ 非空 | ✅ | **用户自定义描述** | ❌（Dashboard Card 不显示） |
-| `metaDescription` | String? | ✅ 可空 | ✅ | **页面元描述（归档 Worker 抓取所得）** | ❌ |
-| `url` | String? | ✅ 可空 | ✅ | **跳转原始链接** | ✅（LinkTypeBadge 显示域名、点击跳转） |
-| `type` | String @default("url") | ❌ 非空 | ✅ | 链接类型徽标（url/pdf/image/monolith） | ✅（LinkTypeBadge） |
-| `preview` | String? | ✅ 可空 | ✅ | **缩略图状态判断**（"unavailable" / 归档路径） | ✅（Image 组件 + 轮询 refetch 判断） |
-| `image` | String? | ✅ 可空 | ✅ | 截图归档可用性判断 | ✅（formatStats.formatAvailable） |
-| `pdf` | String? | ✅ 可空 | ✅ | PDF 归档可用性判断 | ✅（同上） |
-| `readable` | String? | ✅ 可空 | ✅ | Readability 归档可用性判断 | ✅（同上） |
-| `monolith` | String? | ✅ 可空 | ✅ | Monolith 归档可用性判断 | ✅（同上） |
-| `icon` | String? | ✅ 可空 | ✅ | Phosphor 图标名称（用户自定义图标） | ✅（LinkIcon） |
-| `iconWeight` | String? | ✅ 可空 | ✅ | 图标粗细 | ✅（LinkIcon） |
-| `color` | String? | ✅ 可空 | ✅ | 图标颜色 | ✅（LinkIcon） |
-| `createdAt` | DateTime @default(now()) | ❌ 非空 | ✅ | **创建时间（摘要排序+展示）** | ✅（LinkDate，回退用） |
-| `importDate` | DateTime? | ✅ 可空 | ✅ | 导入时间（优先于 createdAt 展示） | ✅（LinkDate，优先用） |
-| `updatedAt` | DateTime @default(now()) @updatedAt | ❌ 非空 | ✅ | 缩略图 URL 缓存刷新参数 | ✅（Image src query） |
-| `lastPreserved` | DateTime? | ✅ 可空 | ✅ | 上次归档成功时间（可选展示） | ❌ |
-| `collectionId` | Int | ❌ 非空 | ✅ | 关联收藏夹 | ✅（匹配 Collection 对象） |
-| `createdById` | Int? | ✅ 可空 | ✅ | 创建者 ID（可选展示） | ❌ |
-| `clientSide` | Boolean @default(false) | ❌ 非空 | ✅ | 是否客户端归档（邮件可忽略） | ❌ |
-| `aiTagged` | Boolean @default(false) | ❌ 非空 | ✅ | 是否已 AI 打标签（可选展示） | ❌ |
-| `indexVersion` | Int? | ✅ 可空 | ✅ | 全文索引版本（邮件可忽略） | ❌ |
-| `textContent` | String? | ✅ 可空 | ❌（被 omit） | 无需（邮件不展示全文） | ❌ |
-| — **关系字段** — | — | — | — | — | — |
-| `tags` | Tag[] | — | ✅（include） | **标签展示** | ⚠️（Card 未直接渲染，但数据返回） |
-| `collection` | Collection | — | ✅（include） | **所属收藏夹名称+颜色** | ✅（LinkCollection 组件） |
-| `pinnedBy` | { id: number }[] | — | ✅（include，仅当前用户） | **固定状态标识** | ✅（LinkPin 组件 + 前端过滤 pinned） |
+| 字段 | 分类 | Prisma 类型 | DB 可空性 | Dashboard 是否返回 | 邮件摘要用途 | 前端 Card 是否使用 |
+|------|------|------------|:---------:|:------------------:|-------------|:------------------:|
+| `id` | 主键 | Int @default(autoincrement()) | ❌ 非空 | ✅ | 生成详情链接、去重 | ✅（拖拽 key、路由跳转） |
+| `name` | 业务元数据 | String @default("") | ❌ 非空 | ✅ | **链接标题（摘要核心）** | ✅（卡片主标题，line-clamp-2） |
+| `description` | 业务元数据 | String @default("") | ❌ 非空 | ✅ | **用户自定义描述** | ❌（Dashboard Card 不显示） |
+| `metaDescription` | Worker 抓取元数据 | String? | ✅ 可空 | ✅ | **页面元描述（归档 Worker 抓取所得）** | ❌ |
+| `url` | **源链接（非归档）** | String? | ✅ 可空 | ✅ | **跳转原始链接（源链接，非归档产物）** | ✅（LinkTypeBadge 显示域名、点击跳转） |
+| `type` | 业务元数据 | String @default("url") | ❌ 非空 | ✅ | 链接类型徽标（url/pdf/image/monolith） | ✅（LinkTypeBadge） |
+| `preview` | **归档产物** | String? | ✅ 可空 | ✅ | **缩略图（归档 Worker 生成的页面预览图）** | ✅（Image 组件 + 轮询 refetch 判断） |
+| `image` | **归档产物** | String? | ✅ 可空 | ✅ | 整页截图（归档产物） | ✅（formatStats.formatAvailable） |
+| `pdf` | **归档产物** | String? | ✅ 可空 | ✅ | PDF 归档（归档产物） | ✅（同上） |
+| `readable` | **归档产物** | String? | ✅ 可空 | ✅ | Readability 正文提取（归档产物） | ✅（同上） |
+| `monolith` | **归档产物** | String? | ✅ 可空 | ✅ | Monolith 单页 HTML（归档产物） | ✅（同上） |
+| `icon` | 业务元数据 | String? | ✅ 可空 | ✅ | Phosphor 图标名称（用户自定义图标） | ✅（LinkIcon） |
+| `iconWeight` | 业务元数据 | String? | ✅ 可空 | ✅ | 图标粗细 | ✅（LinkIcon） |
+| `color` | 业务元数据 | String? | ✅ 可空 | ✅ | 图标颜色 | ✅（LinkIcon） |
+| `createdAt` | 时间戳 | DateTime @default(now()) | ❌ 非空 | ✅ | **创建时间（摘要排序+展示）** | ✅（LinkDate，回退用） |
+| `importDate` | 时间戳 | DateTime? | ✅ 可空 | ✅ | 导入时间（优先于 createdAt 展示） | ✅（LinkDate，优先用） |
+| `updatedAt` | 时间戳 | DateTime @default(now()) @updatedAt | ❌ 非空 | ✅ | 缩略图 URL 缓存刷新参数 | ✅（Image src query） |
+| `lastPreserved` | 时间戳 | DateTime? | ✅ 可空 | ✅ | 上次归档成功时间（可选展示） | ❌ |
+| `collectionId` | 外键 | Int | ❌ 非空 | ✅ | 关联收藏夹 | ✅（匹配 Collection 对象） |
+| `createdById` | 外键 | Int? | ✅ 可空 | ✅ | 创建者 ID（可选展示） | ❌ |
+| `clientSide` | 归档标记 | Boolean @default(false) | ❌ 非空 | ✅ | 是否客户端归档（邮件可忽略） | ❌ |
+| `aiTagged` | 归档标记 | Boolean @default(false) | ❌ 非空 | ✅ | 是否已 AI 打标签（可选展示） | ❌ |
+| `indexVersion` | 归档标记 | Int? | ✅ 可空 | ✅ | 全文索引版本（邮件可忽略） | ❌ |
+| `textContent` | 归档产物 | String? | ✅ 可空 | ❌（被 omit） | 无需（邮件不展示全文） | ❌ |
+| — **关系字段** — | — | — | — | — | — | — |
+| `tags` | 关系 | Tag[] | — | ✅（include） | **标签展示** | ⚠️（Card 未直接渲染，但数据返回） |
+| `collection` | 关系 | Collection | — | ✅（include） | **所属收藏夹名称+颜色** | ✅（LinkCollection 组件） |
+| `pinnedBy` | 关系 | { id: number }[] | — | ✅（include，仅当前用户） | **固定状态标识** | ✅（LinkPin 组件 + 前端过滤 pinned） |
 
 **邮件摘要核心可复用字段（15 个，全部 Dashboard 已返回）：**
 `id`、`name`、`description`、`metaDescription`、`url`、`preview`、`image`、`type`、`createdAt`、`importDate`、`lastPreserved`、`tags`、`collection.name`、`collection.color`、`pinnedBy`
@@ -410,55 +410,145 @@ include: {
 | 空值场景 | **新建且尚未被 Worker 处理的可抓取 URL 类型 Link**——约为新创建后几秒钟到几分钟内为 null |
 | 含义 | 表示"归档流程已执行"——无论成功还是失败，只要 Worker 处理过就会有值 |
 
-###### `url` / `preview` / `image` / `pdf` / `readable` / `monolith` —— 可空，三态值模式
+###### `url` —— 可空，**源链接字段（非归档产物）**，不遵循三态模式
 
-这些归档格式字段遵循统一的三态模式：
+> **重要纠正：之前文档将 url 与 preview/image 等归为"归档三态字段"是错误的。url 是 Link 的核心源数据，表示用户收藏的原始外部 URL，与 Worker 归档产物完全不同。**
+
+| 属性 | 值 |
+|------|---|
+| 分类 | **源链接（业务输入）**，不是归档产物 |
+| DB 可空性 | ✅ **可空**（`String?`，无 default） |
+| 值来源 | 1. 用户新建时输入：`PostLinkSchema.url` 校验 `z.string().trim().max(2048).url().optional()`（[schemaValidation.ts#L127](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/lib/schemaValidation.ts#L127)）<br>2. 导入时从备份文件/Pocket API 读取（[importFromLinkwarden.ts#L78](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/migration/importFromLinkwarden.ts#L78)、[importFromPocket.ts#L59](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/lib/api/controllers/migration/importFromPocket.ts#L59)） |
+| 空值场景 | **用户手动上传本地文件（PDF/PNG/JPG/HTML）作为 Link 时，url 为 null**——此时 Link 的内容完全是归档文件本身，没有外部源链接 |
+| 是否会被设为 "unavailable" | ❌ **绝对不会**。url 是用户原始输入，从未在任何 Worker 或 API 中被设置为 "unavailable" 字符串 |
+| 值形式 | 标准 URL 字符串（如 `"https://example.com/article"`），或 `null` |
+| 典型占比 | 约 **90%+** 的 Link 有 url（纯上传文件的 Link 占少数） |
+
+**字段定位总结：**
+
+| 维度 | `url`（源链接） | `preview` / `image` / `pdf` 等（归档产物） |
+|------|----------------|------------------------------------------|
+| 数据来源 | 用户输入/导入 | Worker 异步生成 |
+| 值含义 | 被收藏的原始网页地址 | 本地存储的归档文件相对路径 |
+| 三态模式 | ❌ 不遵循 | ✅ 严格遵循 |
+| 值为 "unavailable" | 永远不会 | 会 |
+| 与 type 的关系 | type="url" 时必有 url；type="pdf"/"image"/"monolith" 时 url 可为 null | 与 type 交叉：如 type="pdf" 时 pdf 字段有值，type="url" 时可同时有 image/pdf/readable |
+
+---
+
+###### `preview` / `image` / `pdf` / `readable` / `monolith` —— 可空，**归档产物字段**，严格三态模式
+
+这 5 个字段均为 Worker 归档处理的产物，遵循统一的三态值模式：
 
 | 状态 | 值示例 | 含义 |
 |------|--------|------|
-| 未处理 | `null` | Link 创建后尚未被 Worker 处理 |
-| 处理成功 | `"archives/12/456.jpeg"` / `"archives/12/456.pdf"` 等 | 归档文件的相对路径 |
-| 不可用 | `"unavailable"` | Worker 处理后确认无法生成该格式 |
+| **未处理** | `null` | Link 创建后尚未被 Worker 处理，或用户未启用该归档格式 |
+| **处理成功** | `"archives/preview/12/456.jpeg"` / `"archives/12/456.pdf"` / `"archives/12/456_readability.json"` 等 | 归档文件的相对路径（相对于存储根目录） |
+| **不可用** | `"unavailable"` | Worker 已尝试处理，但确认无法生成该格式（见 [archiveHandler.ts#L197-L212](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/archiveHandler.ts#L197-L212)：Worker 遍历所有归档格式后，将仍为 null 的字段统一标记为 "unavailable"） |
 
-`preview` 字段额外说明：通过 `/api/v1/archives/{id}?format=jpeg&preview=true` 接口访问时会附带 `&updatedAt={updatedAt}` 作为缓存刷新参数（[DashboardLinks.tsx#L157](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/DashboardLinks.tsx#L157)）。
+**各字段的生成来源函数：**
 
-`url` 字段说明：手动创建 Link 时可为 null（例如上传 PDF 或图片作为 Link），但绝大多数 Link 有 url。
+| 字段 | 生成函数 | 触发条件 | 说明 |
+|------|---------|---------|------|
+| `preview` | [handleArchivePreview.ts](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/preservationScheme/handleArchivePreview.ts) | type="url" 且服务端可抓取 | 优先取 og:image，否则 Playwright 低质量截图（quality: 20） |
+| `image` | [handleScreenshotAndPdf.ts](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/preservationScheme/handleScreenshotAndPdf.ts) | 用户启用 `archiveAsScreenshot` 且 type="url" | 整页高质量截图 |
+| `pdf` | 同上 `handleScreenshotAndPdf.ts` | 用户启用 `archiveAsPDF` 且 type="url" | Playwright 生成 PDF |
+| `readable` | [handleReadability.ts](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/preservationScheme/handleReadability.ts) | type="url" 且页面有正文内容 | Readability 提取 + DOMPurify 净化，输出 JSON |
+| `monolith` | [handleMonolith.ts](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/worker/lib/preservationScheme/handleMonolith.ts) | 用户启用且 type="url" | Monolith 单页 HTML 归档 |
+
+**`preview` 字段额外说明**：通过 `/api/v1/archives/{id}?format=jpeg&preview=true` 接口访问时会附带 `&updatedAt={updatedAt}` 作为缓存刷新参数（[DashboardLinks.tsx#L157](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/apps/web/components/DashboardLinks.tsx#L157)）。该接口需要用户登录鉴权（[linkId].ts#L104-L119），**邮件中无法直接访问**。
+
+**手动上传文件时的归档字段行为**（[linkId].ts#L262-L280）：用户通过 API POST `/api/v1/archives/{linkId}` 手动上传文件时，直接设置对应字段为归档路径，并将其他不适用的归档格式标记为 "unavailable"（例如上传 PDF 时设置 `preview: "unavailable"`）。
 
 ##### 5.2.5.2 邮件摘要展示时的空值处理建议
 
 | 字段 | 空值/默认值 | 邮件中处理建议 |
 |------|------------|---------------|
-| **`name`** | `""`（空字符串） | 显示 fallback：<br>1. 若有 `url` → 显示域名（`new URL(url).host`）<br>2. 若无 `url` → 显示 `type`（如 `"PDF"`、`"Image"`） |
+| **`name`** | `""`（空字符串） | 显示 fallback：<br>1. 若有 `url` → 显示域名（`new URL(url).host`）<br>2. 若无 `url` → 显示 `type`（如 `"PDF"`、`"Image"`、`"Monolith"`） |
 | **`description`** | `""`（空字符串） | fallback 到 `metaDescription`（若 metaDescription 也为空则不展示描述行） |
 | **`metaDescription`** | `null` | fallback 到 `description`（两者都空则省略描述区域） |
-| **`url`** | `null` | 不渲染跳转链接；但仍可展示详情页链接 `/dashboard/links/{id}` |
-| **`preview` / `image`** | `null` 或 `"unavailable"` | 不展示缩略图；或展示站点 favicon 作为占位（需从 `url` 提取域名） |
+| **`url`** | `null` | 说明：表示该 Link 是纯上传文件（无外部源链接）<br>处理：**不渲染外部跳转链接**，但仍渲染 Linkwarden 内部详情页链接 `/dashboard/links/{id}` |
+| **`preview`** | `null` 或 `"unavailable"` | 邮件缩略图处理（详见下方跳转链接与缩略图专题建议） |
+| **`image` / `pdf` / `readable` / `monolith`** | `null` 或 `"unavailable"` | 邮件摘要中通常无需单独展示这些格式的可用性；可在"可用归档格式"区域汇总展示，或直接忽略 |
 | **`importDate`** | `null` | fallback 到 `createdAt`，与前端 LinkDate 组件一致 |
 | **`lastPreserved`** | `null` | 不展示该指标；或标注为"待归档" |
 | **`tags`** | `[]`（空数组） | 不展示标签行 |
 | **`pinnedBy`** | `[]`（空数组） | 不显示"固定"徽标 |
 
-**推荐模板渲染优先级（单条链接展示）：**
+###### 邮件摘要跳转链接与缩略图专题建议
+
+**一、跳转链接策略**
+
+邮件摘要中每条链接应提供**两个独立的跳转入口**：
+
+| 跳转目标 | URL 构造 | 触发条件 | 说明 |
+|---------|---------|---------|------|
+| **外部原始链接** | `link.url` | 仅当 `link.url != null` | 直接跳到用户收藏的源网页；点击可加 UTM 参数（如 `?utm_source=linkwarden-digest`） |
+| **Linkwarden 详情页** | `${BASE_URL}/dashboard/links/${link.id}` | **始终提供** | 进入 Linkwarden 内部的归档详情页，可查看所有归档格式、编辑标签等 |
+
+跳转优先级参考前端实现 [getFormatBasedOnPreference.ts#L15-L48](file:///d:/fz/0601/solo-dogfeeding/code/127-linkwarden/packages/lib/getFormatBasedOnPreference.ts#L15-L48)：
+- `type === "url"` 且用户偏好为 ORIGINAL → 跳 `link.url`
+- `type === "pdf"` 且有 pdf 归档 → 跳 `/api/v1/archives/{id}?format=pdf`（但邮件中此链接需要鉴权，见下）
+- 其他情况 → 跳详情页
+
+**⚠️ 归档文件 API 的鉴权问题：** `/api/v1/archives/{linkId}?format=...` 接口在服务端渲染时通过 Cookie 鉴权（[linkId].ts#L104-L119），但**邮件客户端点击请求不会携带用户登录 Cookie**，因此：
+- 邮件中**不应直接链接到 `/api/v1/archives/...`**——用户会看到 401
+- 推荐一律跳详情页 `/dashboard/links/{id}`，由详情页再提供各归档格式下载入口
+
+**二、缩略图展示策略**
+
+缩略图有三种来源，按优先级排列：
+
+| 方案 | 实现方式 | 优点 | 缺点 | 适用场景 |
+|------|---------|------|------|---------|
+| **方案 A：外部 og:image 直链** | 若 `preview` 非 null 且原始 `url` 可推断 og:image（通过 Google S2 Favicon API 或 DuckDuckGo Instant Answer API 获取站点缩略图） | 无需鉴权，邮件直接展示 | og:image 不一定存在；第三方 API 可能有限流 | url 类型 Link 推荐 |
+| **方案 B：Linkwarden 用户内容域名** | 若配置了 `NEXT_PUBLIC_USER_CONTENT_DOMAIN`，可通过该域名公开提供归档预览图（需服务端额外配置公开访问路径） | 使用自有归档，数据最准确 | 需额外基础设施配置；未配置则不可用 | 自托管且配置了用户内容域名 |
+| **方案 C：站点 Favicon 占位** | `https://www.google.com/s2/favicons?domain={hostname}&sz=128` 或 `https://icons.duckduckgo.com/ip3/{hostname}.ico` | 无需鉴权、几乎 100% 可用、稳定 | 只是小图标，不是页面缩略图 | preview 不可用时的 fallback |
+| **方案 D：不展示缩略图** | 用彩色图标 + 标题卡片替代 | 最简洁，无外部依赖 | 视觉效果较差 | 极简摘要模板 |
+
+**推荐缩略图处理逻辑：**
 
 ```
-1. [缩略图]  preview != null && preview != "unavailable"
-              → /api/v1/archives/{id}?format=jpeg&preview=true&updatedAt={updatedAt}
-            否则不展示
+1. 若 link.type === "image" 且 link.image 有值
+   → 用户上传的图片文件：邮件中无法直链归档，使用方案 C（Favicon）或 D（不展示）
+   
+2. 若 link.type === "pdf"
+   → 使用通用 PDF 图标（inline SVG）或方案 C
 
-2. [标题]    name != "" → name
-            否则 url != null → new URL(url).host
-            否则 → type.toUpperCase()
+3. 若 link.type === "url" 且 link.url != null：
+   a. 尝试方案 A（通过第三方 API 获取 og:image）
+   b. 若无法获取 → fallback 到方案 C（Favicon 128px）
+   c. 若 url 为 null → fallback 到方案 D
 
-3. [描述]    description != "" → description（截断 200 字符）
-            否则 metaDescription != null → metaDescription（截断 200 字符）
-            否则 → 不展示
+4. 所有方案均失败 → 方案 D（纯文字卡片，带 link.icon + link.color 自定义图标或默认图标）
+```
 
-4. [元信息]
-   - 标签：tags.length > 0 → 展示标签名列表
-   - 收藏夹：collection.name + 颜色圆点
-   - 日期：importDate || createdAt → toLocaleDateString()
-   - 固定徽标：pinnedBy.length > 0 → 展示
-   - 类型徽标：url + type 组合显示
+**模板渲染优先级（更新版，单条链接完整展示）：**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  [缩略图区域]                                            │
+│  方案 A/B/C/D 生成的图片，点击跳转到：                    │
+│    link.url || `${BASE_URL}/dashboard/links/${link.id}`  │
+├─────────────────────────────────────────────────────────┤
+│  📌 [pinnedBy 有值时显示固定徽标]  [收藏夹名称·颜色圆点]  │
+│                                                         │
+│  标题（加粗）：                                          │
+│    name != "" → name                                     │
+│    url != null  → new URL(url).hostname                  │
+│    → type.toUpperCase()                                  │
+│                                                         │
+│  描述（灰色小字，最多 2 行）：                             │
+│    description != "" → description（truncate 200 字符）   │
+│    metaDescription != null → metaDescription             │
+│    → 不展示                                              │
+│                                                         │
+│  [标签1] [标签2] ...（tags.length > 0 时展示）            │
+│                                                         │
+│  📅 日期：(importDate || createdAt).toLocaleDateString() │
+│  🔗 外部链接：仅当 url != null 时展示                     │
+│  📂 在 Linkwarden 中查看：详情页链接（始终展示）           │
+└─────────────────────────────────────────────────────────┘
 ```
 
 #### 5.2.6 collectionLinks 返回结构（第 149-152 行）
